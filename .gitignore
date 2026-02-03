@@ -1,0 +1,8 @@
+.pyc
+.ipynb_checkpoints
+.DS_Store
+.env
+/datasets
+.cursor
+.cursorignore
+__pycache__
