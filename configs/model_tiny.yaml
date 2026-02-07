@@ -1,0 +1,46 @@
+name: tiny_tcn
+seed: 42
+
+data:
+  data_dir: data/kaist
+  processed_dir: data/processed
+  splits_dir: data/splits
+  window_size: 5.0
+  stride: 0.5
+  sampling_rate: 100
+  normalize: true
+
+model:
+  name: tiny_tcn
+  input_channels: 6
+  window_samples: 500
+  hidden_channels: 16
+  num_blocks: 3
+  output_dim: 6
+  dropout: 0.1
+  activation: relu6
+  norm_type: layer
+
+training:
+  epochs: 150
+  batch_size: 64
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  scheduler: cosine
+  warmup_epochs: 5
+  position_loss_weight: 1.0
+  orientation_loss_weight: 0.5
+  velocity_loss_weight: 0.3
+  quantize_aware: true
+  gradient_clip: 1.0
+
+mobile:
+  target_format: coreml
+  quantize: true
+  quantize_mode: int8
+  optimize_for_ane: true
+  input_shape: [1, 500, 6]
+  max_model_size_mb: 1.0
+
+output_dir: results/tiny_tcn
+checkpoint_dir: checkpoints/tiny_tcn

@@ -1,0 +1,22 @@
+name: default_training
+seed: 42
+
+training:
+  epochs: 150
+  batch_size: 64
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  scheduler: cosine
+  warmup_epochs: 5
+  position_loss_weight: 1.0
+  orientation_loss_weight: 0.5
+  velocity_loss_weight: 0.3
+  regularization_weight: 0.00001
+  quantize_aware: false
+  gradient_clip: 1.0
+  num_workers: 4
+
+# Knowledge distillation settings (optional)
+# distill_from: checkpoints/teacher_best.ckpt
+# distill_temperature: 3.0
+# distill_alpha: 0.3

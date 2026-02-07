@@ -1,0 +1,22 @@
+mobile:
+  target_format: coreml
+  quantize: true
+  quantize_mode: int8
+  optimize_for_ane: true
+  input_shape: [1, 500, 6]
+  max_model_size_mb: 5.0
+
+# CoreML specific
+coreml:
+  minimum_deployment_target: ios16
+  compute_units: all  # all, cpu_only, cpu_and_gpu, cpu_and_ne
+  model_description: "Lightweight IMU odometry model for on-device navigation"
+  author: "TERN.AI"
+
+# TFLite specific
+tflite:
+  optimization: default  # default, optimize_for_size, optimize_for_latency
+  supported_ops:
+    - TFLITE_BUILTINS
+    - SELECT_TF_OPS
+  num_calibration_steps: 100
