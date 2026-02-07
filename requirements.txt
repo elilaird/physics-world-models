@@ -1,0 +1,34 @@
+# Core
+torch>=2.0.0
+pytorch-lightning>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Data
+pandas>=2.0.0
+h5py>=3.8.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Experiment tracking
+tqdm>=4.65.0
+wandb>=0.15.0
+
+# Configuration
+pyyaml>=6.0
+omegaconf>=2.3.0
+
+# IMU / orientation
+ahrs>=0.3.0
+
+# Mobile export (optional)
+# coremltools>=7.0  # macOS only, for iOS export
+# tensorflow>=2.13.0  # for TFLite export
+# tf2onnx>=1.14.0
+onnx>=1.14.0
+onnxruntime>=1.15.0
+
+# Testing
+pytest>=7.3.0
