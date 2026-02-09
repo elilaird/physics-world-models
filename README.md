@@ -30,7 +30,7 @@ python train.py --multirun model=jump,lstm,newtonian,velocity,port_hamiltonian
 python evaluate.py checkpoint=outputs/<date>/<time>/best_model.pt
 ```
 
-Checkpoints, logs, and plots are saved to `outputs/<date>/<time>/` by Hydra.
+Checkpoints, logs, and plots are saved to `outputs/<date>/<time>/<model_name>/` by Hydra.
 
 ## Environments
 
@@ -65,7 +65,7 @@ ODE models are automatically wrapped with `TrajectoryMatchingModel` for integrat
 - **dt generalization** — tests prediction accuracy across different integration timesteps
 
 ```bash
-python evaluate.py checkpoint=path/to/best_model.pt eval.horizon=100 eval.dt_values=[0.05,0.1,0.2,0.5]
+python evaluate.py checkpoint=outputs/<date>/<time>/<model>/best_model.pt eval.horizon=100
 ```
 
 Outputs `rollout.png`, `energy.png`, `dt_generalization.png`, and `eval_metrics.pt`.
@@ -75,11 +75,11 @@ Outputs `rollout.png`, `energy.png`, `dt_generalization.png`, and `eval_metrics.
 `report.py` compares multiple checkpoints (trained on the same env) side-by-side:
 
 ```bash
-# Compare specific checkpoints
-python report.py checkpoints=[path/to/jump/best_model.pt,path/to/lstm/best_model.pt]
+# Scan a training run directory (short path auto-resolves under outputs/ or multirun/)
+python report.py report_checkpoint_dir=<date>/<time>
 
-# Or scan a multirun output directory for all best_model.pt files
-python report.py checkpoint_dir=multirun/<date>/<time>
+# Or use full paths
+python report.py report_checkpoint_dir=outputs/<date>/<time>
 ```
 
 Produces comparison tables (console + CSV) and combined plots in `reports/<timestamp>/`:
@@ -89,6 +89,24 @@ Produces comparison tables (console + CSV) and combined plots in `reports/<times
 - `energy_comparison.png` — energy traces overlaid
 - `dt_generalization.png` — grouped bar chart across dt values
 - `mse_over_horizon.png` — per-timestep MSE curves
+
+## Visual Observations
+
+Environments can render states as images for pixel-based learning. Currently supported: oscillator and pendulum (custom renderer), plus a dm_control pendulum wrapper for MuJoCo rendering.
+
+```bash
+# Preview rendering
+python scripts/visualize_env.py --env oscillator --n_frames 50
+python scripts/visualize_env.py --env pendulum --save_gif pendulum_demo.gif --img_size 128
+
+# Train with visual config (generates dataset; model architectures not yet implemented)
+python train.py env=oscillator_visual
+python train.py env=pendulum_visual
+```
+
+Visual env configs (`oscillator_visual`, `pendulum_visual`) inherit physics parameters from their base configs and add `observation_mode: pixels`. The `visual` section in `config.yaml` controls `img_size`, `color`, and `render_quality`.
+
+For the dm_control wrapper: `pip install gymnasium shimmy[dm_control] dm_control`, then use `env=pendulum_dmcontrol`.
 
 ## Project Structure
 
@@ -102,6 +120,8 @@ src/
   envs/                    # Environment implementations + registry
   data/                    # SequenceDataset for trajectory generation
   eval/                    # Metrics and rollout evaluation
+scripts/
+  visualize_env.py           # Validate environment rendering (argparse)
 train.py                   # Unified training entry point
 evaluate.py                # Single-model evaluation with plots + metrics
 report.py                  # Multi-model comparison report

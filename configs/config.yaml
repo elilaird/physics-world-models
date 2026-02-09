@@ -16,6 +16,12 @@ data:
   seq_len: 100
   dt: 0.1
 
+visual:
+  img_size: 64
+  channels: 3
+  color: true
+  render_quality: medium
+
 checkpoint_dir: ${hydra:runtime.output_dir}
 
 # evaluate.py settings
@@ -31,3 +37,10 @@ report_checkpoint_dir: null
 
 report:
   output_dir: reports/${now:%Y-%m-%d_%H-%M-%S}
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}/${model.name}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${model.name}

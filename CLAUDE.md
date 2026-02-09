@@ -29,22 +29,22 @@ python train.py env=spaceship model=newtonian training.epochs=80 training.lr=5e-
 python train.py --multirun model=jump,lstm,newtonian,port_hamiltonian
 
 # Evaluate a checkpoint
-python evaluate.py checkpoint=outputs/<date>/<time>/best_model.pt
+python evaluate.py checkpoint=outputs/<date>/<time>/<model>/best_model.pt
 
 # Evaluate with custom settings
 python evaluate.py checkpoint=path/to/best_model.pt eval.horizon=100 eval.dt_values=[0.05,0.1,0.2,0.5]
 
-# Compare multiple models (must share same env)
-python report.py checkpoints=[path/to/jump/best_model.pt,path/to/lstm/best_model.pt]
+# Compare models from a training run (short path auto-resolves under outputs/ or multirun/)
+python report.py report_checkpoint_dir=<date>/<time>
 
-# Or scan a multirun output directory
-python report.py checkpoint_dir=multirun/<date>/<time>
+# Or use full paths
+python report.py report_checkpoint_dir=outputs/<date>/<time>
 
 # Override eval settings for report
-python report.py checkpoint_dir=multirun/<date>/<time> eval.horizon=100 eval.dt_values=[0.05,0.1,0.2,0.5]
+python report.py report_checkpoint_dir=<date>/<time> eval.horizon=100 eval.dt_values=[0.05,0.1,0.2,0.5]
 ```
 
-Hydra outputs (checkpoints, logs, plots) go to `outputs/<date>/<time>/`.
+Hydra outputs (checkpoints, logs, plots) go to `outputs/<date>/<time>/<model_name>/`.
 
 ## Architecture
 
@@ -74,6 +74,23 @@ All models use `nn.Embedding` for discrete action spaces. Registry in `src/model
 - `utils.py`: `load_checkpoint()`, `rebuild_model()`, `rebuild_env()` — shared by `evaluate.py` and `report.py`
 - `metrics.py`: `mse_over_horizon()`, `energy_drift()`
 - `rollout.py`: `open_loop_rollout()`, `dt_generalization_test()`
+
+### Visual Observations (`src/envs/rendering.py`, `src/data/visual_dataset.py`)
+Pixel-based observations for environments with `render_state()`. Oscillator and Pendulum have custom renderers ported from `environments/`. `dm_control` pendulum wrapper provides MuJoCo-rendered alternative (requires `gymnasium shimmy[dm_control] dm_control`).
+
+- **Visual env configs** (`oscillator_visual`, `pendulum_visual`): inherit physics from base, set `observation_mode: pixels`
+- **`VisualSequenceDataset`**: generates `(images, actions, target_images)` tuples in `(T, C, H, W)` format, includes vector states for validation
+- **`visual` config section**: `img_size`, `channels`, `color`, `render_quality`
+- Visual model architectures are not yet implemented — `train.py` raises `NotImplementedError` on visual datasets
+
+```bash
+# Visualize rendering
+python scripts/visualize_env.py --env oscillator --n_frames 50
+python scripts/visualize_env.py --env pendulum --save_gif pendulum_demo.gif
+
+# Train with visual env (will generate dataset but fail at model step)
+python train.py env=oscillator_visual
+```
 
 ### Legacy systems (kept for reference)
 - `models.py`, `envs.py`, `datasets.py` — original flat-file versions, superseded by `src/`

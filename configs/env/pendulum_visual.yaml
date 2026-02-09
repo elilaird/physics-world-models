@@ -1,0 +1,5 @@
+defaults:
+  - pendulum
+
+name: pendulum_visual
+observation_mode: pixels

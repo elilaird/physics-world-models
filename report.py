@@ -5,9 +5,17 @@ Loads multiple checkpoints (trained on the same env), runs identical evaluation
 on each using a shared test trajectory, and produces comparison tables + plots.
 
 Usage:
-    python report.py checkpoints=[path/to/jump/best_model.pt,path/to/lstm/best_model.pt]
-    python report.py checkpoint_dir=multirun/2026-02-09/12-00-00
-    python report.py checkpoints=[...] eval.horizon=100 eval.dt_values=[0.05,0.1,0.2,0.5]
+    # Scan a training run directory (auto-resolves under outputs/ or multirun/)
+    python report.py report_checkpoint_dir=2026-02-09/12-00-00
+
+    # Full paths work too
+    python report.py report_checkpoint_dir=outputs/2026-02-09/12-00-00
+
+    # Or list individual checkpoints (short paths resolved under outputs/)
+    python report.py checkpoints=[2026-02-09/12-00-00/jump/best_model.pt,2026-02-09/12-00-00/lstm/best_model.pt]
+
+    # Override eval settings
+    python report.py report_checkpoint_dir=2026-02-09/12-00-00 eval.horizon=100
 """
 
 import csv
@@ -16,6 +24,7 @@ import logging
 import os
 
 import hydra
+import hydra.utils
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -30,19 +39,47 @@ log = logging.getLogger(__name__)
 COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f"]
 
 
-def discover_checkpoints(cfg):
-    """Collect checkpoint paths from config."""
-    paths = list(cfg.checkpoints) if cfg.checkpoints else []
-    print("paths: ", paths)
-    print("checkpoints: ", cfg.checkpoints)
+def resolve_path(path, orig_cwd):
+    """Resolve a possibly-shortened path by checking outputs/ and multirun/ prefixes."""
+    if os.path.isabs(path):
+        return path
 
+    # Try as-is relative to original cwd
+    candidate = os.path.join(orig_cwd, path)
+    if os.path.exists(candidate):
+        return candidate
+
+    # Try prefixing with outputs/ then multirun/
+    for prefix in ["outputs", "multirun"]:
+        candidate = os.path.join(orig_cwd, prefix, path)
+        if os.path.exists(candidate):
+            return candidate
+
+    # Return as-is (will fail later with a clear error)
+    return os.path.join(orig_cwd, path)
+
+
+def discover_checkpoints(cfg, orig_cwd):
+    """Collect checkpoint paths from config, resolving short paths."""
+    paths = []
+
+    # Individual checkpoint paths
+    if cfg.checkpoints:
+        for p in cfg.checkpoints:
+            paths.append(resolve_path(p, orig_cwd))
+
+    # Directory scan
     if cfg.report_checkpoint_dir:
-        found = sorted(glob.glob(os.path.join(cfg.report_checkpoint_dir, "**/best_model.pt"), recursive=True))
+        scan_dir = resolve_path(cfg.report_checkpoint_dir, orig_cwd)
+        found = sorted(glob.glob(os.path.join(scan_dir, "**/best_model.pt"), recursive=True))
+        if not found:
+            raise ValueError(f"No best_model.pt files found in: {scan_dir}")
         paths.extend(found)
 
     if not paths:
         raise ValueError(
-            "No checkpoints provided. Use checkpoints=[...] or checkpoint_dir=<path>"
+            "No checkpoints provided. Use report_checkpoint_dir=<date>/<time> "
+            "or checkpoints=[<path1>,<path2>]"
         )
 
     # Deduplicate while preserving order
@@ -206,8 +243,10 @@ def plot_mse_over_horizon(all_results, save_path):
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig):
+    orig_cwd = hydra.utils.get_original_cwd()
+
     # Discover checkpoints
-    checkpoint_paths = discover_checkpoints(cfg)
+    checkpoint_paths = discover_checkpoints(cfg, orig_cwd)
     log.info(f"Found {len(checkpoint_paths)} checkpoints")
 
     # Load all checkpoints and validate same env
@@ -273,8 +312,10 @@ def main(cfg: DictConfig):
             "dt_results": dt_results,
         }
 
-    # Output directory
+    # Output directory (resolve relative to project root, not Hydra's output dir)
     output_dir = cfg.report.output_dir
+    if not os.path.isabs(output_dir):
+        output_dir = os.path.join(orig_cwd, output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
     # Print and save summary table

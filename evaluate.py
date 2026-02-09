@@ -16,7 +16,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from src.eval.utils import load_checkpoint, rebuild_model, rebuild_env
+from src.eval.utils import load_checkpoint, rebuild_model, rebuild_env, is_visual_checkpoint
 from src.eval.metrics import mse_over_horizon, energy_drift
 from src.eval.rollout import open_loop_rollout, dt_generalization_test
 
@@ -88,6 +88,12 @@ def main(cfg: DictConfig):
         raise ValueError("Must provide checkpoint=<path> to evaluate")
 
     ckpt, train_cfg = load_checkpoint(cfg.checkpoint)
+
+    if is_visual_checkpoint(train_cfg):
+        raise NotImplementedError(
+            "Evaluation of visual (pixel-based) checkpoints is not yet implemented. "
+            "Visual model architectures are required first."
+        )
 
     # Rebuild model and env from training config
     model = rebuild_model(train_cfg)
