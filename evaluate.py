@@ -92,7 +92,7 @@ def main(cfg: DictConfig):
     if is_visual_checkpoint(train_cfg):
         raise NotImplementedError(
             "Evaluation of visual (pixel-based) checkpoints is not yet implemented. "
-            "Visual model architectures are required first."
+            "Visual rollout evaluation will be added in a future PR."
         )
 
     # Rebuild model and env from training config
