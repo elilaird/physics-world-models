@@ -148,38 +148,27 @@ def main(cfg: DictConfig):
     torch.save(metadata, os.path.join(output_dir, "metadata.pt"))
 
     # Human-readable metadata
-    sample_shapes = {k: tuple(v.shape) for k, v in splits["train"].items() if isinstance(v, torch.Tensor)}
-    with open(os.path.join(output_dir, "metadata.yaml"), "w") as f:
-        f.write(f"env: {cfg.env.name}\n")
-        f.write(f"state_dim: {cfg.env.state_dim}\n")
-        f.write(f"action_dim: {cfg.env.action_dim}\n")
-        f.write(f"observation_mode: {'pixels' if visual else 'vector'}\n")
-        f.write(f"seed: {cfg.seed}\n")
-        f.write(f"dt: {cfg.data.dt}\n")
-        f.write(f"seq_len: {cfg.data.seq_len}\n")
-        f.write(f"n_seqs: {cfg.data.n_seqs}\n")
-        f.write(f"\nsplits:\n")
-        f.write(f"  train: {n_train}\n")
-        f.write(f"  val: {n_val}\n")
-        f.write(f"  test: {n_test}\n")
-        f.write(f"\ntensor_shapes:\n")
-        for k, shape in sample_shapes.items():
-            f.write(f"  {k}: {list(shape)}\n")
-        f.write(f"\ngeneration_time_s: {gen_time:.1f}\n")
-        if visual:
-            f.write(f"\nvisual:\n")
-            f.write(f"  img_size: {cfg.visual.img_size}\n")
-            f.write(f"  color: {cfg.visual.color}\n")
-            f.write(f"  render_quality: {cfg.visual.render_quality}\n")
-        env_params = OmegaConf.to_container(cfg.env.params, resolve=True)
-        f.write(f"\nenv_params:\n")
-        for k, v in env_params.items():
-            f.write(f"  {k}: {v}\n")
-        var_params = OmegaConf.to_container(cfg.env.variable_params, resolve=True)
-        if var_params:
-            f.write(f"\nvariable_params:\n")
-            for k, v in var_params.items():
-                f.write(f"  {k}: {v}\n")
+    import json
+    sample_shapes = {k: list(v.shape) for k, v in splits["train"].items() if isinstance(v, torch.Tensor)}
+    readable = {
+        "env": cfg.env.name,
+        "state_dim": cfg.env.state_dim,
+        "action_dim": cfg.env.action_dim,
+        "observation_mode": "pixels" if visual else "vector",
+        "seed": cfg.seed,
+        "dt": cfg.data.dt,
+        "seq_len": cfg.data.seq_len,
+        "n_seqs": cfg.data.n_seqs,
+        "splits": {"train": n_train, "val": n_val, "test": n_test},
+        "tensor_shapes": sample_shapes,
+        "generation_time_s": round(gen_time, 1),
+        "env_params": OmegaConf.to_container(cfg.env.params, resolve=True),
+        "variable_params": OmegaConf.to_container(cfg.env.variable_params, resolve=True),
+    }
+    if visual:
+        readable["visual"] = OmegaConf.to_container(cfg.visual, resolve=True)
+    with open(os.path.join(output_dir, "metadata.json"), "w") as f:
+        json.dump(readable, f, indent=2)
 
     log.info(f"Dataset saved to: {output_dir}")
 
