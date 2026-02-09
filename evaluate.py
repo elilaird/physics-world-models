@@ -120,7 +120,7 @@ def plot_dt_generalization(results, save_path):
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig):
     # Load checkpoint
-    if not hasattr(cfg, "checkpoint") or cfg.checkpoint is None:
+    if cfg.checkpoint is None:
         raise ValueError("Must provide checkpoint=<path> to evaluate")
 
     ckpt, train_cfg = load_checkpoint(cfg.checkpoint)
@@ -135,11 +135,8 @@ def main(cfg: DictConfig):
 
     log.info(f"Loaded {train_cfg.model.name} (epoch {ckpt['epoch']}, test_loss={ckpt['test_loss']:.6f})")
 
-    # Eval config with defaults
-    horizon = cfg.get("eval", {}).get("horizon", 50)
-    dt_values = cfg.get("eval", {}).get("dt_values", [0.05, 0.1, 0.2, 0.5])
-    if not isinstance(dt_values, list):
-        dt_values = list(dt_values)
+    horizon = cfg.eval.horizon
+    dt_values = list(cfg.eval.dt_values)
 
     output_dir = cfg.checkpoint_dir
     os.makedirs(output_dir, exist_ok=True)
