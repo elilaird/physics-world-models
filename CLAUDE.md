@@ -33,6 +33,15 @@ python evaluate.py checkpoint=outputs/<date>/<time>/best_model.pt
 
 # Evaluate with custom settings
 python evaluate.py checkpoint=path/to/best_model.pt eval.horizon=100 eval.dt_values=[0.05,0.1,0.2,0.5]
+
+# Compare multiple models (must share same env)
+python report.py checkpoints=[path/to/jump/best_model.pt,path/to/lstm/best_model.pt]
+
+# Or scan a multirun output directory
+python report.py checkpoint_dir=multirun/<date>/<time>
+
+# Override eval settings for report
+python report.py checkpoint_dir=multirun/<date>/<time> eval.horizon=100 eval.dt_values=[0.05,0.1,0.2,0.5]
 ```
 
 Hydra outputs (checkpoints, logs, plots) go to `outputs/<date>/<time>/`.
@@ -62,6 +71,7 @@ All models use `nn.Embedding` for discrete action spaces. Registry in `src/model
 `SequenceDataset` generates (states, actions, targets) sequences from any env with randomized variable params per sequence.
 
 ### Evaluation (`src/eval/`)
+- `utils.py`: `load_checkpoint()`, `rebuild_model()`, `rebuild_env()` — shared by `evaluate.py` and `report.py`
 - `metrics.py`: `mse_over_horizon()`, `energy_drift()`
 - `rollout.py`: `open_loop_rollout()`, `dt_generalization_test()`
 
