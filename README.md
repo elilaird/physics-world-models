@@ -70,6 +70,26 @@ python evaluate.py checkpoint=path/to/best_model.pt eval.horizon=100 eval.dt_val
 
 Outputs `rollout.png`, `energy.png`, `dt_generalization.png`, and `eval_metrics.pt`.
 
+### Multi-Model Comparison
+
+`report.py` compares multiple checkpoints (trained on the same env) side-by-side:
+
+```bash
+# Compare specific checkpoints
+python report.py checkpoints=[path/to/jump/best_model.pt,path/to/lstm/best_model.pt]
+
+# Or scan a multirun output directory for all best_model.pt files
+python report.py checkpoint_dir=multirun/<date>/<time>
+```
+
+Produces comparison tables (console + CSV) and combined plots in `reports/<timestamp>/`:
+- `summary.csv` — train loss, open-loop MSE, energy drift per model
+- `dt_generalization.csv` — MSE at each dt per model
+- `rollout_comparison.png` — all models' trajectories overlaid with ground truth
+- `energy_comparison.png` — energy traces overlaid
+- `dt_generalization.png` — grouped bar chart across dt values
+- `mse_over_horizon.png` — per-timestep MSE curves
+
 ## Project Structure
 
 ```
@@ -83,7 +103,8 @@ src/
   data/                    # SequenceDataset for trajectory generation
   eval/                    # Metrics and rollout evaluation
 train.py                   # Unified training entry point
-evaluate.py                # Evaluation with plots + metrics
+evaluate.py                # Single-model evaluation with plots + metrics
+report.py                  # Multi-model comparison report
 environments/              # HGN pixel-rendering environments (separate system)
 experiments/               # Original Jupyter notebooks (archived)
 ```

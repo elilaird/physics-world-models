@@ -16,47 +16,11 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from src.envs import ENV_REGISTRY
-from src.models import MODEL_REGISTRY
-from src.models.wrappers import TrajectoryMatchingModel
+from src.eval.utils import load_checkpoint, rebuild_model, rebuild_env
 from src.eval.metrics import mse_over_horizon, energy_drift
 from src.eval.rollout import open_loop_rollout, dt_generalization_test
 
 log = logging.getLogger(__name__)
-
-
-def load_checkpoint(checkpoint_path):
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    cfg = OmegaConf.create(ckpt["config"])
-    return ckpt, cfg
-
-
-def rebuild_model(cfg):
-    model_cls = MODEL_REGISTRY[cfg.model.name]
-
-    kwargs = {
-        "state_dim": cfg.env.state_dim,
-        "action_dim": cfg.env.action_dim,
-        "hidden_dim": cfg.model.hidden_dim,
-        "action_embedding_dim": cfg.model.action_embedding_dim,
-    }
-
-    if hasattr(cfg.model, "damping_init") and cfg.model.damping_init is not None:
-        kwargs["damping_init"] = cfg.model.damping_init
-
-    model = model_cls(**kwargs)
-
-    if cfg.model.type == "ode":
-        method = cfg.model.get("integration_method", "rk4")
-        model = TrajectoryMatchingModel(model, method=method)
-
-    return model
-
-
-def rebuild_env(cfg):
-    env_cls = ENV_REGISTRY[cfg.env.name]
-    params = OmegaConf.to_container(cfg.env.params, resolve=True)
-    return env_cls(**params)
 
 
 def plot_rollout(pred_states, true_states, title, save_path):

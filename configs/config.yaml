@@ -6,14 +6,14 @@ defaults:
 seed: 42
 
 training:
-  epochs: 40
+  epochs: 200
   batch_size: 32
-  lr: 1e-3
+  lr: 1e-4
   train_split: 0.8
 
 data:
   n_seqs: 200
-  seq_len: 20
+  seq_len: 100
   dt: 0.1
 
 checkpoint_dir: ${hydra:runtime.output_dir}
@@ -24,3 +24,10 @@ checkpoint: null
 eval:
   horizon: 50
   dt_values: [0.05, 0.1, 0.2, 0.5]
+
+# report.py settings
+checkpoints: []
+report_checkpoint_dir: null
+
+report:
+  output_dir: reports/${now:%Y-%m-%d_%H-%M-%S}

@@ -18,6 +18,9 @@ class ForcedOscillator(PhysicsControlEnv):
         self.m, self.k, self.c = m, k, c
 
     def step(self, state, action_idx, dt=0.1, variable_params=None):
+        if isinstance(action_idx, torch.Tensor):
+            action_idx = int(action_idx.item())
+
         f_val = self.action_map[action_idx]
         if variable_params is not None:
             k = variable_params.get("k", self.k)

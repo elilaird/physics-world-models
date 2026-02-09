@@ -6,3 +6,7 @@
 .cursor
 .cursorignore
 __pycache__
+.claude
+outputs/
+reports/
+*.pt
