@@ -32,6 +32,34 @@ python evaluate.py checkpoint=outputs/<date>/<time>/best_model.pt
 
 Checkpoints, logs, and plots are saved to `outputs/<date>/<time>/<model_name>/` by Hydra.
 
+## Dataset Generation
+
+By default, `train.py` generates data on the fly each run. For reproducibility and efficiency — especially when sweeping across models — you can pre-generate a dataset once and reuse it:
+
+```bash
+# Generate a dataset (saved to datasets/<env_name>/<timestamp>/)
+python generate_dataset.py
+python generate_dataset.py env=pendulum data.n_seqs=1000 data.seq_len=200
+
+# Custom split ratios (default: 80/10/10 train/val/test)
+python generate_dataset.py env=spaceship data.n_seqs=2000 data.val_split=0.15 data.test_split=0.15
+```
+
+This produces `train.pt`, `val.pt`, `test.pt`, and `metadata.pt` in the output directory. Each file contains pre-stacked tensors ready for loading.
+
+To train on a saved dataset, pass `dataset_path`:
+
+```bash
+# Single model
+python train.py dataset_path=datasets/oscillator/<timestamp>
+
+# Sweep models — all share the exact same data
+python train.py --multirun model=jump,lstm,newtonian,velocity,port_hamiltonian \
+    dataset_path=datasets/oscillator/<timestamp>
+```
+
+Short paths are resolved under `datasets/` automatically. Without `dataset_path`, training generates data on the fly as before.
+
 ## Environments
 
 | Environment | State | Actions | Config |
@@ -118,13 +146,15 @@ configs/
 src/
   models/                  # Model implementations + registry
   envs/                    # Environment implementations + registry
-  data/                    # SequenceDataset for trajectory generation
+  data/                    # Dataset generation + loading
   eval/                    # Metrics and rollout evaluation
 scripts/
-  visualize_env.py           # Validate environment rendering (argparse)
+  visualize_env.py         # Validate environment rendering (argparse)
+generate_dataset.py        # Pre-generate and save train/val/test splits
 train.py                   # Unified training entry point
 evaluate.py                # Single-model evaluation with plots + metrics
 report.py                  # Multi-model comparison report
+datasets/                  # Saved datasets (gitignored)
 environments/              # HGN pixel-rendering environments (separate system)
 experiments/               # Original Jupyter notebooks (archived)
 ```

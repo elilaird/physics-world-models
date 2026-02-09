@@ -1,6 +1,7 @@
 from torch.utils.data import Dataset
 import torch
 import numpy as np
+from tqdm import tqdm
 
 from src.envs.base import PhysicsControlEnv
 
@@ -35,9 +36,7 @@ class SequenceDataset(Dataset):
         self.env = env
         self.variable_params = variable_params
         self.init_state_range = np.asarray(init_state_range)
-        print(f"Generating {n_seqs} sequences of length {seq_len}...")
-
-        for _ in range(n_seqs):
+        for _ in tqdm(range(n_seqs), desc=f"Generating {n_seqs} seqs (len={seq_len})"):
             sampled_params = self._sample_variable_params()
             state = self._sample_init_state()
 
