@@ -36,6 +36,10 @@ python generate_dataset.py env=pendulum data.n_seqs=1000
 python train.py dataset_path=datasets/oscillator/<timestamp>
 python train.py --multirun model=jump,lstm,newtonian dataset_path=datasets/oscillator/<timestamp>
 
+# Train visual world model on pixel observations
+python train.py env=oscillator_visual model=visual_world_model
+python train.py env=pendulum_visual model=visual_world_model model.latent_dim=64
+
 # Evaluate a checkpoint
 python evaluate.py checkpoint=outputs/<date>/<time>/<model>/best_model.pt
 
@@ -59,7 +63,7 @@ Hydra outputs (checkpoints, logs, plots) go to `outputs/<date>/<time>/<model_nam
 ### Config system (`configs/`)
 Hydra with composable groups. `configs/config.yaml` sets defaults and training params. Override with `env=<name>` and `model=<name>`.
 - **env configs**: oscillator, pendulum, spaceship, three_body — each defines state_dim, action_dim, physics params, variable_params ranges, init_state_range
-- **model configs**: jump, lstm, first_order_ode, newtonian, velocity, port_hamiltonian — each defines type (discrete/ode), hidden_dim, integration_method
+- **model configs**: jump, lstm, first_order_ode, newtonian, velocity, port_hamiltonian, visual_world_model — each defines type (discrete/ode/visual), hidden_dim, integration_method
 
 ### Models (`src/models/`)
 All models use `nn.Embedding` for discrete action spaces. Registry in `src/models/__init__.py`.
@@ -67,6 +71,7 @@ All models use `nn.Embedding` for discrete action spaces. Registry in `src/model
 - **ODE** (`ode.py`): `FirstOrderODENet`, `NewtonianDynamicsModel`, `VelocityDynamicsModel` — forward: `(t, state, action_emb)` for `torchdiffeq.odeint`
 - **Hamiltonian** (`hamiltonian.py`): `PortHamiltonianModel` — learns H(q,p), derives dynamics via `torch.autograd.grad`
 - **Wrappers** (`wrappers.py`): `TrajectoryMatchingModel` (single-step ODE integration), `TrajectoryShootingModel` (multi-step rollout). ODE models are auto-wrapped by `train.py` when `model.type == "ode"`.
+- **Visual** (`visual.py`): `VisualWorldModel` — VQ-VAE (VisionEncoder → VectorQuantizer → VisionDecoder) + `LatentPredictor` (residual MLP). Predictor operates on detached quantized latents with context window. `train.py` routes to `visual_train_step`/`visual_eval_step` when `model.type == "visual"`.
 
 ### Environments (`src/envs/`)
 `PhysicsControlEnv` base class with discrete action maps. Registry in `src/envs/__init__.py`.
@@ -89,15 +94,20 @@ Pixel-based observations for environments with `render_state()`. Oscillator and 
 - **Visual env configs** (`oscillator_visual`, `pendulum_visual`): inherit physics from base, set `observation_mode: pixels`
 - **`VisualSequenceDataset`**: generates `(images, actions, target_images)` tuples in `(T, C, H, W)` format, includes vector states for validation
 - **`visual` config section**: `img_size`, `channels`, `color`, `render_quality`
-- Visual model architectures are not yet implemented — `train.py` raises `NotImplementedError` on visual datasets
+- **`VisualWorldModel`** (`model=visual_world_model`): VQ-VAE + latent predictor. Config exposes `latent_dim`, `n_codebook`, `context_length`, `commitment_beta`, `predictor_weight`. Training uses `visual_train_step` which reconstructs all frames and predicts next-latent from a context window of past quantized latents. Gradient isolation via `.detach()` separates autoencoder and predictor objectives.
+- Visual rollout evaluation is not yet implemented — `evaluate.py` raises `NotImplementedError` for visual checkpoints
 
 ```bash
 # Visualize rendering
 python scripts/visualize_env.py --env oscillator --n_frames 50
 python scripts/visualize_env.py --env pendulum --save_gif pendulum_demo.gif
 
-# Train with visual env (will generate dataset but fail at model step)
-python train.py env=oscillator_visual
+# Train visual world model
+python train.py env=oscillator_visual model=visual_world_model
+python train.py env=pendulum_visual model=visual_world_model
+
+# Override visual model hyperparams
+python train.py env=oscillator_visual model=visual_world_model model.latent_dim=64 model.context_length=2
 ```
 
 ### Legacy systems (kept for reference)
