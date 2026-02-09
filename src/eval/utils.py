@@ -19,6 +19,22 @@ def rebuild_model(cfg):
     """Reconstruct a model from its training config."""
     model_cls = MODEL_REGISTRY[cfg.model.name]
 
+    if cfg.model.type == "visual":
+        visual_cfg = cfg.get("visual", {})
+        kwargs = {
+            "state_dim": cfg.env.state_dim,
+            "action_dim": cfg.env.action_dim,
+            "action_embedding_dim": cfg.model.action_embedding_dim,
+            "hidden_dim": cfg.model.hidden_dim,
+            "latent_dim": cfg.model.latent_dim,
+            "n_codebook": cfg.model.n_codebook,
+            "commitment_beta": cfg.model.commitment_beta,
+            "context_length": cfg.model.context_length,
+            "predictor_weight": cfg.model.predictor_weight,
+            "channels": visual_cfg.get("channels", 3),
+        }
+        return model_cls(**kwargs)
+
     kwargs = {
         "state_dim": cfg.env.state_dim,
         "action_dim": cfg.env.action_dim,

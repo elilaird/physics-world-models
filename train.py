@@ -44,6 +44,21 @@ def build_env(cfg):
 def build_model(cfg):
     model_cls = MODEL_REGISTRY[cfg.model.name]
 
+    if cfg.model.type == "visual":
+        kwargs = {
+            "state_dim": cfg.env.state_dim,
+            "action_dim": cfg.env.action_dim,
+            "action_embedding_dim": cfg.model.action_embedding_dim,
+            "hidden_dim": cfg.model.hidden_dim,
+            "latent_dim": cfg.model.latent_dim,
+            "n_codebook": cfg.model.n_codebook,
+            "commitment_beta": cfg.model.commitment_beta,
+            "context_length": cfg.model.context_length,
+            "predictor_weight": cfg.model.predictor_weight,
+            "channels": cfg.visual.channels,
+        }
+        return model_cls(**kwargs)
+
     kwargs = {
         "state_dim": cfg.env.state_dim,
         "action_dim": cfg.env.action_dim,
@@ -92,13 +107,87 @@ def build_dataset(env, cfg):
     )
 
 
-def train_step(model, batch, optimizer, dt, is_ode):
-    if "images" in batch:
-        raise NotImplementedError(
-            "Visual model architectures not yet implemented. "
-            "Use a vector-state environment (e.g. env=oscillator) for training."
-        )
+def visual_train_step(model, batch, optimizer):
+    images = batch["images"]              # (B, T, C, H, W)
+    target_images = batch["target_images"]  # (B, T, C, H, W)
+    actions = batch["actions"]            # (B, T)
 
+    B, T, C, H, W = images.shape
+    latent_dim = model.latent_dim
+    context_length = model.context_length
+
+    # Build all T+1 frames: first input frame + all targets
+    all_images = torch.cat([images[:, 0:1], target_images], dim=1)  # (B, T+1, C, H, W)
+    all_flat = all_images.reshape(B * (T + 1), C, H, W)
+
+    # Encode + quantize + decode all frames
+    z_all = model.encode(all_flat)
+    z_q_all, vq_loss = model.quantize(z_all)[:2]
+    recon_all = model.decode(z_q_all)
+    recon_loss = ((recon_all - all_flat) ** 2).mean()
+
+    # Predictor operates on detached quantized latents (gradient isolation)
+    z_q_seq = z_q_all.reshape(B, T + 1, latent_dim).detach()
+
+    predictor_loss = torch.tensor(0.0, device=images.device)
+    n_pred = 0
+    for t in range(context_length - 1, T):
+        # Build context [z_t, z_{t-1}, ..., z_{t-H+1}]
+        ctx_parts = [z_q_seq[:, t - i] for i in range(context_length)]
+        context = torch.cat(ctx_parts, dim=-1)  # (B, context_length * latent_dim)
+        pred_z = model.predictor(context, actions[:, t].long())
+        predictor_loss = predictor_loss + ((pred_z - z_q_seq[:, t + 1]) ** 2).mean()
+        n_pred += 1
+
+    if n_pred > 0:
+        predictor_loss = predictor_loss / n_pred
+
+    total_loss = recon_loss + vq_loss + model.predictor_weight * predictor_loss
+
+    optimizer.zero_grad()
+    total_loss.backward()
+    optimizer.step()
+
+    return total_loss.item()
+
+
+@torch.no_grad()
+def visual_eval_step(model, batch):
+    images = batch["images"]
+    target_images = batch["target_images"]
+    actions = batch["actions"]
+
+    B, T, C, H, W = images.shape
+    latent_dim = model.latent_dim
+    context_length = model.context_length
+
+    all_images = torch.cat([images[:, 0:1], target_images], dim=1)
+    all_flat = all_images.reshape(B * (T + 1), C, H, W)
+
+    z_all = model.encode(all_flat)
+    z_q_all, vq_loss = model.quantize(z_all)[:2]
+    recon_all = model.decode(z_q_all)
+    recon_loss = ((recon_all - all_flat) ** 2).mean()
+
+    z_q_seq = z_q_all.reshape(B, T + 1, latent_dim)
+
+    predictor_loss = torch.tensor(0.0, device=images.device)
+    n_pred = 0
+    for t in range(context_length - 1, T):
+        ctx_parts = [z_q_seq[:, t - i] for i in range(context_length)]
+        context = torch.cat(ctx_parts, dim=-1)
+        pred_z = model.predictor(context, actions[:, t].long())
+        predictor_loss = predictor_loss + ((pred_z - z_q_seq[:, t + 1]) ** 2).mean()
+        n_pred += 1
+
+    if n_pred > 0:
+        predictor_loss = predictor_loss / n_pred
+
+    total_loss = recon_loss + vq_loss + model.predictor_weight * predictor_loss
+    return total_loss.item()
+
+
+def train_step(model, batch, optimizer, dt, is_ode):
     states = batch["states"]      # (B, T, state_dim)
     actions = batch["actions"]    # (B, T)
     targets = batch["targets"]    # (B, T, state_dim)
@@ -126,12 +215,6 @@ def train_step(model, batch, optimizer, dt, is_ode):
 
 @torch.no_grad()
 def eval_step(model, batch, dt, is_ode):
-    if "images" in batch:
-        raise NotImplementedError(
-            "Visual model architectures not yet implemented. "
-            "Use a vector-state environment (e.g. env=oscillator) for training."
-        )
-
     states = batch["states"]
     actions = batch["actions"]
     targets = batch["targets"]
@@ -164,6 +247,7 @@ def main(cfg: DictConfig):
 
     model = build_model(cfg)
     is_ode = cfg.model.type == "ode"
+    is_visual = cfg.model.type == "visual"
 
     param_count = sum(p.numel() for p in model.parameters())
     log.info(f"Model: {cfg.model.name} ({param_count} params)")
@@ -199,13 +283,19 @@ def main(cfg: DictConfig):
         model.train()
         train_loss_sum = 0.0
         for batch in train_loader:
-            train_loss_sum += train_step(model, batch, optimizer, cfg.data.dt, is_ode)
+            if is_visual:
+                train_loss_sum += visual_train_step(model, batch, optimizer)
+            else:
+                train_loss_sum += train_step(model, batch, optimizer, cfg.data.dt, is_ode)
         avg_train = train_loss_sum / len(train_loader)
 
         model.eval()
         test_loss_sum = 0.0
         for batch in test_loader:
-            test_loss_sum += eval_step(model, batch, cfg.data.dt, is_ode)
+            if is_visual:
+                test_loss_sum += visual_eval_step(model, batch)
+            else:
+                test_loss_sum += eval_step(model, batch, cfg.data.dt, is_ode)
         avg_test = test_loss_sum / len(test_loader)
 
         pbar.set_description(
