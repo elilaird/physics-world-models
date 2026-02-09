@@ -1,0 +1,6 @@
+name: newtonian
+type: ode
+hidden_dim: 64
+action_embedding_dim: 8
+damping_init: -1.0
+integration_method: rk4

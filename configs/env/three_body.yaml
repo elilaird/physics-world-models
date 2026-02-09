@@ -1,0 +1,25 @@
+name: three_body
+state_dim: 12
+action_dim: 9
+
+params:
+  G: 1.0
+  thrust_magnitude: 1.0
+
+variable_params: {}
+
+init_state_range:
+  # positions (6D): clustered near origin
+  - [-1.0, 1.0]
+  - [-1.0, 1.0]
+  - [-1.0, 1.0]
+  - [-1.0, 1.0]
+  - [-1.0, 1.0]
+  - [-1.0, 1.0]
+  # velocities (6D): small initial velocities
+  - [-0.5, 0.5]
+  - [-0.5, 0.5]
+  - [-0.5, 0.5]
+  - [-0.5, 0.5]
+  - [-0.5, 0.5]
+  - [-0.5, 0.5]

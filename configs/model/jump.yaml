@@ -1,0 +1,4 @@
+name: jump
+type: discrete
+hidden_dim: 64
+action_embedding_dim: 8
