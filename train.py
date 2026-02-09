@@ -23,6 +23,7 @@ from tqdm import tqdm
 from src.envs import ENV_REGISTRY
 from src.models import MODEL_REGISTRY
 from src.models.wrappers import TrajectoryMatchingModel
+from src.models.visual import PREDICTOR_REGISTRY
 from src.data.dataset import SequenceDataset
 from src.data.visual_dataset import build_visual_dataset
 from src.data.precomputed import PrecomputedDataset
@@ -41,23 +42,33 @@ def build_env(cfg):
     return env_cls(**params)
 
 
+def build_predictor(cfg):
+    """Build a latent predictor module from config."""
+    predictor_name = cfg.model.get("predictor", "latent_mlp")
+    predictor_cls = PREDICTOR_REGISTRY[predictor_name]
+    return predictor_cls(
+        latent_dim=cfg.model.latent_dim,
+        action_dim=cfg.env.action_dim,
+        action_embedding_dim=cfg.model.action_embedding_dim,
+        hidden_dim=cfg.model.hidden_dim,
+        context_length=cfg.model.context_length,
+    )
+
+
 def build_model(cfg):
     model_cls = MODEL_REGISTRY[cfg.model.name]
 
     if cfg.model.type == "visual":
-        kwargs = {
-            "state_dim": cfg.env.state_dim,
-            "action_dim": cfg.env.action_dim,
-            "action_embedding_dim": cfg.model.action_embedding_dim,
-            "hidden_dim": cfg.model.hidden_dim,
-            "latent_dim": cfg.model.latent_dim,
-            "n_codebook": cfg.model.n_codebook,
-            "commitment_beta": cfg.model.commitment_beta,
-            "context_length": cfg.model.context_length,
-            "predictor_weight": cfg.model.predictor_weight,
-            "channels": cfg.visual.channels,
-        }
-        return model_cls(**kwargs)
+        predictor = build_predictor(cfg)
+        return model_cls(
+            predictor=predictor,
+            latent_dim=cfg.model.latent_dim,
+            n_codebook=cfg.model.n_codebook,
+            commitment_beta=cfg.model.commitment_beta,
+            context_length=cfg.model.context_length,
+            predictor_weight=cfg.model.predictor_weight,
+            channels=cfg.visual.channels,
+        )
 
     kwargs = {
         "state_dim": cfg.env.state_dim,
@@ -107,7 +118,7 @@ def build_dataset(env, cfg):
     )
 
 
-def visual_train_step(model, batch, optimizer):
+def visual_train_step(model, batch, optimizers):
     images = batch["images"]              # (B, T, C, H, W)
     target_images = batch["target_images"]  # (B, T, C, H, W)
     actions = batch["actions"]            # (B, T)
@@ -116,17 +127,26 @@ def visual_train_step(model, batch, optimizer):
     latent_dim = model.latent_dim
     context_length = model.context_length
 
-    # Build all T+1 frames: first input frame + all targets
+    opt_enc, opt_dec, opt_pred = optimizers["encoder"], optimizers["decoder"], optimizers["predictor"]
+
+    # --- Autoencoder step (encoder + VQ + decoder) ---
     all_images = torch.cat([images[:, 0:1], target_images], dim=1)  # (B, T+1, C, H, W)
     all_flat = all_images.reshape(B * (T + 1), C, H, W)
 
-    # Encode + quantize + decode all frames
     z_all = model.encode(all_flat)
     z_q_all, vq_loss = model.quantize(z_all)[:2]
     recon_all = model.decode(z_q_all)
     recon_loss = ((recon_all - all_flat) ** 2).mean()
 
-    # Predictor operates on detached quantized latents (gradient isolation)
+    ae_loss = recon_loss + vq_loss
+
+    opt_enc.zero_grad()
+    opt_dec.zero_grad()
+    ae_loss.backward()
+    opt_enc.step()
+    opt_dec.step()
+
+    # --- Predictor step (on detached latents) ---
     z_q_seq = z_q_all.reshape(B, T + 1, latent_dim).detach()
 
     predictor_loss = torch.tensor(0.0, device=images.device)
@@ -142,13 +162,12 @@ def visual_train_step(model, batch, optimizer):
     if n_pred > 0:
         predictor_loss = predictor_loss / n_pred
 
-    total_loss = recon_loss + vq_loss + model.predictor_weight * predictor_loss
+    opt_pred.zero_grad()
+    predictor_loss.backward()
+    opt_pred.step()
 
-    optimizer.zero_grad()
-    total_loss.backward()
-    optimizer.step()
-
-    return total_loss.item()
+    total_loss = ae_loss.item() + model.predictor_weight * predictor_loss.item()
+    return total_loss
 
 
 @torch.no_grad()
@@ -169,6 +188,8 @@ def visual_eval_step(model, batch):
     recon_all = model.decode(z_q_all)
     recon_loss = ((recon_all - all_flat) ** 2).mean()
 
+    ae_loss = recon_loss + vq_loss
+
     z_q_seq = z_q_all.reshape(B, T + 1, latent_dim)
 
     predictor_loss = torch.tensor(0.0, device=images.device)
@@ -183,7 +204,7 @@ def visual_eval_step(model, batch):
     if n_pred > 0:
         predictor_loss = predictor_loss / n_pred
 
-    total_loss = recon_loss + vq_loss + model.predictor_weight * predictor_loss
+    total_loss = ae_loss + model.predictor_weight * predictor_loss
     return total_loss.item()
 
 
@@ -273,7 +294,17 @@ def main(cfg: DictConfig):
     train_loader = DataLoader(train_data, batch_size=cfg.training.batch_size, shuffle=True)
     test_loader = DataLoader(val_data, batch_size=cfg.training.batch_size, shuffle=False)
 
-    optimizer = optim.Adam(model.parameters(), lr=cfg.training.lr)
+    if is_visual:
+        lr = cfg.training.lr
+        optimizers = {
+            "encoder": optim.Adam(model.encoder_parameters(), lr=lr),
+            "decoder": optim.Adam(model.decoder_parameters(), lr=lr),
+            "predictor": optim.Adam(model.predictor_parameters(), lr=lr),
+        }
+        optimizer = None
+    else:
+        optimizers = None
+        optimizer = optim.Adam(model.parameters(), lr=cfg.training.lr)
 
     # Training loop
     best_test_loss = float("inf")
@@ -284,7 +315,7 @@ def main(cfg: DictConfig):
         train_loss_sum = 0.0
         for batch in train_loader:
             if is_visual:
-                train_loss_sum += visual_train_step(model, batch, optimizer)
+                train_loss_sum += visual_train_step(model, batch, optimizers)
             else:
                 train_loss_sum += train_step(model, batch, optimizer, cfg.data.dt, is_ode)
         avg_train = train_loss_sum / len(train_loader)

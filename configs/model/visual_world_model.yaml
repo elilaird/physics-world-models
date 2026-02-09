@@ -1,5 +1,6 @@
 name: visual_world_model
 type: visual
+predictor: latent_mlp
 latent_dim: 32
 n_codebook: 512
 hidden_dim: 128
