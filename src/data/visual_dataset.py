@@ -3,6 +3,7 @@
 from torch.utils.data import Dataset
 import torch
 import numpy as np
+from tqdm import tqdm
 
 from src.envs.base import PhysicsControlEnv
 
@@ -35,12 +36,8 @@ class VisualSequenceDataset(Dataset):
         self.render_quality = render_quality
 
         channels = 3 if color else 1
-        print(
-            f"Generating {n_seqs} visual sequences of length {seq_len} "
-            f"({img_size}x{img_size}x{channels})..."
-        )
 
-        for _ in range(n_seqs):
+        for _ in tqdm(range(n_seqs), desc=f"Generating {n_seqs} visual seqs ({img_size}x{img_size}x{channels})"):
             sampled_params = self._sample_variable_params()
             state = self._sample_init_state()
 

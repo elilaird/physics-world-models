@@ -28,6 +28,14 @@ python train.py env=spaceship model=newtonian training.epochs=80 training.lr=5e-
 # Sweep models
 python train.py --multirun model=jump,lstm,newtonian,port_hamiltonian
 
+# Generate a dataset (saved to datasets/<env_name>/<timestamp>/)
+python generate_dataset.py
+python generate_dataset.py env=pendulum data.n_seqs=1000
+
+# Train on a pre-generated dataset
+python train.py dataset_path=datasets/oscillator/<timestamp>
+python train.py --multirun model=jump,lstm,newtonian dataset_path=datasets/oscillator/<timestamp>
+
 # Evaluate a checkpoint
 python evaluate.py checkpoint=outputs/<date>/<time>/<model>/best_model.pt
 
@@ -68,7 +76,7 @@ All models use `nn.Embedding` for discrete action spaces. Registry in `src/model
 - `ThreeBodyEnv`: 12D state, 9 actions, symplectic Euler integration
 
 ### Data (`src/data/`)
-`SequenceDataset` generates (states, actions, targets) sequences from any env with randomized variable params per sequence.
+`SequenceDataset` generates (states, actions, targets) sequences from any env with randomized variable params per sequence. `generate_dataset.py` pre-computes and saves train/val/test splits as stacked tensors under `datasets/<env>/`. `PrecomputedDataset` loads these for training via `dataset_path` config.
 
 ### Evaluation (`src/eval/`)
 - `utils.py`: `load_checkpoint()`, `rebuild_model()`, `rebuild_env()` — shared by `evaluate.py` and `report.py`

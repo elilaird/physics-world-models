@@ -12,6 +12,7 @@ import logging
 import os
 
 import hydra
+import hydra.utils
 import numpy as np
 import torch
 import torch.optim as optim
@@ -24,6 +25,7 @@ from src.models import MODEL_REGISTRY
 from src.models.wrappers import TrajectoryMatchingModel
 from src.data.dataset import SequenceDataset
 from src.data.visual_dataset import build_visual_dataset
+from src.data.precomputed import PrecomputedDataset
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +62,20 @@ def build_model(cfg):
         model = TrajectoryMatchingModel(model, method=method)
 
     return model
+
+
+def resolve_dataset_path(path):
+    """Resolve dataset_path to an absolute directory (handles Hydra cwd change)."""
+    if os.path.isabs(path):
+        return path
+    orig_cwd = hydra.utils.get_original_cwd()
+    candidate = os.path.join(orig_cwd, path)
+    if os.path.isdir(candidate):
+        return candidate
+    candidate = os.path.join(orig_cwd, "datasets", path)
+    if os.path.isdir(candidate):
+        return candidate
+    return os.path.join(orig_cwd, path)
 
 
 def build_dataset(env, cfg):
@@ -146,26 +162,32 @@ def main(cfg: DictConfig):
     env = build_env(cfg)
     visual = is_visual_env(cfg)
 
-    if visual:
-        dataset = build_visual_dataset(env, cfg)
-    else:
-        dataset = build_dataset(env, cfg)
-
     model = build_model(cfg)
     is_ode = cfg.model.type == "ode"
 
     param_count = sum(p.numel() for p in model.parameters())
     log.info(f"Model: {cfg.model.name} ({param_count} params)")
 
-    # Train/test split
-    n = len(dataset)
-    perm = np.random.permutation(n)
-    split = int(n * cfg.training.train_split)
-    train_data = [dataset[i] for i in perm[:split]]
-    test_data = [dataset[i] for i in perm[split:]]
+    # Load or generate dataset
+    if cfg.dataset_path:
+        dataset_dir = resolve_dataset_path(cfg.dataset_path)
+        train_data = PrecomputedDataset(os.path.join(dataset_dir, "train.pt"))
+        val_data = PrecomputedDataset(os.path.join(dataset_dir, "val.pt"))
+        log.info(f"Loaded dataset from {dataset_dir} (train={len(train_data)}, val={len(val_data)})")
+    else:
+        if visual:
+            dataset = build_visual_dataset(env, cfg)
+        else:
+            dataset = build_dataset(env, cfg)
+
+        n = len(dataset)
+        perm = np.random.permutation(n)
+        split = int(n * cfg.training.train_split)
+        train_data = [dataset[i] for i in perm[:split]]
+        val_data = [dataset[i] for i in perm[split:]]
 
     train_loader = DataLoader(train_data, batch_size=cfg.training.batch_size, shuffle=True)
-    test_loader = DataLoader(test_data, batch_size=cfg.training.batch_size, shuffle=False)
+    test_loader = DataLoader(val_data, batch_size=cfg.training.batch_size, shuffle=False)
 
     optimizer = optim.Adam(model.parameters(), lr=cfg.training.lr)
 
