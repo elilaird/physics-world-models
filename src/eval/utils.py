@@ -6,6 +6,7 @@ from omegaconf import OmegaConf
 from src.envs import ENV_REGISTRY
 from src.models import MODEL_REGISTRY
 from src.models.wrappers import TrajectoryMatchingModel
+from src.models.visual import PREDICTOR_REGISTRY
 
 
 def load_checkpoint(checkpoint_path):
@@ -21,19 +22,24 @@ def rebuild_model(cfg):
 
     if cfg.model.type == "visual":
         visual_cfg = cfg.get("visual", {})
-        kwargs = {
-            "state_dim": cfg.env.state_dim,
-            "action_dim": cfg.env.action_dim,
-            "action_embedding_dim": cfg.model.action_embedding_dim,
-            "hidden_dim": cfg.model.hidden_dim,
-            "latent_dim": cfg.model.latent_dim,
-            "n_codebook": cfg.model.n_codebook,
-            "commitment_beta": cfg.model.commitment_beta,
-            "context_length": cfg.model.context_length,
-            "predictor_weight": cfg.model.predictor_weight,
-            "channels": visual_cfg.get("channels", 3),
-        }
-        return model_cls(**kwargs)
+        predictor_name = cfg.model.get("predictor", "latent_mlp")
+        predictor_cls = PREDICTOR_REGISTRY[predictor_name]
+        predictor = predictor_cls(
+            latent_dim=cfg.model.latent_dim,
+            action_dim=cfg.env.action_dim,
+            action_embedding_dim=cfg.model.action_embedding_dim,
+            hidden_dim=cfg.model.hidden_dim,
+            context_length=cfg.model.context_length,
+        )
+        return model_cls(
+            predictor=predictor,
+            latent_dim=cfg.model.latent_dim,
+            n_codebook=cfg.model.n_codebook,
+            commitment_beta=cfg.model.commitment_beta,
+            context_length=cfg.model.context_length,
+            predictor_weight=cfg.model.predictor_weight,
+            channels=visual_cfg.get("channels", 3),
+        )
 
     kwargs = {
         "state_dim": cfg.env.state_dim,

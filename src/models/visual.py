@@ -122,11 +122,15 @@ class LatentPredictor(nn.Module):
         return z_t + delta
 
 
-class VisualWorldModel(nn.Module):
-    """VQ-VAE encoder/decoder + latent-space predictor world model."""
+PREDICTOR_REGISTRY = {
+    "latent_mlp": LatentPredictor,
+}
 
-    def __init__(self, state_dim, action_dim, action_embedding_dim=8,
-                 hidden_dim=128, latent_dim=32, n_codebook=512,
+
+class VisualWorldModel(nn.Module):
+    """VQ-VAE encoder/decoder + swappable latent-space predictor world model."""
+
+    def __init__(self, predictor, latent_dim=32, n_codebook=512,
                  commitment_beta=0.25, context_length=3,
                  predictor_weight=1.0, channels=3):
         super().__init__()
@@ -138,13 +142,7 @@ class VisualWorldModel(nn.Module):
         self.vq = VectorQuantizer(n_codebook=n_codebook, latent_dim=latent_dim,
                                   commitment_beta=commitment_beta)
         self.decoder = VisionDecoder(channels=channels, latent_dim=latent_dim)
-        self.predictor = LatentPredictor(
-            latent_dim=latent_dim,
-            action_dim=action_dim,
-            action_embedding_dim=action_embedding_dim,
-            hidden_dim=hidden_dim,
-            context_length=context_length,
-        )
+        self.predictor = predictor
 
     def encode(self, images):
         return self.encoder(images)
@@ -154,3 +152,16 @@ class VisualWorldModel(nn.Module):
 
     def decode(self, z_q):
         return self.decoder(z_q)
+
+    def encoder_parameters(self):
+        """Parameters for encoder + vector quantizer."""
+        yield from self.encoder.parameters()
+        yield from self.vq.parameters()
+
+    def decoder_parameters(self):
+        """Parameters for decoder."""
+        yield from self.decoder.parameters()
+
+    def predictor_parameters(self):
+        """Parameters for predictor."""
+        yield from self.predictor.parameters()
