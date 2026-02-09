@@ -81,8 +81,11 @@ All environments use discrete action spaces and integrate ground-truth dynamics 
 | NewtonianDynamicsModel | ODE | `d/dt[x,v] = [v, f(x,v,a)]` with learned damping | `model=newtonian` |
 | VelocityDynamicsModel | ODE | Learns velocity, shares integrator interface | `model=velocity` |
 | PortHamiltonianModel | ODE | Learns H(q,p), symplectic dynamics via autograd | `model=port_hamiltonian` |
+| VisualWorldModel | Visual | VQ-VAE + latent predictor for pixel observations | `model=visual_world_model` |
 
 ODE models are automatically wrapped with `TrajectoryMatchingModel` for integration via `torchdiffeq`. This means they naturally handle variable timesteps — no retraining needed to evaluate at different dt values.
+
+The **VisualWorldModel** operates on pixel observations rather than state vectors. It uses a VQ-VAE (encoder → vector quantizer → decoder) for image reconstruction, paired with a residual-MLP latent predictor that forecasts the next quantized latent from a context window of past latents + action. The predictor is gradient-isolated from the autoencoder via detach, so each component trains on its own objective with a single optimizer.
 
 ## Evaluation
 
@@ -127,12 +130,17 @@ Environments can render states as images for pixel-based learning. Currently sup
 python scripts/visualize_env.py --env oscillator --n_frames 50
 python scripts/visualize_env.py --env pendulum --save_gif pendulum_demo.gif --img_size 128
 
-# Train with visual config (generates dataset; model architectures not yet implemented)
-python train.py env=oscillator_visual
-python train.py env=pendulum_visual
+# Train visual world model
+python train.py env=oscillator_visual model=visual_world_model
+python train.py env=pendulum_visual model=visual_world_model
+
+# Override visual model hyperparams
+python train.py env=oscillator_visual model=visual_world_model model.latent_dim=64 model.context_length=2 model.n_codebook=256
 ```
 
 Visual env configs (`oscillator_visual`, `pendulum_visual`) inherit physics parameters from their base configs and add `observation_mode: pixels`. The `visual` section in `config.yaml` controls `img_size`, `color`, and `render_quality`.
+
+The visual world model config (`model=visual_world_model`) exposes: `latent_dim` (codebook vector size), `n_codebook` (number of codebook entries), `context_length` (how many past latents the predictor sees), `commitment_beta` (VQ commitment loss weight), and `predictor_weight` (latent prediction loss weight).
 
 For the dm_control wrapper: `pip install gymnasium shimmy[dm_control] dm_control`, then use `env=pendulum_dmcontrol`.
 
