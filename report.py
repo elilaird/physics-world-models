@@ -33,6 +33,8 @@ COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e3
 def discover_checkpoints(cfg):
     """Collect checkpoint paths from config."""
     paths = list(cfg.checkpoints) if cfg.checkpoints else []
+    print("paths: ", paths)
+    print("checkpoints: ", cfg.checkpoints)
 
     if cfg.report_checkpoint_dir:
         found = sorted(glob.glob(os.path.join(cfg.report_checkpoint_dir, "**/best_model.pt"), recursive=True))
