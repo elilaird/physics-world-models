@@ -29,22 +29,22 @@ python train.py env=spaceship model=newtonian training.epochs=80 training.lr=5e-
 python train.py --multirun model=jump,lstm,newtonian,port_hamiltonian
 
 # Evaluate a checkpoint
-python evaluate.py checkpoint=outputs/<date>/<time>/best_model.pt
+python evaluate.py checkpoint=outputs/<date>/<time>/<model>/best_model.pt
 
 # Evaluate with custom settings
 python evaluate.py checkpoint=path/to/best_model.pt eval.horizon=100 eval.dt_values=[0.05,0.1,0.2,0.5]
 
-# Compare multiple models (must share same env)
-python report.py checkpoints=[path/to/jump/best_model.pt,path/to/lstm/best_model.pt]
+# Compare models from a training run (short path auto-resolves under outputs/ or multirun/)
+python report.py report_checkpoint_dir=<date>/<time>
 
-# Or scan a multirun output directory
-python report.py checkpoint_dir=multirun/<date>/<time>
+# Or use full paths
+python report.py report_checkpoint_dir=outputs/<date>/<time>
 
 # Override eval settings for report
-python report.py checkpoint_dir=multirun/<date>/<time> eval.horizon=100 eval.dt_values=[0.05,0.1,0.2,0.5]
+python report.py report_checkpoint_dir=<date>/<time> eval.horizon=100 eval.dt_values=[0.05,0.1,0.2,0.5]
 ```
 
-Hydra outputs (checkpoints, logs, plots) go to `outputs/<date>/<time>/`.
+Hydra outputs (checkpoints, logs, plots) go to `outputs/<date>/<time>/<model_name>/`.
 
 ## Architecture
 

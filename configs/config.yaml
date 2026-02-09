@@ -31,3 +31,10 @@ report_checkpoint_dir: null
 
 report:
   output_dir: reports/${now:%Y-%m-%d_%H-%M-%S}
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}/${model.name}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${model.name}

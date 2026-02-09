@@ -30,7 +30,7 @@ python train.py --multirun model=jump,lstm,newtonian,velocity,port_hamiltonian
 python evaluate.py checkpoint=outputs/<date>/<time>/best_model.pt
 ```
 
-Checkpoints, logs, and plots are saved to `outputs/<date>/<time>/` by Hydra.
+Checkpoints, logs, and plots are saved to `outputs/<date>/<time>/<model_name>/` by Hydra.
 
 ## Environments
 
@@ -65,7 +65,7 @@ ODE models are automatically wrapped with `TrajectoryMatchingModel` for integrat
 - **dt generalization** — tests prediction accuracy across different integration timesteps
 
 ```bash
-python evaluate.py checkpoint=path/to/best_model.pt eval.horizon=100 eval.dt_values=[0.05,0.1,0.2,0.5]
+python evaluate.py checkpoint=outputs/<date>/<time>/<model>/best_model.pt eval.horizon=100
 ```
 
 Outputs `rollout.png`, `energy.png`, `dt_generalization.png`, and `eval_metrics.pt`.
@@ -75,11 +75,11 @@ Outputs `rollout.png`, `energy.png`, `dt_generalization.png`, and `eval_metrics.
 `report.py` compares multiple checkpoints (trained on the same env) side-by-side:
 
 ```bash
-# Compare specific checkpoints
-python report.py checkpoints=[path/to/jump/best_model.pt,path/to/lstm/best_model.pt]
+# Scan a training run directory (short path auto-resolves under outputs/ or multirun/)
+python report.py report_checkpoint_dir=<date>/<time>
 
-# Or scan a multirun output directory for all best_model.pt files
-python report.py checkpoint_dir=multirun/<date>/<time>
+# Or use full paths
+python report.py report_checkpoint_dir=outputs/<date>/<time>
 ```
 
 Produces comparison tables (console + CSV) and combined plots in `reports/<timestamp>/`:
