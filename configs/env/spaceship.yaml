@@ -1,0 +1,17 @@
+name: spaceship
+state_dim: 4
+action_dim: 9
+
+params:
+  G: 1.0
+  M_star: 10.0
+  thruster_magnitude: 0.5
+
+# No variable params — orbital mechanics are fixed
+variable_params: {}
+
+init_state_range:
+  - [-5.0, 5.0]   # q_x
+  - [-5.0, 5.0]   # q_y
+  - [-2.0, 2.0]   # v_x
+  - [-2.0, 2.0]   # v_y
