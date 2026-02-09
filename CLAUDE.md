@@ -8,40 +8,64 @@ Research project comparing neural network architectures for learning physics dyn
 
 ## Key Dependencies
 
-- PyTorch, torchdiffeq (ODE integration via `odeint` with dopri5 solver)
+- PyTorch, torchdiffeq, hydra-core, omegaconf
 - OpenCV (cv2), matplotlib (visualization/rendering)
-- No package manager config exists — install dependencies manually (`pip install torch torchdiffeq opencv-python matplotlib`)
+- Conda environment: `dino_wm`
+- Install extras: `pip install hydra-core omegaconf`
+
+## Running Experiments
+
+```bash
+# Train (defaults: oscillator env + jump model)
+python train.py
+
+# Train specific env + model combination
+python train.py env=pendulum model=port_hamiltonian
+
+# Override training params
+python train.py env=spaceship model=newtonian training.epochs=80 training.lr=5e-4
+
+# Sweep models
+python train.py --multirun model=jump,lstm,newtonian,port_hamiltonian
+
+# Evaluate a checkpoint
+python evaluate.py checkpoint=outputs/<date>/<time>/best_model.pt
+
+# Evaluate with custom settings
+python evaluate.py checkpoint=path/to/best_model.pt eval.horizon=100 eval.dt_values=[0.05,0.1,0.2,0.5]
+```
+
+Hydra outputs (checkpoints, logs, plots) go to `outputs/<date>/<time>/`.
 
 ## Architecture
 
-There are two parallel environment systems:
+### Config system (`configs/`)
+Hydra with composable groups. `configs/config.yaml` sets defaults and training params. Override with `env=<name>` and `model=<name>`.
+- **env configs**: oscillator, pendulum, spaceship, three_body — each defines state_dim, action_dim, physics params, variable_params ranges, init_state_range
+- **model configs**: jump, lstm, first_order_ode, newtonian, velocity, port_hamiltonian — each defines type (discrete/ode), hidden_dim, integration_method
 
-### 1. Control environments (`envs.py`)
-`PhysicsControlEnv` base class with `ForcedOscillator` and `ForcedPendulum`. These use discrete action spaces (action maps like `{0: -1.0, 1: 0.0, 2: 1.0}`), integrate dynamics with `torchdiffeq.odeint`, and support variable parameters (mass, damping, stiffness) randomized per sequence for generalization. Used with `datasets.py:SequenceDataset` which generates (states, actions, targets) tuples.
+### Models (`src/models/`)
+All models use `nn.Embedding` for discrete action spaces. Registry in `src/models/__init__.py`.
+- **Discrete** (`discrete.py`): `JumpModel` (residual MLP), `LSTMModel` — forward: `(state, action) → next_state`
+- **ODE** (`ode.py`): `FirstOrderODENet`, `NewtonianDynamicsModel`, `VelocityDynamicsModel` — forward: `(t, state, action_emb)` for `torchdiffeq.odeint`
+- **Hamiltonian** (`hamiltonian.py`): `PortHamiltonianModel` — learns H(q,p), derives dynamics via `torch.autograd.grad`
+- **Wrappers** (`wrappers.py`): `TrajectoryMatchingModel` (single-step ODE integration), `TrajectoryShootingModel` (multi-step rollout). ODE models are auto-wrapped by `train.py` when `model.type == "ode"`.
 
-### 2. Hamiltonian Generative Network environments (`environments/`)
-Based on [arxiv.org/abs/1909.13789](https://arxiv.org/abs/1909.13789). `Environment` ABC in `environment.py` with concrete implementations: `Pendulum`, `Spring`, `NObjectGravity`, `ChaoticPendulum`. These use generalized coordinates (q, p), render pixel observations via anti-aliased circle rendering, and are accessed through `EnvFactory`. Used with `environments/datasets.py:EnvironmentSampler`.
+### Environments (`src/envs/`)
+`PhysicsControlEnv` base class with discrete action maps. Registry in `src/envs/__init__.py`.
+- `ForcedOscillator`: 2D state [x, v], 3 actions
+- `ForcedPendulum`: 2D state [theta, omega], 3 actions
+- `ForcedTwoBodySpaceship`: 4D state [qx, qy, vx, vy], 9 directional thrusters
+- `ThreeBodyEnv`: 12D state, 9 actions, symplectic Euler integration
 
-### Models (`models.py`)
-All models predict next state from (state, action) with discrete action embeddings:
-- **JumpModel**: Residual MLP, learns `x_{t+1} = x_t + f(x_t, a_t)`
-- **LSTMModel**: LSTM with residual connection for sequential prediction
-- **NewtonianDynamicsModel**: Physics prior separating position/velocity, learns acceleration with learned damping. Takes `(t, state, action_emb)` for ODE integration.
-- **VelocityDynamicsModel**: Learns velocity directly, zeros for dvdt to share integrator interface
-- **PortHamiltonianModel**: Learns Hamiltonian H(q,p) with autograd for symplectic structure, includes dissipation and input port G(u)
+### Data (`src/data/`)
+`SequenceDataset` generates (states, actions, targets) sequences from any env with randomized variable params per sequence.
 
-The ODE-based models (Newtonian, Velocity, PortHamiltonian) use `forward(t, state, action_emb)` signature compatible with `torchdiffeq.odeint`. The discrete models (Jump, LSTM) use `forward(state, action)`.
+### Evaluation (`src/eval/`)
+- `metrics.py`: `mse_over_horizon()`, `energy_drift()`
+- `rollout.py`: `open_loop_rollout()`, `dt_generalization_test()`
 
-## Experiments
-
-Jupyter notebooks in `experiments/` — run directly (not via a test runner). Key notebook: `experiments/pendulum/pendulum.ipynb`.
-
-## Running Code
-
-```bash
-# Environment factory demo (from environments/ directory)
-python environments/environment_factory.py
-
-# Individual environment demos
-python environments/pendulum.py
-```
+### Legacy systems (kept for reference)
+- `models.py`, `envs.py`, `datasets.py` — original flat-file versions, superseded by `src/`
+- `environments/` — separate HGN pixel-rendering system (Pendulum, Spring, NObjectGravity, ChaoticPendulum) based on arxiv 1909.13789
+- `experiments/` — original Jupyter notebooks (archived)
