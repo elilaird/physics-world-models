@@ -24,6 +24,8 @@ class ForcedPendulum(PhysicsControlEnv):
         self.m, self.L, self.g, self.c = m, L, g, c
 
     def step(self, state, action_idx, dt=0.1, variable_params=None):
+        if isinstance(action_idx, torch.Tensor):
+            action_idx = int(action_idx.item())
         f_val = self.action_map[action_idx]
         if variable_params is not None:
             m = variable_params.get("m", self.m)

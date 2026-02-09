@@ -11,3 +11,11 @@ outputs/
 reports/
 *.pt
 multirun/
+*.gif
+*.png
+*.h5
+*.csv
+*.json
+*.pt
+*.pth
+*.pkl
