@@ -23,8 +23,14 @@ from src.envs import ENV_REGISTRY
 from src.models import MODEL_REGISTRY
 from src.models.wrappers import TrajectoryMatchingModel
 from src.data.dataset import SequenceDataset
+from src.data.visual_dataset import build_visual_dataset
 
 log = logging.getLogger(__name__)
+
+
+def is_visual_env(cfg):
+    """Check if the environment config specifies pixel observations."""
+    return getattr(cfg.env, "observation_mode", None) == "pixels"
 
 
 def build_env(cfg):
@@ -71,6 +77,12 @@ def build_dataset(env, cfg):
 
 
 def train_step(model, batch, optimizer, dt, is_ode):
+    if "images" in batch:
+        raise NotImplementedError(
+            "Visual model architectures not yet implemented. "
+            "Use a vector-state environment (e.g. env=oscillator) for training."
+        )
+
     states = batch["states"]      # (B, T, state_dim)
     actions = batch["actions"]    # (B, T)
     targets = batch["targets"]    # (B, T, state_dim)
@@ -98,6 +110,12 @@ def train_step(model, batch, optimizer, dt, is_ode):
 
 @torch.no_grad()
 def eval_step(model, batch, dt, is_ode):
+    if "images" in batch:
+        raise NotImplementedError(
+            "Visual model architectures not yet implemented. "
+            "Use a vector-state environment (e.g. env=oscillator) for training."
+        )
+
     states = batch["states"]
     actions = batch["actions"]
     targets = batch["targets"]
@@ -126,7 +144,13 @@ def main(cfg: DictConfig):
 
     # Build components
     env = build_env(cfg)
-    dataset = build_dataset(env, cfg)
+    visual = is_visual_env(cfg)
+
+    if visual:
+        dataset = build_visual_dataset(env, cfg)
+    else:
+        dataset = build_dataset(env, cfg)
+
     model = build_model(cfg)
     is_ode = cfg.model.type == "ode"
 

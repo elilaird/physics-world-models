@@ -90,6 +90,24 @@ Produces comparison tables (console + CSV) and combined plots in `reports/<times
 - `dt_generalization.png` — grouped bar chart across dt values
 - `mse_over_horizon.png` — per-timestep MSE curves
 
+## Visual Observations
+
+Environments can render states as images for pixel-based learning. Currently supported: oscillator and pendulum (custom renderer), plus a dm_control pendulum wrapper for MuJoCo rendering.
+
+```bash
+# Preview rendering
+python scripts/visualize_env.py --env oscillator --n_frames 50
+python scripts/visualize_env.py --env pendulum --save_gif pendulum_demo.gif --img_size 128
+
+# Train with visual config (generates dataset; model architectures not yet implemented)
+python train.py env=oscillator_visual
+python train.py env=pendulum_visual
+```
+
+Visual env configs (`oscillator_visual`, `pendulum_visual`) inherit physics parameters from their base configs and add `observation_mode: pixels`. The `visual` section in `config.yaml` controls `img_size`, `color`, and `render_quality`.
+
+For the dm_control wrapper: `pip install gymnasium shimmy[dm_control] dm_control`, then use `env=pendulum_dmcontrol`.
+
 ## Project Structure
 
 ```
@@ -102,6 +120,8 @@ src/
   envs/                    # Environment implementations + registry
   data/                    # SequenceDataset for trajectory generation
   eval/                    # Metrics and rollout evaluation
+scripts/
+  visualize_env.py           # Validate environment rendering (argparse)
 train.py                   # Unified training entry point
 evaluate.py                # Single-model evaluation with plots + metrics
 report.py                  # Multi-model comparison report

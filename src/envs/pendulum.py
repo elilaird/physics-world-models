@@ -2,6 +2,10 @@ import torch
 from torchdiffeq import odeint
 
 from src.envs.base import PhysicsControlEnv
+from src.envs.rendering import (
+    world_to_pixels, render_circle_aa, gaussian_blur,
+    DEFAULT_BG_COLOR, DEFAULT_BALL_COLORS,
+)
 
 
 class ForcedPendulum(PhysicsControlEnv):
@@ -50,3 +54,30 @@ class ForcedPendulum(PhysicsControlEnv):
         kinetic = 0.5 * m * L**2 * omega**2
         potential = m * g * L * (1 - torch.cos(theta))
         return kinetic + potential
+
+    def render_state(self, state, img_size=64, color=True, render_quality="medium"):
+        """Render pendulum state as an image. Bob at (L*sin(theta), L*cos(theta))."""
+        world_size = 2.0
+        space_res = 2.0 * world_size / img_size
+        radius = self.m / space_res
+
+        theta = state[0].item() if isinstance(state, torch.Tensor) else state[0]
+
+        x_world = self.L * torch.sin(torch.tensor(theta))
+        y_world = self.L * torch.cos(torch.tensor(theta))
+
+        img = torch.zeros(img_size, img_size, 3)
+        ball_color = torch.tensor(DEFAULT_BALL_COLORS[0])
+
+        px, py = world_to_pixels(x_world.item(), y_world.item(), img_size, world_size)
+        img = render_circle_aa(img, px, py, radius, ball_color, render_quality)
+        img = gaussian_blur(img, kernel_size=5, sigma=1.0)
+
+        bg = torch.tensor(DEFAULT_BG_COLOR)
+        img = img + bg
+        img = torch.clamp(img, 0.0, 1.0)
+
+        if not color:
+            img = torch.max(img, dim=-1, keepdim=True)[0]
+
+        return img

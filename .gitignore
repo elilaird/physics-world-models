@@ -10,3 +10,4 @@ __pycache__
 outputs/
 reports/
 *.pt
+multirun/

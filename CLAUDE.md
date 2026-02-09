@@ -75,6 +75,23 @@ All models use `nn.Embedding` for discrete action spaces. Registry in `src/model
 - `metrics.py`: `mse_over_horizon()`, `energy_drift()`
 - `rollout.py`: `open_loop_rollout()`, `dt_generalization_test()`
 
+### Visual Observations (`src/envs/rendering.py`, `src/data/visual_dataset.py`)
+Pixel-based observations for environments with `render_state()`. Oscillator and Pendulum have custom renderers ported from `environments/`. `dm_control` pendulum wrapper provides MuJoCo-rendered alternative (requires `gymnasium shimmy[dm_control] dm_control`).
+
+- **Visual env configs** (`oscillator_visual`, `pendulum_visual`): inherit physics from base, set `observation_mode: pixels`
+- **`VisualSequenceDataset`**: generates `(images, actions, target_images)` tuples in `(T, C, H, W)` format, includes vector states for validation
+- **`visual` config section**: `img_size`, `channels`, `color`, `render_quality`
+- Visual model architectures are not yet implemented — `train.py` raises `NotImplementedError` on visual datasets
+
+```bash
+# Visualize rendering
+python scripts/visualize_env.py --env oscillator --n_frames 50
+python scripts/visualize_env.py --env pendulum --save_gif pendulum_demo.gif
+
+# Train with visual env (will generate dataset but fail at model step)
+python train.py env=oscillator_visual
+```
+
 ### Legacy systems (kept for reference)
 - `models.py`, `envs.py`, `datasets.py` — original flat-file versions, superseded by `src/`
 - `environments/` — separate HGN pixel-rendering system (Pendulum, Spring, NObjectGravity, ChaoticPendulum) based on arxiv 1909.13789

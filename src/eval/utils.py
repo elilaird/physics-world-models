@@ -43,3 +43,9 @@ def rebuild_env(cfg):
     env_cls = ENV_REGISTRY[cfg.env.name]
     params = OmegaConf.to_container(cfg.env.params, resolve=True)
     return env_cls(**params)
+
+
+def is_visual_checkpoint(cfg):
+    """Check if a checkpoint was trained with pixel observations."""
+    env_cfg = cfg.get("env", {})
+    return env_cfg.get("observation_mode", None) == "pixels"
