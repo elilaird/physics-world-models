@@ -1,5 +1,94 @@
-# physics-world-models
+# Physics World Models
 
+Comparing neural network architectures for learning physics dynamics as world models. Models are trained on simulated physics environments and evaluated on how well different inductive biases (discrete jumps, Newtonian mechanics, Hamiltonian structure) capture the true dynamics — including energy conservation and temporal generalization across timesteps.
 
+## Setup
 
-## For gymnasium with dm_control envs follow: https://medium.com/@kaige.yang0110/run-dm-control-with-gymnasium-framestack-and-resize-pixel-obsservation-34c1b8ff4764
+```bash
+conda activate dino_wm
+pip install hydra-core omegaconf
+```
+
+**Core dependencies:** PyTorch, torchdiffeq, hydra-core, omegaconf, matplotlib, opencv-python
+
+## Quick Start
+
+```bash
+# Train with defaults (oscillator + jump model)
+python train.py
+
+# Train a specific env + model combo
+python train.py env=pendulum model=port_hamiltonian
+
+# Override training hyperparams
+python train.py training.epochs=80 training.lr=5e-4 data.n_seqs=500
+
+# Sweep across models
+python train.py --multirun model=jump,lstm,newtonian,velocity,port_hamiltonian
+
+# Evaluate a trained checkpoint
+python evaluate.py checkpoint=outputs/<date>/<time>/best_model.pt
+```
+
+Checkpoints, logs, and plots are saved to `outputs/<date>/<time>/` by Hydra.
+
+## Environments
+
+| Environment | State | Actions | Config |
+|---|---|---|---|
+| Forced Oscillator | `[x, v]` (2D) | 3 (force left/none/right) | `env=oscillator` |
+| Forced Pendulum | `[theta, omega]` (2D) | 3 (torque) | `env=pendulum` |
+| 2-Body Spaceship | `[qx, qy, vx, vy]` (4D) | 9 (8 thrusters + idle) | `env=spaceship` |
+| 3-Body Gravity | `[pos, vel]` (12D) | 9 (thrust on body 0) | `env=three_body` |
+
+All environments use discrete action spaces and integrate ground-truth dynamics with `torchdiffeq.odeint` (except three-body which uses symplectic Euler). Variable parameters (e.g. damping) are randomized per sequence to force generalization.
+
+## Models
+
+| Model | Type | Inductive Bias | Config |
+|---|---|---|---|
+| JumpModel | Discrete | Residual MLP: `x_{t+1} = x_t + f(x_t, a_t)` | `model=jump` |
+| LSTMModel | Discrete | Recurrent with residual connection | `model=lstm` |
+| FirstOrderODENet | ODE | Learns `dx/dt = NN(x, a)` directly | `model=first_order_ode` |
+| NewtonianDynamicsModel | ODE | `d/dt[x,v] = [v, f(x,v,a)]` with learned damping | `model=newtonian` |
+| VelocityDynamicsModel | ODE | Learns velocity, shares integrator interface | `model=velocity` |
+| PortHamiltonianModel | ODE | Learns H(q,p), symplectic dynamics via autograd | `model=port_hamiltonian` |
+
+ODE models are automatically wrapped with `TrajectoryMatchingModel` for integration via `torchdiffeq`. This means they naturally handle variable timesteps — no retraining needed to evaluate at different dt values.
+
+## Evaluation
+
+`evaluate.py` loads a checkpoint and runs three analyses:
+
+- **Open-loop rollout** — feeds model's own predictions back recursively, plots trajectory vs ground truth
+- **Energy conservation** — tracks total energy over time, reports absolute and relative drift
+- **dt generalization** — tests prediction accuracy across different integration timesteps
+
+```bash
+python evaluate.py checkpoint=path/to/best_model.pt eval.horizon=100 eval.dt_values=[0.05,0.1,0.2,0.5]
+```
+
+Outputs `rollout.png`, `energy.png`, `dt_generalization.png`, and `eval_metrics.pt`.
+
+## Project Structure
+
+```
+configs/
+  config.yaml              # Hydra defaults + training params
+  env/                     # Per-environment configs
+  model/                   # Per-model configs
+src/
+  models/                  # Model implementations + registry
+  envs/                    # Environment implementations + registry
+  data/                    # SequenceDataset for trajectory generation
+  eval/                    # Metrics and rollout evaluation
+train.py                   # Unified training entry point
+evaluate.py                # Evaluation with plots + metrics
+environments/              # HGN pixel-rendering environments (separate system)
+experiments/               # Original Jupyter notebooks (archived)
+```
+
+## References
+
+- Hamiltonian Generative Networks: [arxiv.org/abs/1909.13789](https://arxiv.org/abs/1909.13789)
+- For gymnasium with dm_control envs: [setup guide](https://medium.com/@kaige.yang0110/run-dm-control-with-gymnasium-framestack-and-resize-pixel-obsservation-34c1b8ff4764)
