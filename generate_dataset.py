@@ -128,9 +128,11 @@ def main(cfg: DictConfig):
     }
 
     # Save
+    root = cfg.get("dataset_dir") or "datasets"
+    if not os.path.isabs(root):
+        root = os.path.join(hydra.utils.get_original_cwd(), root)
     output_dir = os.path.join(
-        hydra.utils.get_original_cwd(),
-        "datasets",
+        root,
         cfg.env.name,
         OmegaConf.to_container(cfg, resolve=True).get("_timestamp", time.strftime("%Y-%m-%d_%H-%M-%S")),
     )

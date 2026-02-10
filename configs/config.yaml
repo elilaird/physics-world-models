@@ -19,6 +19,7 @@ data:
   test_split: 0.1
 
 dataset_path: null
+dataset_dir: null
 
 wandb:
   enabled: false
