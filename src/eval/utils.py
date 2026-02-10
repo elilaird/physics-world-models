@@ -34,8 +34,8 @@ def rebuild_model(cfg):
         return model_cls(
             predictor=predictor,
             latent_dim=cfg.model.latent_dim,
-            n_codebook=cfg.model.n_codebook,
-            commitment_beta=cfg.model.commitment_beta,
+            beta=cfg.model.beta,
+            free_bits=cfg.model.free_bits,
             context_length=cfg.model.context_length,
             predictor_weight=cfg.model.predictor_weight,
             channels=visual_cfg.get("channels", 3),

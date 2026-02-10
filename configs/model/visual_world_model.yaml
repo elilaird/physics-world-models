@@ -2,9 +2,9 @@ name: visual_world_model
 type: visual
 predictor: latent_mlp
 latent_dim: 32
-n_codebook: 512
+beta: 4.0
+free_bits: 0.5
 hidden_dim: 128
 action_embedding_dim: 8
 context_length: 3
-commitment_beta: 0.25
 predictor_weight: 1.0

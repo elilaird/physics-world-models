@@ -1,11 +1,11 @@
-"""VQ-VAE visual world model with latent-space predictor."""
+"""Beta-VAE visual world model with latent-space predictor."""
 
 import torch
 import torch.nn as nn
 
 
 class VisionEncoder(nn.Module):
-    """Encodes (B, C, 64, 64) images to (B, latent_dim) vectors."""
+    """Encodes (B, C, 64, 64) images to (B, latent_dim) mu and logvar."""
 
     def __init__(self, channels=3, latent_dim=32):
         super().__init__()
@@ -23,11 +23,12 @@ class VisionEncoder(nn.Module):
             nn.BatchNorm2d(256),
             nn.ReLU(),
         )
-        self.fc = nn.Linear(256 * 4 * 4, latent_dim)
+        self.fc_mu = nn.Linear(256 * 4 * 4, latent_dim)
+        self.fc_logvar = nn.Linear(256 * 4 * 4, latent_dim)
 
     def forward(self, x):
-        h = self.net(x)
-        return self.fc(h.flatten(1))
+        h = self.net(x).flatten(1)
+        return self.fc_mu(h), self.fc_logvar(h)
 
 
 class VisionDecoder(nn.Module):
@@ -53,38 +54,6 @@ class VisionDecoder(nn.Module):
     def forward(self, z):
         h = self.fc(z).view(-1, 256, 4, 4)
         return self.net(h)
-
-
-class VectorQuantizer(nn.Module):
-    """Vector quantization with straight-through estimator."""
-
-    def __init__(self, n_codebook=512, latent_dim=32, commitment_beta=0.25):
-        super().__init__()
-        self.n_codebook = n_codebook
-        self.latent_dim = latent_dim
-        self.beta = commitment_beta
-
-        self.codebook = nn.Embedding(n_codebook, latent_dim)
-        self.codebook.weight.data.uniform_(-1.0 / n_codebook, 1.0 / n_codebook)
-
-    def forward(self, z):
-        # z: (B, latent_dim)
-        # Find nearest codebook entry
-        dists = (
-            z.pow(2).sum(1, keepdim=True)
-            - 2 * z @ self.codebook.weight.t()
-            + self.codebook.weight.pow(2).sum(1, keepdim=True).t()
-        )
-        indices = dists.argmin(dim=1)
-        z_q = self.codebook(indices)
-
-        # Losses
-        vq_loss = ((z_q - z.detach()) ** 2).mean() + self.beta * ((z_q.detach() - z) ** 2).mean()
-
-        # Straight-through estimator
-        z_q_st = z + (z_q - z).detach()
-
-        return z_q_st, vq_loss, indices
 
 
 class LatentPredictor(nn.Module):
@@ -127,36 +96,60 @@ PREDICTOR_REGISTRY = {
 }
 
 
-class VisualWorldModel(nn.Module):
-    """VQ-VAE encoder/decoder + swappable latent-space predictor world model."""
+def kl_divergence_free_bits(mu, logvar, free_bits=0.5):
+    """KL divergence with free bits (per-dimension clamping).
 
-    def __init__(self, predictor, latent_dim=32, n_codebook=512,
-                 commitment_beta=0.25, context_length=3,
-                 predictor_weight=1.0, channels=3):
+    Args:
+        mu: (B, latent_dim)
+        logvar: (B, latent_dim)
+        free_bits: minimum KL in nats per dimension
+
+    Returns:
+        kl_loss: scalar, mean over batch
+    """
+    # KL per dimension: 0.5 * (mu^2 + exp(logvar) - 1 - logvar)
+    kl_per_dim = 0.5 * (mu.pow(2) + logvar.exp() - 1 - logvar)  # (B, latent_dim)
+    # Clamp each dimension to at least free_bits nats
+    kl_clamped = torch.clamp(kl_per_dim, min=free_bits)  # (B, latent_dim)
+    # Sum over latent dims, mean over batch
+    return kl_clamped.sum(dim=1).mean()
+
+
+class VisualWorldModel(nn.Module):
+    """Beta-VAE encoder/decoder + swappable latent-space predictor world model."""
+
+    def __init__(self, predictor, latent_dim=32, beta=1.0, free_bits=0.5,
+                 context_length=3, predictor_weight=1.0, channels=3):
         super().__init__()
         self.latent_dim = latent_dim
+        self.beta = beta
+        self.free_bits = free_bits
         self.context_length = context_length
         self.predictor_weight = predictor_weight
 
         self.encoder = VisionEncoder(channels=channels, latent_dim=latent_dim)
-        self.vq = VectorQuantizer(n_codebook=n_codebook, latent_dim=latent_dim,
-                                  commitment_beta=commitment_beta)
         self.decoder = VisionDecoder(channels=channels, latent_dim=latent_dim)
         self.predictor = predictor
 
     def encode(self, images):
+        """Returns (mu, logvar) each of shape (B, latent_dim)."""
         return self.encoder(images)
 
-    def quantize(self, z):
-        return self.vq(z)
+    def reparameterize(self, mu, logvar):
+        """Sample z = mu + eps * std."""
+        std = (0.5 * logvar).exp()
+        eps = torch.randn_like(std)
+        return mu + eps * std
 
-    def decode(self, z_q):
-        return self.decoder(z_q)
+    def decode(self, z):
+        return self.decoder(z)
+
+    def kl_loss(self, mu, logvar):
+        return kl_divergence_free_bits(mu, logvar, self.free_bits)
 
     def encoder_parameters(self):
-        """Parameters for encoder + vector quantizer."""
+        """Parameters for encoder."""
         yield from self.encoder.parameters()
-        yield from self.vq.parameters()
 
     def decoder_parameters(self):
         """Parameters for decoder."""

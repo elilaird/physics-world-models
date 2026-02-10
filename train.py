@@ -63,8 +63,8 @@ def build_model(cfg):
         return model_cls(
             predictor=predictor,
             latent_dim=cfg.model.latent_dim,
-            n_codebook=cfg.model.n_codebook,
-            commitment_beta=cfg.model.commitment_beta,
+            beta=cfg.model.beta,
+            free_bits=cfg.model.free_bits,
             context_length=cfg.model.context_length,
             predictor_weight=cfg.model.predictor_weight,
             channels=cfg.visual.channels,
@@ -129,16 +129,17 @@ def visual_train_step(model, batch, optimizers):
 
     opt_enc, opt_dec, opt_pred = optimizers["encoder"], optimizers["decoder"], optimizers["predictor"]
 
-    # --- Autoencoder step (encoder + VQ + decoder) ---
+    # --- Autoencoder step (encoder + beta-VAE + decoder) ---
     all_images = torch.cat([images[:, 0:1], target_images], dim=1)  # (B, T+1, C, H, W)
     all_flat = all_images.reshape(B * (T + 1), C, H, W)
 
-    z_all = model.encode(all_flat)
-    z_q_all, vq_loss = model.quantize(z_all)[:2]
-    recon_all = model.decode(z_q_all)
+    mu, logvar = model.encode(all_flat)
+    z = model.reparameterize(mu, logvar)
+    recon_all = model.decode(z)
     recon_loss = ((recon_all - all_flat) ** 2).mean()
+    kl_loss = model.kl_loss(mu, logvar)
 
-    ae_loss = recon_loss + vq_loss
+    ae_loss = recon_loss + model.beta * kl_loss
 
     opt_enc.zero_grad()
     opt_dec.zero_grad()
@@ -147,16 +148,16 @@ def visual_train_step(model, batch, optimizers):
     opt_dec.step()
 
     # --- Predictor step (on detached latents) ---
-    z_q_seq = z_q_all.reshape(B, T + 1, latent_dim).detach()
+    z_seq = z.reshape(B, T + 1, latent_dim).detach()
 
     predictor_loss = torch.tensor(0.0, device=images.device)
     n_pred = 0
     for t in range(context_length - 1, T):
         # Build context [z_t, z_{t-1}, ..., z_{t-H+1}]
-        ctx_parts = [z_q_seq[:, t - i] for i in range(context_length)]
+        ctx_parts = [z_seq[:, t - i] for i in range(context_length)]
         context = torch.cat(ctx_parts, dim=-1)  # (B, context_length * latent_dim)
         pred_z = model.predictor(context, actions[:, t].long())
-        predictor_loss = predictor_loss + ((pred_z - z_q_seq[:, t + 1]) ** 2).mean()
+        predictor_loss = predictor_loss + ((pred_z - z_seq[:, t + 1]) ** 2).mean()
         n_pred += 1
 
     if n_pred > 0:
@@ -183,22 +184,24 @@ def visual_eval_step(model, batch):
     all_images = torch.cat([images[:, 0:1], target_images], dim=1)
     all_flat = all_images.reshape(B * (T + 1), C, H, W)
 
-    z_all = model.encode(all_flat)
-    z_q_all, vq_loss = model.quantize(z_all)[:2]
-    recon_all = model.decode(z_q_all)
+    mu, logvar = model.encode(all_flat)
+    # Use mean (no sampling) for deterministic eval
+    z = mu
+    recon_all = model.decode(z)
     recon_loss = ((recon_all - all_flat) ** 2).mean()
+    kl_loss = model.kl_loss(mu, logvar)
 
-    ae_loss = recon_loss + vq_loss
+    ae_loss = recon_loss + model.beta * kl_loss
 
-    z_q_seq = z_q_all.reshape(B, T + 1, latent_dim)
+    z_seq = z.reshape(B, T + 1, latent_dim)
 
     predictor_loss = torch.tensor(0.0, device=images.device)
     n_pred = 0
     for t in range(context_length - 1, T):
-        ctx_parts = [z_q_seq[:, t - i] for i in range(context_length)]
+        ctx_parts = [z_seq[:, t - i] for i in range(context_length)]
         context = torch.cat(ctx_parts, dim=-1)
         pred_z = model.predictor(context, actions[:, t].long())
-        predictor_loss = predictor_loss + ((pred_z - z_q_seq[:, t + 1]) ** 2).mean()
+        predictor_loss = predictor_loss + ((pred_z - z_seq[:, t + 1]) ** 2).mean()
         n_pred += 1
 
     if n_pred > 0:
