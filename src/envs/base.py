@@ -23,7 +23,8 @@ class PhysicsControlEnv:
     def get_energy(self, state, variable_params=None):
         raise NotImplementedError
 
-    def render_state(self, state, img_size=64, color=True, render_quality="medium"):
+    def render_state(self, state, img_size=64, color=True, render_quality="medium",
+                     ball_color=None, bg_color=None, ball_radius=None):
         """Render a single state as an image.
 
         Args:
@@ -31,6 +32,9 @@ class PhysicsControlEnv:
             img_size: Output image resolution (square).
             color: If True, return RGB; if False, grayscale.
             render_quality: 'low', 'medium', or 'high' anti-aliasing.
+            ball_color: [R, G, B] in 0-1 range, or None for default.
+            bg_color: [R, G, B] in 0-1 range, or None for default.
+            ball_radius: Radius in world units, or None for mass-based default.
 
         Returns:
             Image tensor of shape (H, W, C) with values in [0, 1].

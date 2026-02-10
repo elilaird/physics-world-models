@@ -11,8 +11,9 @@ from src.envs.base import PhysicsControlEnv
 class VisualSequenceDataset(Dataset):
     """
     Image-based sequence dataset for any PhysicsControlEnv with render_state().
-    Generates (images, actions, target_images) tuples with optional vector states
-    for validation. Randomizes variable params per sequence.
+    Stores full (T+1)-length image and state sequences with T actions.
+    Inputs and targets derived by slicing at training time.
+    Randomizes variable params per sequence.
     """
 
     def __init__(
@@ -26,6 +27,9 @@ class VisualSequenceDataset(Dataset):
         img_size=64,
         color=True,
         render_quality="medium",
+        ball_color=None,
+        bg_color=None,
+        ball_radius=None,
     ):
         self.data = []
         self.env = env
@@ -34,6 +38,11 @@ class VisualSequenceDataset(Dataset):
         self.img_size = img_size
         self.color = color
         self.render_quality = render_quality
+        self.render_opts = dict(
+            ball_color=ball_color,
+            bg_color=bg_color,
+            ball_radius=ball_radius,
+        )
 
         channels = 3 if color else 1
 
@@ -50,26 +59,22 @@ class VisualSequenceDataset(Dataset):
                 states.append(state)
                 actions.append(a)
 
-            # Render all states to images
-            all_states = states  # len = seq_len + 1
             images = []
-            for s in all_states:
+            for s in states:
                 img = self.env.render_state(
                     s,
                     img_size=img_size,
                     color=color,
                     render_quality=render_quality,
+                    **self.render_opts,
                 )
-                # (H, W, C) -> (C, H, W)
                 images.append(img.permute(2, 0, 1))
 
             self.data.append(
                 {
-                    "images": torch.stack(images[:-1]).float(),        # (T, C, H, W)
-                    "actions": torch.stack(actions).float(),           # (T,)
-                    "target_images": torch.stack(images[1:]).float(),  # (T, C, H, W)
-                    "states": torch.stack(states[:-1]).float(),        # (T, state_dim)
-                    "target_states": torch.stack(states[1:]).float(),  # (T, state_dim)
+                    "images": torch.stack(images).float(),    # (T+1, C, H, W)
+                    "actions": torch.stack(actions).float(),  # (T,)
+                    "states": torch.stack(states).float(),    # (T+1, state_dim)
                     "variable_params": sampled_params,
                 }
             )
@@ -107,10 +112,18 @@ def build_visual_dataset(env, cfg):
         OmegaConf.to_container(cfg.env.init_state_range, resolve=True)
     )
 
-    visual_cfg = cfg.get("visual", {})
-    img_size = visual_cfg.get("img_size", 64)
-    color = visual_cfg.get("color", True)
-    render_quality = visual_cfg.get("render_quality", "medium")
+    env_cfg = cfg.env
+    img_size = env_cfg.get("img_size", 64)
+    color = env_cfg.get("color", True)
+    render_quality = env_cfg.get("render_quality", "medium")
+
+    ball_color = env_cfg.get("ball_color", None)
+    bg_color = env_cfg.get("bg_color", None)
+    ball_radius = env_cfg.get("ball_radius", None)
+    if ball_color is not None:
+        ball_color = list(ball_color)
+    if bg_color is not None:
+        bg_color = list(bg_color)
 
     return VisualSequenceDataset(
         env=env,
@@ -122,4 +135,7 @@ def build_visual_dataset(env, cfg):
         img_size=img_size,
         color=color,
         render_quality=render_quality,
+        ball_color=ball_color,
+        bg_color=bg_color,
+        ball_radius=ball_radius,
     )

@@ -42,7 +42,13 @@ def generate_all_sequences(env, cfg):
 
     if is_visual_env(cfg):
         from src.data.visual_dataset import VisualSequenceDataset
-        visual_cfg = cfg.get("visual", {})
+        env_cfg = cfg.env
+        ball_color = env_cfg.get("ball_color", None)
+        bg_color = env_cfg.get("bg_color", None)
+        if ball_color is not None:
+            ball_color = list(ball_color)
+        if bg_color is not None:
+            bg_color = list(bg_color)
         dataset = VisualSequenceDataset(
             env=env,
             variable_params=variable_params,
@@ -50,9 +56,12 @@ def generate_all_sequences(env, cfg):
             n_seqs=cfg.data.n_seqs,
             seq_len=cfg.data.seq_len,
             dt=cfg.data.dt,
-            img_size=visual_cfg.get("img_size", 64),
-            color=visual_cfg.get("color", True),
-            render_quality=visual_cfg.get("render_quality", "medium"),
+            img_size=env_cfg.get("img_size", 64),
+            color=env_cfg.get("color", True),
+            render_quality=env_cfg.get("render_quality", "medium"),
+            ball_color=ball_color,
+            bg_color=bg_color,
+            ball_radius=env_cfg.get("ball_radius", None),
         )
     else:
         dataset = SequenceDataset(
@@ -72,11 +81,9 @@ def stack_split(dataset, indices, visual):
     data = {
         "states": torch.stack([dataset[i]["states"] for i in indices]),
         "actions": torch.stack([dataset[i]["actions"] for i in indices]),
-        "targets": torch.stack([dataset[i]["targets"] for i in indices]),
     }
     if visual:
         data["images"] = torch.stack([dataset[i]["images"] for i in indices])
-        data["target_images"] = torch.stack([dataset[i]["target_images"] for i in indices])
     return data
 
 
@@ -144,7 +151,8 @@ def main(cfg: DictConfig):
         "generation_time_s": gen_time,
     }
     if visual:
-        metadata["visual_cfg"] = OmegaConf.to_container(cfg.get("visual", {}), resolve=True)
+        visual_keys = ("img_size", "channels", "color", "render_quality", "ball_color", "bg_color", "ball_radius")
+        metadata["visual_cfg"] = {k: cfg.env[k] for k in visual_keys if k in cfg.env}
     torch.save(metadata, os.path.join(output_dir, "metadata.pt"))
 
     # Human-readable metadata
@@ -166,7 +174,8 @@ def main(cfg: DictConfig):
         "variable_params": OmegaConf.to_container(cfg.env.variable_params, resolve=True),
     }
     if visual:
-        readable["visual"] = OmegaConf.to_container(cfg.visual, resolve=True)
+        visual_keys = ("img_size", "channels", "color", "render_quality", "ball_color", "bg_color", "ball_radius")
+        readable["visual"] = {k: cfg.env[k] for k in visual_keys if k in cfg.env}
     with open(os.path.join(output_dir, "metadata.json"), "w") as f:
         json.dump(readable, f, indent=2)
 

@@ -9,12 +9,9 @@ class PrecomputedDataset(Dataset):
 
     def __init__(self, path):
         data = torch.load(path, weights_only=False)
-        self.states = data["states"]    # (N, T, D)
+        self.states = data["states"]    # (N, T+1, D)
         self.actions = data["actions"]  # (N, T)
-        self.targets = data["targets"]  # (N, T, D)
-
-        self.images = data.get("images")              # (N, T, C, H, W) or None
-        self.target_images = data.get("target_images") # (N, T, C, H, W) or None
+        self.images = data.get("images")  # (N, T+1, C, H, W) or None
 
     def __len__(self):
         return self.states.shape[0]
@@ -23,9 +20,7 @@ class PrecomputedDataset(Dataset):
         item = {
             "states": self.states[idx],
             "actions": self.actions[idx],
-            "targets": self.targets[idx],
         }
         if self.images is not None:
             item["images"] = self.images[idx]
-            item["target_images"] = self.target_images[idx]
         return item

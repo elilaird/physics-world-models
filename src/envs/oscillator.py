@@ -52,22 +52,22 @@ class ForcedOscillator(PhysicsControlEnv):
         x, v = state[..., 0], state[..., 1]
         return 0.5 * m * v**2 + 0.5 * k * x**2
 
-    def render_state(self, state, img_size=64, color=True, render_quality="medium"):
-        """Render oscillator state as an image. Ball at (0, x) for vertical oscillation."""
+    def render_state(self, state, img_size=64, color=True, render_quality="medium",
+                     ball_color=None, bg_color=None, ball_radius=None):
         world_size = 2.0
         space_res = 2.0 * world_size / img_size
-        radius = self.m / space_res
+        radius = (ball_radius / space_res) if ball_radius is not None else (self.m / space_res)
 
         x_pos = state[0].item() if isinstance(state, torch.Tensor) else state[0]
 
         img = torch.zeros(img_size, img_size, 3)
-        ball_color = torch.tensor(DEFAULT_BALL_COLORS[0])
+        bc = torch.tensor(ball_color if ball_color is not None else DEFAULT_BALL_COLORS[0])
 
         px, py = world_to_pixels(0.0, x_pos, img_size, world_size)
-        img = render_circle_aa(img, px, py, radius, ball_color, render_quality)
+        img = render_circle_aa(img, px, py, radius, bc, render_quality)
         img = gaussian_blur(img, kernel_size=5, sigma=1.0)
 
-        bg = torch.tensor(DEFAULT_BG_COLOR)
+        bg = torch.tensor(bg_color if bg_color is not None else DEFAULT_BG_COLOR)
         img = img + bg
         img = torch.clamp(img, 0.0, 1.0)
 

@@ -6,6 +6,10 @@ Usage:
     python scripts/visualize_env.py --env oscillator --n_frames 50
     python scripts/visualize_env.py --env pendulum --save_gif pendulum_demo.gif
     python scripts/visualize_env.py --env pendulum --img_size 128 --save_grid grid.png
+
+    # Visualize a random sequence from a pre-generated dataset
+    python scripts/visualize_env.py --dataset datasets/oscillator_visual/2026-02-09_21-57-38
+    python scripts/visualize_env.py --dataset datasets/oscillator_visual/2026-02-09_21-57-38 --save_gif sample.gif
 """
 
 import argparse
@@ -107,10 +111,35 @@ def save_gif(frames, path, fps=10):
     print(f"Saved GIF: {path}")
 
 
+def load_dataset_sample(dataset_path, split="train", idx=None):
+    """Load a random (or specified) sequence from a pre-generated dataset."""
+    path = os.path.join(dataset_path, f"{split}.pt")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Dataset file not found: {path}")
+
+    data = torch.load(path, weights_only=False)
+    images = data["images"]  # (N, T+1, C, H, W)
+    N = images.shape[0]
+
+    if idx is None:
+        idx = np.random.randint(N)
+    elif idx >= N:
+        raise ValueError(f"Index {idx} out of range (dataset has {N} sequences)")
+
+    seq = images[idx]  # (T+1, C, H, W)
+    # Convert to (T+1, H, W, C) for visualization
+    frames = [seq[t].permute(1, 2, 0) for t in range(seq.shape[0])]
+    return frames, idx
+
+
 def main():
     parser = argparse.ArgumentParser(description="Visualize environment rendering")
+    parser.add_argument("--dataset", type=str, default=None,
+                        help="Path to pre-generated dataset directory to visualize a sample from")
+    parser.add_argument("--split", type=str, default="train", choices=["train", "val", "test"])
+    parser.add_argument("--idx", type=int, default=None, help="Sequence index (random if not set)")
     parser.add_argument("--env", type=str, default="oscillator", choices=list(ENV_REGISTRY.keys()),
-                        help="Environment name")
+                        help="Environment name (ignored when --dataset is set)")
     parser.add_argument("--n_frames", type=int, default=50, help="Number of frames")
     parser.add_argument("--img_size", type=int, default=64, help="Image size")
     parser.add_argument("--no_color", action="store_true", help="Grayscale rendering")
@@ -124,6 +153,21 @@ def main():
     parser.add_argument("--dt", type=float, default=0.1)
     args = parser.parse_args()
 
+    if args.dataset:
+        np.random.seed(args.seed)
+        frames, idx = load_dataset_sample(args.dataset, split=args.split, idx=args.idx)
+        print(f"Dataset: {args.dataset} ({args.split} split)")
+        print(f"Sequence {idx}: {len(frames)} frames, shape: {frames[0].shape}")
+
+        if args.save_grid is None and args.save_gif is None:
+            args.save_grid = f"dataset_sample_{idx}.png"
+
+        if args.save_grid:
+            save_grid(frames, args.save_grid)
+        if args.save_gif:
+            save_gif(frames, args.save_gif)
+        return
+
     env_cls = ENV_REGISTRY[args.env]
     env = env_cls()
 
@@ -136,7 +180,6 @@ def main():
 
     print(f"Rendered {len(frames)} frames, shape: {frames[0].shape}")
 
-    # Default output if nothing specified
     if args.save_grid is None and args.save_gif is None:
         args.save_grid = f"{args.env}_frames.png"
 

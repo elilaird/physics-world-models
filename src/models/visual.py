@@ -3,7 +3,6 @@
 import torch
 import torch.nn as nn
 
-
 class VisionEncoder(nn.Module):
     """Encodes (B, C, 64, 64) images to (B, latent_dim) mu and logvar."""
 
@@ -54,46 +53,6 @@ class VisionDecoder(nn.Module):
     def forward(self, z):
         h = self.fc(z).view(-1, 256, 4, 4)
         return self.net(h)
-
-
-class LatentPredictor(nn.Module):
-    """Predicts next latent from context window of past latents + action.
-
-    Follows the JumpModel residual-MLP pattern: z_t + f(context, action).
-    """
-
-    def __init__(self, latent_dim=32, action_dim=3, action_embedding_dim=8,
-                 hidden_dim=128, context_length=3):
-        super().__init__()
-        self.context_length = context_length
-        self.latent_dim = latent_dim
-        self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
-        self.net = nn.Sequential(
-            nn.Linear(context_length * latent_dim + action_embedding_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, latent_dim),
-        )
-
-    def forward(self, context, action):
-        """
-        Args:
-            context: (B, context_length * latent_dim) — ordered [z_t, z_{t-1}, ...]
-            action: (B,) discrete action indices
-        Returns:
-            predicted next latent (B, latent_dim)
-        """
-        emb = self.act_emb(action)
-        delta = self.net(torch.cat([context, emb], dim=-1))
-        # Residual: add to most recent latent (first in context)
-        z_t = context[:, :self.latent_dim]
-        return z_t + delta
-
-
-PREDICTOR_REGISTRY = {
-    "latent_mlp": LatentPredictor,
-}
 
 
 def kl_divergence_free_bits(mu, logvar, free_bits=0.5):

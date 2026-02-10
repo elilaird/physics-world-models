@@ -20,11 +20,11 @@ data:
 
 dataset_path: null
 
-visual:
-  img_size: 64
-  channels: 3
-  color: true
-  render_quality: medium
+wandb:
+  enabled: false
+  project: physics-world-models
+  log_images_every: 10
+  n_log_images: 4
 
 checkpoint_dir: ${hydra:runtime.output_dir}
 

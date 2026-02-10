@@ -9,8 +9,9 @@ from src.envs.base import PhysicsControlEnv
 class SequenceDataset(Dataset):
     """
     Generic sequence dataset for any PhysicsControlEnv.
-    Generates (states, actions, targets) tuples with randomized
-    variable parameters per sequence for generalization.
+    Generates (states, actions) tuples where states has length T+1
+    (inputs and targets derived by slicing). Randomizes variable
+    parameters per sequence for generalization.
     """
 
     def __init__(
@@ -51,9 +52,8 @@ class SequenceDataset(Dataset):
 
             self.data.append(
                 {
-                    "states": torch.stack(states[:-1]).float(),
-                    "actions": torch.stack(actions).float(),
-                    "targets": torch.stack(states[1:]).float(),
+                    "states": torch.stack(states).float(),    # (T+1, state_dim)
+                    "actions": torch.stack(actions).float(),  # (T,)
                     "variable_params": sampled_params,
                 }
             )
