@@ -81,11 +81,11 @@ def generate_all_sequences(env, cfg):
 def stack_split(dataset, indices, visual):
     """Stack a subset of dataset entries into contiguous tensors."""
     data = {
-        "states": torch.stack([dataset[i]["states"] for i in indices]),
-        "actions": torch.stack([dataset[i]["actions"] for i in indices]),
+        "states": torch.stack([dataset.data[i]["states"] for i in indices]),
+        "actions": torch.stack([dataset.data[i]["actions"] for i in indices]),
     }
     if visual:
-        data["images"] = torch.stack([dataset[i]["images"] for i in indices])
+        data["images"] = torch.stack([dataset.data[i]["images"] for i in indices])
     return data
 
 

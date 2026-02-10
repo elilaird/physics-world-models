@@ -22,5 +22,8 @@ class PrecomputedDataset(Dataset):
             "actions": self.actions[idx],
         }
         if self.images is not None:
-            item["images"] = self.images[idx]
+            img = self.images[idx]
+            if img.dtype == torch.uint8:
+                img = img.float() / 255.0
+            item["images"] = img
         return item

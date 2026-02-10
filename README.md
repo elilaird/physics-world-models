@@ -129,6 +129,8 @@ Environments can render states as images for pixel-based learning. Currently sup
 # Preview rendering
 python scripts/visualize_env.py --env oscillator --n_frames 50
 python scripts/visualize_env.py --env pendulum --save_gif pendulum_demo.gif --img_size 128
+python scripts/visualize_env.py --dataset datasets/oscillator_visual/<timestamp>
+
 
 # Train visual world model
 python train.py env=oscillator_visual model=visual_world_model

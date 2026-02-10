@@ -78,7 +78,7 @@ class VisualSequenceDataset(Dataset):
 
             self.data.append(
                 {
-                    "images": torch.stack(images).float(),    # (T+1, C, H, W)
+                    "images": (torch.stack(images) * 255).to(torch.uint8),  # (T+1, C, H, W)
                     "actions": torch.stack(actions).float(),  # (T,)
                     "states": states_tensor,
                     "variable_params": sampled_params,
@@ -106,7 +106,11 @@ class VisualSequenceDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        return self.data[idx]
+        item = self.data[idx]
+        return {
+            **item,
+            "images": item["images"].float() / 255.0,
+        }
 
 
 def build_visual_dataset(env, cfg):
