@@ -8,6 +8,8 @@ params:
 
 variable_params: {}
 
+observation_noise_std: 0.1
+
 init_state_range:
   # positions (6D): clustered near origin
   - [-1.0, 1.0]

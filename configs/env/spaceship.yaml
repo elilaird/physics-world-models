@@ -10,6 +10,8 @@ params:
 # No variable params — orbital mechanics are fixed
 variable_params: {}
 
+observation_noise_std: 0.1
+
 init_state_range:
   - [-5.0, 5.0]   # q_x
   - [-5.0, 5.0]   # q_y

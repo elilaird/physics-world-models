@@ -123,6 +123,7 @@ def build_dataset(env, cfg):
         n_seqs=cfg.data.n_seqs,
         seq_len=cfg.data.seq_len,
         dt=cfg.data.dt,
+        observation_noise_std=cfg.env.get("observation_noise_std", 0.0),
     )
 
 

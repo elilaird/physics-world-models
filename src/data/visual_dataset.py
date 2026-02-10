@@ -30,6 +30,7 @@ class VisualSequenceDataset(Dataset):
         ball_color=None,
         bg_color=None,
         ball_radius=None,
+        observation_noise_std=0.0,
     ):
         self.data = []
         self.env = env
@@ -38,6 +39,7 @@ class VisualSequenceDataset(Dataset):
         self.img_size = img_size
         self.color = color
         self.render_quality = render_quality
+        self.observation_noise_std = observation_noise_std
         self.render_opts = dict(
             ball_color=ball_color,
             bg_color=bg_color,
@@ -70,11 +72,15 @@ class VisualSequenceDataset(Dataset):
                 )
                 images.append(img.permute(2, 0, 1))
 
+            states_tensor = torch.stack(states).float()  # (T+1, state_dim)
+            if self.observation_noise_std > 0:
+                states_tensor = states_tensor + torch.randn_like(states_tensor) * self.observation_noise_std
+
             self.data.append(
                 {
                     "images": torch.stack(images).float(),    # (T+1, C, H, W)
                     "actions": torch.stack(actions).float(),  # (T,)
-                    "states": torch.stack(states).float(),    # (T+1, state_dim)
+                    "states": states_tensor,
                     "variable_params": sampled_params,
                 }
             )
@@ -138,4 +144,5 @@ def build_visual_dataset(env, cfg):
         ball_color=ball_color,
         bg_color=bg_color,
         ball_radius=ball_radius,
+        observation_noise_std=env_cfg.get("observation_noise_std", 0.0),
     )

@@ -22,6 +22,7 @@ class SequenceDataset(Dataset):
         n_seqs=200,
         seq_len=20,
         dt=0.1,
+        observation_noise_std=0.0,
     ):
         """
         Args:
@@ -32,11 +33,13 @@ class SequenceDataset(Dataset):
             n_seqs: Number of sequences to generate.
             seq_len: Steps per sequence.
             dt: Integration timestep.
+            observation_noise_std: Std dev of Gaussian noise added to observed states.
         """
         self.data = []
         self.env = env
         self.variable_params = variable_params
         self.init_state_range = np.asarray(init_state_range)
+        self.observation_noise_std = observation_noise_std
         for _ in tqdm(range(n_seqs), desc=f"Generating {n_seqs} seqs (len={seq_len})"):
             sampled_params = self._sample_variable_params()
             state = self._sample_init_state()
@@ -50,9 +53,13 @@ class SequenceDataset(Dataset):
                 states.append(state)
                 actions.append(a)
 
+            states_tensor = torch.stack(states).float()  # (T+1, state_dim)
+            if self.observation_noise_std > 0:
+                states_tensor = states_tensor + torch.randn_like(states_tensor) * self.observation_noise_std
+
             self.data.append(
                 {
-                    "states": torch.stack(states).float(),    # (T+1, state_dim)
+                    "states": states_tensor,
                     "actions": torch.stack(actions).float(),  # (T,)
                     "variable_params": sampled_params,
                 }
@@ -107,4 +114,5 @@ def build_dataset(env, cfg):
         n_seqs=cfg.n_seqs,
         seq_len=cfg.seq_len,
         dt=cfg.dt,
+        observation_noise_std=cfg.get("observation_noise_std", 0.0),
     )

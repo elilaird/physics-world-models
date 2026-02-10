@@ -62,6 +62,7 @@ def generate_all_sequences(env, cfg):
             ball_color=ball_color,
             bg_color=bg_color,
             ball_radius=env_cfg.get("ball_radius", None),
+            observation_noise_std=env_cfg.get("observation_noise_std", 0.0),
         )
     else:
         dataset = SequenceDataset(
@@ -71,6 +72,7 @@ def generate_all_sequences(env, cfg):
             n_seqs=cfg.data.n_seqs,
             seq_len=cfg.data.seq_len,
             dt=cfg.data.dt,
+            observation_noise_std=cfg.env.get("observation_noise_std", 0.0),
         )
 
     return dataset
