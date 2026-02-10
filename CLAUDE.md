@@ -71,7 +71,7 @@ All models use `nn.Embedding` for discrete action spaces. Registry in `src/model
 - **ODE** (`ode.py`): `FirstOrderODENet`, `NewtonianDynamicsModel`, `VelocityDynamicsModel` — forward: `(t, state, action_emb)` for `torchdiffeq.odeint`
 - **Hamiltonian** (`hamiltonian.py`): `PortHamiltonianModel` — learns H(q,p), derives dynamics via `torch.autograd.grad`
 - **Wrappers** (`wrappers.py`): `TrajectoryMatchingModel` (single-step ODE integration), `TrajectoryShootingModel` (multi-step rollout). ODE models are auto-wrapped by `train.py` when `model.type == "ode"`.
-- **Visual** (`visual.py`): `VisualWorldModel` — VQ-VAE (VisionEncoder → VectorQuantizer → VisionDecoder) + `LatentPredictor` (residual MLP). Predictor operates on detached quantized latents with context window. `train.py` routes to `visual_train_step`/`visual_eval_step` when `model.type == "visual"`.
+- **Visual** (`visual.py`): `VisualWorldModel` — beta-VAE (VisionEncoder → reparameterize → VisionDecoder) + swappable `LatentPredictor` (residual MLP, via `PREDICTOR_REGISTRY`). Encoder outputs `(mu, logvar)`, KL divergence uses per-dimension free bits clamping to prevent posterior collapse. Predictor operates on detached sampled latents with context window. Separate optimizers for encoder, decoder, and predictor. `train.py` routes to `visual_train_step`/`visual_eval_step` when `model.type == "visual"`.
 
 ### Environments (`src/envs/`)
 `PhysicsControlEnv` base class with discrete action maps. Registry in `src/envs/__init__.py`.
@@ -94,7 +94,7 @@ Pixel-based observations for environments with `render_state()`. Oscillator and 
 - **Visual env configs** (`oscillator_visual`, `pendulum_visual`): inherit physics from base, set `observation_mode: pixels`
 - **`VisualSequenceDataset`**: generates `(images, actions, target_images)` tuples in `(T, C, H, W)` format, includes vector states for validation
 - **`visual` config section**: `img_size`, `channels`, `color`, `render_quality`
-- **`VisualWorldModel`** (`model=visual_world_model`): VQ-VAE + latent predictor. Config exposes `latent_dim`, `n_codebook`, `context_length`, `commitment_beta`, `predictor_weight`. Training uses `visual_train_step` which reconstructs all frames and predicts next-latent from a context window of past quantized latents. Gradient isolation via `.detach()` separates autoencoder and predictor objectives.
+- **`VisualWorldModel`** (`model=visual_world_model`): beta-VAE + swappable latent predictor. Config exposes `latent_dim`, `beta` (KL weight), `free_bits` (per-dimension KL floor), `context_length`, `predictor_weight`, `predictor` (registry key, default `latent_mlp`). Training uses `visual_train_step` which reconstructs all frames via ELBO (recon + beta * KL) and predicts next-latent from a context window of past sampled latents. Gradient isolation via `.detach()` separates autoencoder and predictor objectives. Eval uses posterior mean (no sampling) for deterministic evaluation.
 - Visual rollout evaluation is not yet implemented — `evaluate.py` raises `NotImplementedError` for visual checkpoints
 
 ```bash
@@ -108,6 +108,7 @@ python train.py env=pendulum_visual model=visual_world_model
 
 # Override visual model hyperparams
 python train.py env=oscillator_visual model=visual_world_model model.latent_dim=64 model.context_length=2
+python train.py env=oscillator_visual model=visual_world_model model.beta=1.0 model.free_bits=0.25
 ```
 
 ### Legacy systems (kept for reference)
