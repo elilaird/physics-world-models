@@ -76,7 +76,6 @@ def build_model(cfg):
             free_bits=cfg.model.free_bits,
             context_length=cfg.model.context_length,
             predictor_weight=cfg.model.predictor_weight,
-            channels=cfg.env.channels,
         )
 
     kwargs = {

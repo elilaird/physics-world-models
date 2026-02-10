@@ -39,7 +39,7 @@ class LatentPredictor(nn.Module):
         Returns:
             predicted next latent (B, latent_dim)
         """
-        emb = self.act_emb(action)
+        emb = self.act_emb(action).squeeze(1)
         delta = self.net(torch.cat([context, emb], dim=-1))
         # Residual: add to most recent latent (first in context)
         z_t = context[:, : self.latent_dim]
