@@ -1,0 +1,9 @@
+_target_: src.models.predictors.LatentODEPredictor
+name: latent_ode
+latent_dim: ${model.latent_dim}
+action_dim: ${env.action_dim}
+action_embedding_dim: ${model.action_embedding_dim}
+hidden_dim: ${model.hidden_dim}
+context_length: ${model.context_length}
+integration_method: ${model.integration_method}
+dt: ${model.predictor_dt}

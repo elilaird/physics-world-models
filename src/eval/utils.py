@@ -2,11 +2,11 @@
 
 import torch
 from omegaconf import OmegaConf
+import hydra
 
 from src.envs import ENV_REGISTRY
 from src.models import MODEL_REGISTRY
 from src.models.wrappers import TrajectoryMatchingModel
-from src.models.predictors import PREDICTOR_REGISTRY
 
 
 def load_checkpoint(checkpoint_path):
@@ -21,21 +21,7 @@ def rebuild_model(cfg):
     model_cls = MODEL_REGISTRY[cfg.model.name]
 
     if cfg.model.type == "visual":
-        predictor_name = cfg.model.get("predictor", "latent_mlp")
-        predictor_cls = PREDICTOR_REGISTRY[predictor_name]
-        pred_kwargs = dict(
-            latent_dim=cfg.model.latent_dim,
-            action_dim=cfg.env.action_dim,
-            action_embedding_dim=cfg.model.action_embedding_dim,
-            hidden_dim=cfg.model.hidden_dim,
-            context_length=cfg.model.context_length,
-        )
-        if predictor_name in ("latent_ode", "latent_newtonian", "latent_hamiltonian"):
-            pred_kwargs["integration_method"] = cfg.model.get("integration_method", "rk4")
-            pred_kwargs["dt"] = cfg.model.get("predictor_dt", 1.0)
-        if predictor_name in ("latent_newtonian", "latent_hamiltonian"):
-            pred_kwargs["damping_init"] = cfg.model.get("damping_init", -1.0)
-        predictor = predictor_cls(**pred_kwargs)
+        predictor = hydra.utils.instantiate(cfg.predictor)
         return model_cls(
             predictor=predictor,
             latent_dim=cfg.model.latent_dim,

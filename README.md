@@ -47,18 +47,18 @@ python generate_dataset.py env=spaceship data.n_seqs=2000 data.val_split=0.15 da
 
 This produces `train.pt`, `val.pt`, `test.pt`, and `metadata.pt` in the output directory. Each file contains pre-stacked tensors ready for loading.
 
-To train on a saved dataset, pass `dataset_path`:
+To train on a saved dataset, pass `dataset_name`:
 
 ```bash
 # Single model
-python train.py dataset_path=datasets/oscillator/<timestamp>
+python train.py dataset_name=oscillator/<timestamp>
 
 # Sweep models — all share the exact same data
 python train.py --multirun model=jump,lstm,newtonian,velocity,port_hamiltonian \
-    dataset_path=datasets/oscillator/<timestamp>
+    dataset_name=oscillator/<timestamp>
 ```
 
-Short paths are resolved under `datasets/` automatically. Without `dataset_path`, training generates data on the fly as before.
+Short paths are resolved under `data_root` (defaults to `datasets/`) automatically. Without `dataset_name`, training generates data on the fly as before.
 
 ## Environments
 

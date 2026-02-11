@@ -4,9 +4,10 @@ from torchdiffeq import odeint
 
 
 class LatentPredictor(nn.Module):
-    """Predicts next latent from context window of past latents + action.
+    """Per-frame residual MLP predictor.
 
-    Follows the JumpModel residual-MLP pattern: z_t + f(context, action).
+    Each frame independently predicts the next latent: z_t + f(z_t, action_t).
+    Linear layers broadcast over the time dimension.
     """
 
     def __init__(
@@ -16,15 +17,14 @@ class LatentPredictor(nn.Module):
         action_embedding_dim=8,
         hidden_dim=128,
         context_length=3,
+        name="latent_mlp",
     ):
         super().__init__()
         self.context_length = context_length
         self.latent_dim = latent_dim
         self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
         self.net = nn.Sequential(
-            nn.Linear(
-                context_length * latent_dim + action_embedding_dim, hidden_dim
-            ),
+            nn.Linear(latent_dim + action_embedding_dim, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.Tanh(),
@@ -34,23 +34,21 @@ class LatentPredictor(nn.Module):
     def forward(self, context, action):
         """
         Args:
-            context: (B, context_length * latent_dim) — ordered [z_t, z_{t-1}, ...]
-            action: (B,) discrete action indices
+            context: (B, T, latent_dim)
+            action: (B, T) discrete action indices
         Returns:
-            predicted next latent (B, latent_dim)
+            (B, T, latent_dim) — predicted next latent for each frame
         """
-        emb = self.act_emb(action).squeeze(1)
-        delta = self.net(torch.cat([context, emb], dim=-1))
-        # Residual: add to most recent latent (first in context)
-        z_t = context[:, : self.latent_dim]
-        return z_t + delta
+        emb = self.act_emb(action)  # (B, T, emb_dim)
+        delta = self.net(torch.cat([context, emb], dim=-1))  # (B, T, D)
+        return context + delta
 
 
 class LatentLSTMPredictor(nn.Module):
     """LSTM-based latent predictor with residual connection.
 
-    Processes the context window as a sequence, then predicts
-    a residual delta from the LSTM's last hidden output.
+    Processes the context as a sequence, outputting a prediction at every
+    timestep. Output at position t is causally conditioned on frames 0..t.
     """
 
     def __init__(
@@ -60,6 +58,7 @@ class LatentLSTMPredictor(nn.Module):
         action_embedding_dim=8,
         hidden_dim=128,
         context_length=3,
+        name="latent_lstm",
     ):
         super().__init__()
         self.context_length = context_length
@@ -71,18 +70,18 @@ class LatentLSTMPredictor(nn.Module):
         self.fc = nn.Linear(hidden_dim, latent_dim)
 
     def forward(self, context, action):
-        B = context.shape[0]
-        D = self.latent_dim
-        # context is [z_t, z_{t-1}, ...] — reshape and reverse to chronological
-        z_seq = context.reshape(B, self.context_length, D).flip(1)  # (B, ctx, D)
-        emb = self.act_emb(action)  # (B, action_embedding_dim)
-        # Broadcast action embedding across time steps
-        emb_seq = emb.unsqueeze(1).expand(-1, self.context_length, -1)
-        lstm_in = torch.cat([z_seq, emb_seq], dim=-1)  # (B, ctx, D + emb)
-        out, _ = self.lstm(lstm_in)  # (B, ctx, hidden_dim)
-        delta = self.fc(out[:, -1])  # last time step output
-        z_t = context[:, :D]
-        return z_t + delta
+        """
+        Args:
+            context: (B, T, latent_dim)
+            action: (B, T) discrete action indices
+        Returns:
+            (B, T, latent_dim) — predicted next latent for each frame
+        """
+        emb = self.act_emb(action)  # (B, T, emb_dim)
+        lstm_in = torch.cat([context, emb], dim=-1)  # (B, T, D + emb)
+        out, _ = self.lstm(lstm_in)  # (B, T, hidden_dim)
+        delta = self.fc(out)  # (B, T, D)
+        return context + delta
 
 
 class _LatentODEFunc(nn.Module):
@@ -110,7 +109,7 @@ class LatentODEPredictor(nn.Module):
     """First-order ODE predictor in latent space.
 
     Integrates dz/dt = MLP(z, action_emb) from t=0 to t=dt.
-    Markov: only uses the most recent latent z_t.
+    Per-frame Markov: each frame is integrated independently via broadcasting.
     """
 
     def __init__(
@@ -122,6 +121,7 @@ class LatentODEPredictor(nn.Module):
         context_length=3,
         integration_method="rk4",
         dt=1.0,
+        name="latent_ode",
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -132,12 +132,18 @@ class LatentODEPredictor(nn.Module):
         self.dt = dt
 
     def forward(self, context, action):
-        z_t = context[:, : self.latent_dim]
-        emb = self.act_emb(action)
+        """
+        Args:
+            context: (B, T, latent_dim)
+            action: (B, T) discrete action indices
+        Returns:
+            (B, T, latent_dim) — predicted next latent for each frame
+        """
+        emb = self.act_emb(action)  # (B, T, emb_dim)
         self.ode_func.set_action_emb(emb)
-        t_span = torch.tensor([0.0, self.dt], device=z_t.device, dtype=z_t.dtype)
-        z_next = odeint(self.ode_func, z_t, t_span, method=self.integration_method)
-        return z_next[-1]  # (B, latent_dim)
+        t_span = torch.tensor([0.0, self.dt], device=context.device, dtype=context.dtype)
+        z_next = odeint(self.ode_func, context, t_span, method=self.integration_method)
+        return z_next[-1]  # (B, T, latent_dim)
 
 
 class _LatentNewtonianFunc(nn.Module):
@@ -174,6 +180,7 @@ class LatentNewtonianPredictor(nn.Module):
 
     Splits latent into position/momentum halves and enforces
     dq/dt = p, dp/dt = f(q,p,a) - damping*p structure.
+    Per-frame Markov: each frame integrated independently via broadcasting.
     Requires even latent_dim.
     """
 
@@ -187,6 +194,7 @@ class LatentNewtonianPredictor(nn.Module):
         integration_method="rk4",
         dt=1.0,
         damping_init=-1.0,
+        name="latent_newtonian",
     ):
         super().__init__()
         assert latent_dim % 2 == 0, "LatentNewtonianPredictor requires even latent_dim"
@@ -202,12 +210,18 @@ class LatentNewtonianPredictor(nn.Module):
         self.dt = dt
 
     def forward(self, context, action):
-        z_t = context[:, : self.latent_dim]
-        emb = self.act_emb(action)
+        """
+        Args:
+            context: (B, T, latent_dim)
+            action: (B, T) discrete action indices
+        Returns:
+            (B, T, latent_dim) — predicted next latent for each frame
+        """
+        emb = self.act_emb(action)  # (B, T, emb_dim)
         self.ode_func.set_action_emb(emb)
         self.ode_func.set_damping(torch.exp(self.log_damping))
-        t_span = torch.tensor([0.0, self.dt], device=z_t.device, dtype=z_t.dtype)
-        z_next = odeint(self.ode_func, z_t, t_span, method=self.integration_method)
+        t_span = torch.tensor([0.0, self.dt], device=context.device, dtype=context.dtype)
+        z_next = odeint(self.ode_func, context, t_span, method=self.integration_method)
         return z_next[-1]
 
 
@@ -255,6 +269,7 @@ class LatentHamiltonianPredictor(nn.Module):
 
     Learns H(q,p) and derives symplectic dynamics via autograd.
     Includes dissipation (learned damping) and input port G(action).
+    Per-frame Markov: each frame integrated independently via broadcasting.
     Requires even latent_dim.
     """
 
@@ -268,6 +283,7 @@ class LatentHamiltonianPredictor(nn.Module):
         integration_method="rk4",
         dt=1.0,
         damping_init=-1.0,
+        name="latent_hamiltonian",
     ):
         super().__init__()
         assert latent_dim % 2 == 0, "LatentHamiltonianPredictor requires even latent_dim"
@@ -283,12 +299,18 @@ class LatentHamiltonianPredictor(nn.Module):
         self.dt = dt
 
     def forward(self, context, action):
-        z_t = context[:, : self.latent_dim]
-        emb = self.act_emb(action)
+        """
+        Args:
+            context: (B, T, latent_dim)
+            action: (B, T) discrete action indices
+        Returns:
+            (B, T, latent_dim) — predicted next latent for each frame
+        """
+        emb = self.act_emb(action)  # (B, T, emb_dim)
         self.ode_func.set_action_emb(emb)
         self.ode_func.set_damping(torch.exp(self.log_damping))
-        t_span = torch.tensor([0.0, self.dt], device=z_t.device, dtype=z_t.dtype)
-        z_next = odeint(self.ode_func, z_t, t_span, method=self.integration_method)
+        t_span = torch.tensor([0.0, self.dt], device=context.device, dtype=context.dtype)
+        z_next = odeint(self.ode_func, context, t_span, method=self.integration_method)
         return z_next[-1]
 
 

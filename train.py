@@ -10,6 +10,7 @@ Usage:
 
 import logging
 import os
+from collections import defaultdict
 
 import hydra
 import hydra.utils
@@ -19,11 +20,11 @@ import torch.optim as optim
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import wandb
 
 from src.envs import ENV_REGISTRY
 from src.models import MODEL_REGISTRY
 from src.models.wrappers import TrajectoryMatchingModel
-from src.models.predictors import PREDICTOR_REGISTRY
 from src.data.dataset import SequenceDataset
 from src.data.visual_dataset import build_visual_dataset
 from src.data.precomputed import PrecomputedDataset
@@ -36,6 +37,10 @@ def is_visual_env(cfg):
     return getattr(cfg.env, "observation_mode", None) == "pixels"
 
 
+def batch_to_device(batch, device):
+    return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+
 def build_env(cfg):
     env_cls = ENV_REGISTRY[cfg.env.name]
     params = OmegaConf.to_container(cfg.env.params, resolve=True)
@@ -43,25 +48,8 @@ def build_env(cfg):
 
 
 def build_predictor(cfg):
-    """Build a latent predictor module from config."""
-    predictor_name = cfg.model.get("predictor", "latent_mlp")
-    predictor_cls = PREDICTOR_REGISTRY[predictor_name]
-
-    kwargs = dict(
-        latent_dim=cfg.model.latent_dim,
-        action_dim=cfg.env.action_dim,
-        action_embedding_dim=cfg.model.action_embedding_dim,
-        hidden_dim=cfg.model.hidden_dim,
-        context_length=cfg.model.context_length,
-    )
-
-    if predictor_name in ("latent_ode", "latent_newtonian", "latent_hamiltonian"):
-        kwargs["integration_method"] = cfg.model.get("integration_method", "rk4")
-        kwargs["dt"] = cfg.model.get("predictor_dt", 1.0)
-    if predictor_name in ("latent_newtonian", "latent_hamiltonian"):
-        kwargs["damping_init"] = cfg.model.get("damping_init", -1.0)
-
-    return predictor_cls(**kwargs)
+    """Build a latent predictor module from Hydra config."""
+    return hydra.utils.instantiate(cfg.predictor)
 
 
 def build_model(cfg):
@@ -97,21 +85,6 @@ def build_model(cfg):
 
     return model
 
-
-def resolve_dataset_path(path):
-    """Resolve dataset_path to an absolute directory (handles Hydra cwd change)."""
-    if os.path.isabs(path):
-        return path
-    orig_cwd = hydra.utils.get_original_cwd()
-    candidate = os.path.join(orig_cwd, path)
-    if os.path.isdir(candidate):
-        return candidate
-    candidate = os.path.join(orig_cwd, "datasets", path)
-    if os.path.isdir(candidate):
-        return candidate
-    return os.path.join(orig_cwd, path)
-
-
 def build_dataset(env, cfg):
     variable_params = OmegaConf.to_container(cfg.env.variable_params, resolve=True)
     init_state_range = np.array(OmegaConf.to_container(cfg.env.init_state_range, resolve=True))
@@ -131,56 +104,55 @@ def visual_train_step(model, batch, optimizers):
     all_images = batch["images"]  # (B, T+1, C, H, W)
     actions = batch["actions"]    # (B, T)
 
-    B, T_plus_1, C, H, W = all_images.shape
-    T = T_plus_1 - 1
-    latent_dim = model.latent_dim
+    B, N, C, H, W = all_images.shape
     context_length = model.context_length
+    window_size = context_length + 1
+    step_size = context_length
+    num_windows = max(1, 1 + (N - window_size) // step_size)
 
     opt_enc, opt_dec, opt_pred = optimizers["encoder"], optimizers["decoder"], optimizers["predictor"]
-
-    # --- Autoencoder step (encoder + beta-VAE + decoder) ---
-    all_flat = all_images.reshape(B * (T + 1), C, H, W)
-
-    mu, logvar = model.encode(all_flat)
-    z = model.reparameterize(mu, logvar)
-    recon_all = model.decode(z)
-    recon_loss = ((recon_all - all_flat) ** 2).mean()
-    kl_loss = model.kl_loss(mu, logvar)
-
-    ae_loss = recon_loss + model.beta * kl_loss
-
     opt_enc.zero_grad()
     opt_dec.zero_grad()
-    ae_loss.backward()
+    opt_pred.zero_grad()
+
+    batch_losses = defaultdict(float)
+
+    for w in range(num_windows):
+        start = w * step_size
+        end = min(start + window_size, N)
+        win_len = end - start
+
+        window_frames = all_images[:, start:end].reshape(B * win_len, C, H, W)
+        mu, logvar = model.encode(window_frames)
+        z = model.reparameterize(mu, logvar)
+        recon = model.decode(z)
+
+        recon_loss = ((recon - window_frames) ** 2).mean()
+        kl_loss = model.kl_loss(mu, logvar)
+
+        z_window = z.detach().reshape(B, win_len, -1)
+        ctx = z_window[:, :context_length]
+        targets = z_window[:, 1:]
+        window_actions = actions[:, start:start + context_length].long()
+        pred_z = model.predictor(ctx, window_actions)
+        pred_loss = ((pred_z - targets) ** 2).mean()
+
+        window_loss = recon_loss + model.beta * kl_loss + model.predictor_weight * pred_loss
+        (window_loss / num_windows).backward()
+
+        batch_losses["recon_loss"] += recon_loss.item() / num_windows
+        batch_losses["kl_loss"] += kl_loss.item() / num_windows
+        batch_losses["predictor_loss"] += pred_loss.item() / num_windows
+
     opt_enc.step()
     opt_dec.step()
-
-    # --- Predictor step (on detached latents) ---
-    z_seq = z.reshape(B, T + 1, latent_dim).detach()
-
-    predictor_loss = torch.tensor(0.0, device=all_images.device)
-    n_pred = 0
-    for t in range(context_length - 1, T):
-        ctx_parts = [z_seq[:, t - i] for i in range(context_length)]
-        context = torch.cat(ctx_parts, dim=-1)
-        pred_z = model.predictor(context, actions[:, t].long())
-        predictor_loss = predictor_loss + ((pred_z - z_seq[:, t + 1]) ** 2).mean()
-        n_pred += 1
-
-    if n_pred > 0:
-        predictor_loss = predictor_loss / n_pred
-
-    opt_pred.zero_grad()
-    predictor_loss.backward()
     opt_pred.step()
 
-    total_loss = ae_loss.item() + model.predictor_weight * predictor_loss.item()
-    return {
-        "total_loss": total_loss,
-        "recon_loss": recon_loss.item(),
-        "kl_loss": kl_loss.item(),
-        "predictor_loss": predictor_loss.item(),
-    }
+    batch_losses["total_loss"] = (
+        batch_losses["recon_loss"] + model.beta * batch_losses["kl_loss"]
+        + model.predictor_weight * batch_losses["predictor_loss"]
+    )
+    return dict(batch_losses)
 
 
 @torch.no_grad()
@@ -188,42 +160,39 @@ def visual_eval_step(model, batch):
     all_images = batch["images"]  # (B, T+1, C, H, W)
     actions = batch["actions"]    # (B, T)
 
-    B, T_plus_1, C, H, W = all_images.shape
-    T = T_plus_1 - 1
-    latent_dim = model.latent_dim
+    B, N, C, H, W = all_images.shape
     context_length = model.context_length
+    window_size = context_length + 1
+    step_size = context_length
+    num_windows = max(1, 1 + (N - window_size) // step_size)
 
-    all_flat = all_images.reshape(B * (T + 1), C, H, W)
+    batch_losses = defaultdict(float)
 
-    mu, logvar = model.encode(all_flat)
-    z = mu
-    recon_all = model.decode(z)
-    recon_loss = ((recon_all - all_flat) ** 2).mean()
-    kl_loss = model.kl_loss(mu, logvar)
+    for w in range(num_windows):
+        start = w * step_size
+        end = min(start + window_size, N)
+        win_len = end - start
 
-    ae_loss = recon_loss + model.beta * kl_loss
+        window_frames = all_images[:, start:end].reshape(B * win_len, C, H, W)
+        mu, logvar = model.encode(window_frames)
+        z = mu  # posterior mean for eval
+        recon = model.decode(z)
 
-    z_seq = z.reshape(B, T + 1, latent_dim)
+        batch_losses["recon_loss"] += ((recon - window_frames) ** 2).mean().item() / num_windows
+        batch_losses["kl_loss"] += model.kl_loss(mu, logvar).item() / num_windows
 
-    predictor_loss = torch.tensor(0.0, device=all_images.device)
-    n_pred = 0
-    for t in range(context_length - 1, T):
-        ctx_parts = [z_seq[:, t - i] for i in range(context_length)]
-        context = torch.cat(ctx_parts, dim=-1)
-        pred_z = model.predictor(context, actions[:, t].long())
-        predictor_loss = predictor_loss + ((pred_z - z_seq[:, t + 1]) ** 2).mean()
-        n_pred += 1
+        z_window = z.reshape(B, win_len, -1)
+        ctx = z_window[:, :context_length]
+        targets = z_window[:, 1:]
+        window_actions = actions[:, start:start + context_length].long()
+        pred_z = model.predictor(ctx, window_actions)
+        batch_losses["predictor_loss"] += ((pred_z - targets) ** 2).mean().item() / num_windows
 
-    if n_pred > 0:
-        predictor_loss = predictor_loss / n_pred
-
-    total_loss = ae_loss + model.predictor_weight * predictor_loss
-    return {
-        "total_loss": total_loss.item(),
-        "recon_loss": recon_loss.item(),
-        "kl_loss": kl_loss.item(),
-        "predictor_loss": predictor_loss.item(),
-    }
+    batch_losses["total_loss"] = (
+        batch_losses["recon_loss"] + model.beta * batch_losses["kl_loss"]
+        + model.predictor_weight * batch_losses["predictor_loss"]
+    )
+    return dict(batch_losses)
 
 
 def train_step(model, batch, optimizer, dt, is_ode):
@@ -274,51 +243,55 @@ def eval_step(model, batch, dt, is_ode):
 
 
 @torch.no_grad()
-def log_visual_reconstructions(model, batch, cfg):
-    """Log encoder and predictor reconstruction images to wandb."""
-    import wandb
+def make_recon_grid(model, batch, n_samples=4):
+    """Build a reconstruction grid image for wandb.
 
+    For each sample, shows 3 rows across one window (ctx+1 frames):
+      Row 1: ground truth frames
+      Row 2: encoder reconstructions (encode → decode)
+      Row 3: predictor reconstructions (predict next → decode, first col blank)
+
+    Returns a wandb.Image with a slider-compatible single image.
+    """
     all_images = batch["images"]  # (B, T+1, C, H, W)
     actions = batch["actions"]    # (B, T)
 
-    B, T_plus_1, C, H, W = all_images.shape
-    T = T_plus_1 - 1
-    latent_dim = model.latent_dim
+    B, N, C, H, W = all_images.shape
     context_length = model.context_length
-    n = min(cfg.wandb.n_log_images, B)
+    window_size = context_length + 1
+    n = min(n_samples, B)
 
-    t = context_length - 1
-    if t >= T:
-        return
+    if N < window_size:
+        return None
 
-    all_flat = all_images.reshape(B * (T + 1), C, H, W)
-    mu, _ = model.encode(all_flat)
-    z_seq = mu.reshape(B, T + 1, latent_dim)
+    # Encode first window
+    window = all_images[:n, :window_size]  # (n, ws, C, H, W)
+    flat = window.reshape(n * window_size, C, H, W)
+    mu, _ = model.encode(flat)
 
-    # Encoder reconstruction of frame t
-    recon_t = model.decode(z_seq[:n, t])  # (n, C, H, W)
+    # Encoder reconstructions
+    enc_recon = model.decode(mu).reshape(n, window_size, C, H, W)
 
-    # Predictor: predict z_{t+1} from context at t
-    ctx_parts = [z_seq[:n, t - i] for i in range(context_length)]
-    context = torch.cat(ctx_parts, dim=-1)
-    pred_z = model.predictor(context, actions[:n, t].long())
-    pred_recon = model.decode(pred_z)  # (n, C, H, W)
+    # Predictor reconstructions
+    z = mu.reshape(n, window_size, -1)
+    ctx = z[:, :context_length]
+    window_actions = actions[:n, :context_length].long()
+    pred_z = model.predictor(ctx, window_actions)  # (n, ctx, D)
+    pred_recon = model.decode(
+        pred_z.reshape(n * context_length, -1)
+    ).reshape(n, context_length, C, H, W)
 
-    # Build wandb image grid: [orig_t, enc_recon_t, orig_{t+1}, pred_recon_{t+1}]
-    log_images = []
+    # Build grid: 3 rows per sample, ws columns
+    blank = torch.zeros(C, H, W, device=window.device)
+    rows = []
     for i in range(n):
-        orig_t = all_images[i, t]          # (C, H, W)
-        enc_recon = recon_t[i]
-        orig_next = all_images[i, t + 1]
-        pred_next = pred_recon[i]
+        gt_row = torch.cat([window[i, t] for t in range(window_size)], dim=-1)
+        enc_row = torch.cat([enc_recon[i, t] for t in range(window_size)], dim=-1)
+        pred_row = torch.cat([blank] + [pred_recon[i, t] for t in range(context_length)], dim=-1)
+        rows.extend([gt_row, enc_row, pred_row])
 
-        row = torch.cat([orig_t, enc_recon, orig_next, pred_next], dim=-1)  # (C, H, 4*W)
-        log_images.append(wandb.Image(
-            row.clamp(0, 1).cpu(),
-            caption=f"sample {i}: orig_t | enc_recon_t | orig_t+1 | pred_t+1",
-        ))
-
-    wandb.log({"val/reconstructions": log_images}, commit=False)
+    grid = torch.cat(rows, dim=-2)  # (C, n*3*H, ws*W)
+    return wandb.Image(grid.clamp(0, 1).cpu(), caption="GT | Enc recon | Pred recon")
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
@@ -329,47 +302,35 @@ def main(cfg: DictConfig):
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
 
-    # Initialize wandb
-    use_wandb = cfg.wandb.enabled
-    if use_wandb:
-        import wandb
+    if cfg.wandb.enabled:
         wandb.init(
             project=cfg.wandb.project,
             config=OmegaConf.to_container(cfg, resolve=True),
-            name=f"{cfg.env.name}_{cfg.model.name}_{cfg.model.get('predictor', 'default')}",
+            name=f"{cfg.env.name}_{cfg.model.name}_{cfg.model.get('predictor').name}",
         )
 
-    # Build components
-    env = build_env(cfg)
-    visual = is_visual_env(cfg)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info(f"Using device: {device}")
 
-    model = build_model(cfg)
+    model = build_model(cfg).to(device)
     is_ode = cfg.model.type == "ode"
     is_visual = cfg.model.type == "visual"
 
     param_count = sum(p.numel() for p in model.parameters())
     log.info(f"Model: {cfg.model.name} ({param_count} params)")
 
-    # Load or generate dataset
-    if cfg.dataset_path:
-        dataset_dir = resolve_dataset_path(cfg.dataset_path)
-        train_data = PrecomputedDataset(os.path.join(dataset_dir, "train.pt"))
-        val_data = PrecomputedDataset(os.path.join(dataset_dir, "val.pt"))
-        log.info(f"Loaded dataset from {dataset_dir} (train={len(train_data)}, val={len(val_data)})")
-    else:
-        if visual:
-            dataset = build_visual_dataset(env, cfg)
-        else:
-            dataset = build_dataset(env, cfg)
+    dataset_version = os.path.join(cfg.dataset.name, cfg.dataset.version)
+    train_data = PrecomputedDataset(os.path.join(cfg.data_root, dataset_version, "train.npz"))
+    val_data = PrecomputedDataset(os.path.join(cfg.data_root, dataset_version, "val.npz"))
+    test_data = PrecomputedDataset(os.path.join(cfg.data_root, dataset_version, "test.npz"))
 
-        n = len(dataset)
-        perm = np.random.permutation(n)
-        split = int(n * cfg.training.train_split)
-        train_data = [dataset[i] for i in perm[:split]]
-        val_data = [dataset[i] for i in perm[split:]]
+    log.info(
+        f"Loaded dataset from {dataset_version} (train={len(train_data)}, val={len(val_data)}, test={len(test_data)})"
+    )
 
     train_loader = DataLoader(train_data, batch_size=cfg.training.batch_size, shuffle=True)
-    test_loader = DataLoader(val_data, batch_size=cfg.training.batch_size, shuffle=False)
+    val_loader = DataLoader(val_data, batch_size=cfg.training.batch_size, shuffle=False)
+    test_loader = DataLoader(test_data, batch_size=cfg.training.batch_size, shuffle=False)
 
     if is_visual:
         lr = cfg.training.lr
@@ -384,73 +345,119 @@ def main(cfg: DictConfig):
         optimizer = optim.Adam(model.parameters(), lr=cfg.training.lr)
 
     # Training loop
-    best_test_loss = float("inf")
+    best_val_loss = float("inf")
     pbar = tqdm(range(1, cfg.training.epochs + 1), desc="Training")
 
     # Keys to accumulate for visual vs non-visual
     loss_keys = ["total_loss", "recon_loss", "kl_loss", "predictor_loss"] if is_visual else ["total_loss"]
 
+    ckpt_path = os.path.join(
+        cfg.checkpoint_dir,
+        "best_model.pt",
+    )
+    if not os.path.exists(os.path.dirname(ckpt_path)):
+        os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+
     for epoch in pbar:
         model.train()
         train_accum = {k: 0.0 for k in loss_keys}
-        for batch in train_loader:
+
+        # Training batches with progress bar
+        train_batches = tqdm(train_loader, desc=f"Epoch {epoch} [Train]", leave=False)
+        first_train_batch = None
+        for batch in train_batches:
+            batch = batch_to_device(batch, device)
+            if first_train_batch is None:
+                first_train_batch = batch
             if is_visual:
                 losses = visual_train_step(model, batch, optimizers)
             else:
                 losses = train_step(model, batch, optimizer, cfg.data.dt, is_ode)
             for k in loss_keys:
                 train_accum[k] += losses[k]
+
+            train_batches.set_postfix({k: f"{losses[k]:.4f}" for k in loss_keys})
+
         train_avg = {k: v / len(train_loader) for k, v in train_accum.items()}
 
         model.eval()
-        test_accum = {k: 0.0 for k in loss_keys}
-        for batch in test_loader:
+        val_accum = {k: 0.0 for k in loss_keys}
+
+        # Validation batches with progress bar
+        val_batches = tqdm(val_loader, desc=f"Epoch {epoch} [Val]", leave=False)
+        for batch in val_batches:
+            batch = batch_to_device(batch, device)
             if is_visual:
                 losses = visual_eval_step(model, batch)
             else:
                 losses = eval_step(model, batch, cfg.data.dt, is_ode)
             for k in loss_keys:
-                test_accum[k] += losses[k]
-        test_avg = {k: v / len(test_loader) for k, v in test_accum.items()}
+                val_accum[k] += losses[k]
+
+            # Update batch progress bar with current loss
+            val_batches.set_postfix({k: f"{losses[k]:.4f}" for k in loss_keys})
+
+        val_avg = {k: v / len(val_loader) for k, v in val_accum.items()}
 
         avg_train = train_avg["total_loss"]
-        avg_test = test_avg["total_loss"]
+        avg_val = val_avg["total_loss"]
 
         pbar.set_description(
-            f"Epoch {epoch} | Train: {avg_train:.6f} | Test: {avg_test:.6f}"
+            f"Epoch {epoch} | " + " | ".join([f"{k}: {train_avg[k]:.4f}" for k in loss_keys]) + " | " + " | ".join([f"{k}: {val_avg[k]:.4f}" for k in loss_keys])
         )
 
         # wandb logging
-        if use_wandb:
+        if cfg.wandb.enabled:
             wandb_log = {"epoch": epoch}
             for k in loss_keys:
                 wandb_log[f"train/{k}"] = train_avg[k]
-                wandb_log[f"val/{k}"] = test_avg[k]
+                wandb_log[f"val/{k}"] = val_avg[k]
 
-            # Log reconstruction images periodically for visual models
-            if is_visual and epoch % cfg.wandb.log_images_every == 0:
-                # Use last batch from val loop
-                log_visual_reconstructions(model, batch, cfg)
+            if is_visual:
+                n_log = cfg.wandb.get("n_log_images", 4)
+                train_img = make_recon_grid(model, first_train_batch, n_log)
+                val_img = make_recon_grid(model, batch, n_log)
+                if train_img is not None:
+                    wandb_log["train/reconstructions"] = train_img
+                if val_img is not None:
+                    wandb_log["val/reconstructions"] = val_img
 
             wandb.log(wandb_log)
 
-        if avg_test < best_test_loss:
-            best_test_loss = avg_test
-            ckpt_path = os.path.join(cfg.checkpoint_dir, "best_model.pt")
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
                     "epoch": epoch,
-                    "test_loss": avg_test,
+                    "val_loss": avg_val,
                     "config": OmegaConf.to_container(cfg, resolve=True),
                 },
                 ckpt_path,
             )
 
-    log.info(f"Training complete. Best test loss: {best_test_loss:.6f}")
-    log.info(f"Checkpoint saved to: {cfg.checkpoint_dir}/best_model.pt")
+    # Test loop
+    test_accum = {k: 0.0 for k in loss_keys}
+    for batch in test_loader:
+        batch = batch_to_device(batch, device)
+        if is_visual:
+            losses = visual_eval_step(model, batch)
+        else:
+            losses = eval_step(model, batch, cfg.data.dt, is_ode)
+        for k in loss_keys:
+            test_accum[k] += losses[k]
+    test_avg = {k: v / len(test_loader) for k, v in test_accum.items()}
+    avg_test = test_avg["total_loss"]
 
-    if use_wandb:
+    if cfg.wandb.enabled:
+        wandb.log({"test/total_loss": avg_test})
+        for k in loss_keys:
+            wandb.log({f"test/{k}": test_avg[k]})
+
+    log.info(f"Training complete. Best val loss: {best_val_loss:.6f}. Test loss: {avg_test:.6f}.")
+    log.info(f"Checkpoint saved to: {ckpt_path}")
+
+    if cfg.wandb.enabled:
         wandb.finish()
 
 

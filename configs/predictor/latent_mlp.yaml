@@ -1,0 +1,7 @@
+_target_: src.models.predictors.LatentPredictor
+name: latent_mlp
+latent_dim: ${model.latent_dim}
+action_dim: ${env.action_dim}
+action_embedding_dim: ${model.action_embedding_dim}
+hidden_dim: ${model.hidden_dim}
+context_length: ${model.context_length}

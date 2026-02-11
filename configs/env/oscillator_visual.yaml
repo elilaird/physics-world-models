@@ -4,7 +4,6 @@ defaults:
 name: oscillator_visual
 observation_mode: pixels
 img_size: 64
-channels: 3
 color: true
 render_quality: medium
 ball_color: null
