@@ -1,5 +1,4 @@
 import torch
-from torchdiffeq import odeint
 
 from src.models.wrappers import TrajectoryMatchingModel
 
@@ -75,3 +74,61 @@ def dt_generalization_test(model, env, init_state, actions, dt_values, variable_
         }
 
     return results
+
+
+@torch.no_grad()
+def visual_open_loop_rollout(model, images, actions):
+    """Open-loop rollout for visual world models.
+
+    Encodes the first context_length frames, then autoregressively predicts
+    remaining frames using the predictor. At each step the predictor sees
+    exactly context_length latents and one action, produces one next-latent,
+    and the context window shifts right by one.
+
+    Args:
+        model: VisualWorldModel (encoder, decoder, predictor).
+        images: (B, T+1, C, H, W) ground-truth image sequence.
+        actions: (B, T) discrete action indices.
+
+    Returns:
+        dict with:
+            pred_latents: (B, T+1-context_length, latent_dim) predicted latents
+            true_latents: (B, T+1, latent_dim) encoded ground-truth latents
+            pred_images: (B, T+1-context_length, C, H, W) decoded predicted frames
+    """
+    B, N, C, H, W = images.shape
+    ctx_len = model.context_length
+    horizon = N - ctx_len  # number of frames to predict
+
+    # Encode all ground-truth frames to get true latents (posterior mean)
+    all_flat = images.reshape(B * N, C, H, W)
+    mu_all, _ = model.encode(all_flat)
+    true_latents = mu_all.reshape(B, N, -1)  # (B, N, D)
+
+    # Seed the context with the first ctx_len encoded frames
+    context = true_latents[:, :ctx_len].clone()  # (B, ctx_len, D)
+
+    pred_latents = []
+    for t in range(horizon):
+        # actions[:, t:t+ctx_len] aligns each context frame z_i with the
+        # action a_i that transitions it to z_{i+1}
+        act = actions[:, t:t + ctx_len].long()  # (B, ctx_len)
+        pred = model.predictor(context, act)  # (B, ctx_len, D)
+        z_next = pred[:, -1]  # (B, D) — last prediction is the new frame
+        pred_latents.append(z_next)
+
+        # Shift context: drop oldest, append new prediction
+        context = torch.cat([context[:, 1:], z_next.unsqueeze(1)], dim=1)
+
+    pred_latents = torch.stack(pred_latents, dim=1)  # (B, horizon, D)
+
+    # Decode predicted latents to images
+    pred_images = model.decode(
+        pred_latents.reshape(B * horizon, -1)
+    ).reshape(B, horizon, C, H, W)
+
+    return {
+        "pred_latents": pred_latents,
+        "true_latents": true_latents,
+        "pred_images": pred_images,
+    }

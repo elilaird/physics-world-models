@@ -28,6 +28,8 @@ from src.models.wrappers import TrajectoryMatchingModel
 from src.data.dataset import SequenceDataset
 from src.data.visual_dataset import build_visual_dataset
 from src.data.precomputed import PrecomputedDataset
+from src.eval.rollout import visual_open_loop_rollout
+from src.eval.metrics import compute_visual_metrics
 
 log = logging.getLogger(__name__)
 
@@ -291,6 +293,72 @@ def make_recon_grid(model, batch, n_samples=4):
     return wandb.Image(grid.clamp(0, 1).cpu(), caption="GT | Enc recon | Pred recon")
 
 
+@torch.no_grad()
+def compute_rollout_metrics(model, batch, n_samples=4):
+    """Run open-loop rollout on a batch and compute visual metrics.
+
+    Args:
+        model: VisualWorldModel.
+        batch: dict with "images" (B, T+1, C, H, W) and "actions" (B, T).
+        n_samples: number of samples to use for the rollout grid.
+
+    Returns:
+        dict with scalar metrics and a wandb.Image rollout grid.
+    """
+    images = batch["images"]
+    actions = batch["actions"]
+    B, N, C, H, W = images.shape
+    ctx_len = model.context_length
+    horizon = N - ctx_len
+
+    if horizon <= 0:
+        return None
+
+    result = visual_open_loop_rollout(model, images, actions)
+    pred_latents = result["pred_latents"]    # (B, horizon, D)
+    true_latents = result["true_latents"]    # (B, N, D)
+    pred_images = result["pred_images"]      # (B, horizon, C, H, W)
+
+    gt_images = images[:, ctx_len:]          # (B, horizon, C, H, W)
+    gt_latents = true_latents[:, ctx_len:]   # (B, horizon, D)
+
+    # Latent MSE
+    latent_mse = ((pred_latents - gt_latents) ** 2).mean().item()
+
+    # Visual metrics (MAE, PSNR, SSIM, LPIPS)
+    vis_metrics = compute_visual_metrics(pred_images, gt_images)
+
+    # Build rollout grid for visualization
+    n_show = min(n_samples, B)
+    ctx_flat = images[:n_show, :ctx_len].reshape(n_show * ctx_len, C, H, W)
+    ctx_mu, _ = model.encode(ctx_flat)
+    ctx_recon = model.decode(ctx_mu).reshape(n_show, ctx_len, C, H, W)
+
+    rows = []
+    device = images.device
+    for i in range(n_show):
+        gt_row = torch.cat([images[i, t] for t in range(N)], dim=-1)
+        recon_frames = [ctx_recon[i, t] for t in range(ctx_len)]
+        pred_frames = [pred_images[i, t] for t in range(horizon)]
+        pred_row = torch.cat(recon_frames + pred_frames, dim=-1)
+        blank = [torch.zeros(C, H, W, device=device)] * ctx_len
+        err_frames = [(pred_images[i, t] - gt_images[i, t]).abs() for t in range(horizon)]
+        err_row = torch.cat(blank + err_frames, dim=-1)
+        rows.extend([gt_row, pred_row, err_row])
+
+    grid = torch.cat(rows, dim=-2).clamp(0, 1).cpu()
+    grid_img = wandb.Image(grid, caption="GT | Pred (ctx recon + rollout) | |Error|")
+
+    return {
+        "latent_mse": latent_mse,
+        "mae": vis_metrics["mae"],
+        "psnr": vis_metrics["psnr"],
+        "ssim": vis_metrics["ssim"],
+        "lpips": vis_metrics["lpips"],
+        "rollout_grid": grid_img,
+    }
+
+
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig):
     log.info(f"Config:\n{OmegaConf.to_yaml(cfg)}")
@@ -428,6 +496,25 @@ def main(cfg: DictConfig):
             f"Epoch {epoch} | " + " | ".join([f"{k}: {train_avg[k]:.4f}" for k in loss_keys]) + " | " + " | ".join([f"{k}: {val_avg[k]:.4f}" for k in loss_keys])
         )
 
+        # Open-loop rollout evaluation (visual only)
+        rollout_metrics = None
+        if is_visual:
+            n_rollouts = cfg.eval.get("n_rollouts", 8)
+            n_log = cfg.wandb.get("n_log_images", 4)
+            rollout_batch = next(iter(DataLoader(
+                val_data, batch_size=n_rollouts, shuffle=False,
+            )))
+            rollout_batch = batch_to_device(rollout_batch, device)
+            rollout_metrics = compute_rollout_metrics(model, rollout_batch, n_log)
+            if rollout_metrics is not None:
+                log.info(
+                    f"  Rollout — MAE: {rollout_metrics['mae']:.4f} | "
+                    f"PSNR: {rollout_metrics['psnr']:.2f} | "
+                    f"SSIM: {rollout_metrics['ssim']:.4f} | "
+                    f"LPIPS: {rollout_metrics['lpips']:.4f} | "
+                    f"Latent MSE: {rollout_metrics['latent_mse']:.6f}"
+                )
+
         # wandb logging
         if cfg.wandb.enabled:
             wandb_log = {"epoch": epoch}
@@ -436,13 +523,17 @@ def main(cfg: DictConfig):
                 wandb_log[f"val/{k}"] = val_avg[k]
 
             if is_visual:
-                n_log = cfg.wandb.get("n_log_images", 4)
                 train_img = make_recon_grid(model, first_train_batch, n_log)
                 val_img = make_recon_grid(model, batch, n_log)
                 if train_img is not None:
                     wandb_log["train/reconstructions"] = train_img
                 if val_img is not None:
                     wandb_log["val/reconstructions"] = val_img
+
+                if rollout_metrics is not None:
+                    wandb_log["val/rollout_grid"] = rollout_metrics.pop("rollout_grid")
+                    for k, v in rollout_metrics.items():
+                        wandb_log[f"val/rollout_{k}"] = v
 
             wandb.log(wandb_log)
 
@@ -471,17 +562,38 @@ def main(cfg: DictConfig):
     test_avg = {k: v / len(test_loader) for k, v in test_accum.items()}
     avg_test = test_avg["total_loss"]
 
-    # Test recon grid
+    # Test rollout evaluation
     if is_visual:
+        n_rollouts = cfg.eval.get("n_rollouts", 8)
         n_log = cfg.wandb.get("n_log_images", 4)
+        test_rollout_batch = next(iter(DataLoader(
+            test_data, batch_size=n_rollouts, shuffle=False,
+        )))
+        test_rollout_batch = batch_to_device(test_rollout_batch, device)
+        test_rollout = compute_rollout_metrics(model, test_rollout_batch, n_log)
+        if test_rollout is not None:
+            log.info(
+                f"Test rollout — MAE: {test_rollout['mae']:.4f} | "
+                f"PSNR: {test_rollout['psnr']:.2f} | "
+                f"SSIM: {test_rollout['ssim']:.4f} | "
+                f"LPIPS: {test_rollout['lpips']:.4f} | "
+                f"Latent MSE: {test_rollout['latent_mse']:.6f}"
+            )
+
         test_img = make_recon_grid(model, batch, n_log)
-        if test_img is not None:
-            wandb.log({"test/reconstructions": test_img})
 
     if cfg.wandb.enabled:
         wandb.log({"test/total_loss": avg_test})
         for k in loss_keys:
             wandb.log({f"test/{k}": test_avg[k]})
+        if is_visual:
+            if test_img is not None:
+                wandb.log({"test/reconstructions": test_img})
+            if test_rollout is not None:
+                wandb.log({
+                    "test/rollout_grid": test_rollout.pop("rollout_grid"),
+                    **{f"test/rollout_{k}": v for k, v in test_rollout.items()},
+                })
 
     log.info(f"Training complete. Best val loss: {best_val_loss:.6f}. Test loss: {avg_test:.6f}.")
     log.info(f"Checkpoint saved to: {ckpt_path}")
