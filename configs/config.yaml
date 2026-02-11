@@ -48,6 +48,9 @@ eval:
   horizon: 50
   dt_values: [0.05, 0.1, 0.2, 0.5]
   n_rollouts: 8
+  # Sequence length (actions) for dt generalization trajectories.
+  # null = use data.seq_len from the dataset config.
+  dt_seq_len: null
 
 # report.py settings
 checkpoints: []

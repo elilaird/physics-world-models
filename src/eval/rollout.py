@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 
 from src.models.wrappers import TrajectoryMatchingModel
@@ -132,3 +133,150 @@ def visual_open_loop_rollout(model, images, actions):
         "true_latents": true_latents,
         "pred_images": pred_images,
     }
+
+
+@torch.no_grad()
+def generate_visual_trajectory(env, init_state, actions, dt, render_opts):
+    """Roll out an environment and render each state to an image.
+
+    Args:
+        env: PhysicsControlEnv with render_state().
+        init_state: (state_dim,) tensor.
+        actions: (T,) tensor of discrete action indices.
+        dt: timestep for env.step().
+        render_opts: dict passed to env.render_state() (img_size, color, etc.).
+
+    Returns:
+        images: (T+1, C, H, W) float tensor in [0, 1].
+        states: (T+1, state_dim) tensor.
+    """
+    states = [init_state]
+    state = init_state.clone()
+    for t in range(len(actions)):
+        state = env.step(state, int(actions[t].item()), dt)
+        states.append(state)
+
+    images = []
+    for s in states:
+        img = env.render_state(s, **render_opts)  # (H, W, C) in [0, 1]
+        images.append(img.permute(2, 0, 1))  # (C, H, W)
+
+    return torch.stack(images).float(), torch.stack(states).float()
+
+
+@torch.no_grad()
+def visual_dt_generalization_test(
+    model, env, dt_values, cfg, n_seqs=8, seq_len=None,
+):
+    """Test visual model across different dt values.
+
+    For each dt, generates fresh trajectories from the environment, runs the
+    visual open-loop rollout, and compares predicted vs ground-truth frames.
+
+    Args:
+        model: VisualWorldModel.
+        env: PhysicsControlEnv with render_state().
+        dt_values: list of dt values to test.
+        cfg: Hydra config (for env render settings and init_state_range).
+        n_seqs: number of trajectories to generate per dt.
+        seq_len: number of action steps per trajectory.
+            Defaults to context_length + 10.
+
+    Returns:
+        dict mapping dt -> {
+            'pred_images': (n_seqs, horizon, C, H, W),
+            'true_images': (n_seqs, horizon, C, H, W),
+            'metrics': dict from compute_visual_metrics,
+            'latent_mse': float,
+        }
+    """
+    from omegaconf import OmegaConf
+    from src.eval.metrics import compute_visual_metrics
+
+    ctx_len = model.context_length
+    if seq_len is None:
+        seq_len = ctx_len + 10
+
+    # Render settings from env config
+    env_cfg = cfg.env
+    render_opts = {
+        "img_size": env_cfg.get("img_size", 64),
+        "color": env_cfg.get("color", True),
+        "render_quality": env_cfg.get("render_quality", "medium"),
+    }
+    for k in ("ball_color", "bg_color", "ball_radius"):
+        v = env_cfg.get(k, None)
+        if v is not None:
+            render_opts[k] = list(v) if hasattr(v, "__iter__") else v
+
+    # Init state sampling
+    init_range = np.array(OmegaConf.to_container(env_cfg.init_state_range, resolve=True))
+
+    device = next(model.parameters()).device
+    results = {}
+
+    for dt in dt_values:
+        all_images = []
+        all_actions = []
+        for _ in range(n_seqs):
+            if init_range.ndim == 1:
+                init_state = torch.tensor(
+                    [np.random.uniform(init_range[0], init_range[1])
+                     for _ in range(env.state_dim)]
+                ).float()
+            else:
+                init_state = torch.tensor(
+                    [np.random.uniform(r[0], r[1]) for r in init_range]
+                ).float()
+
+            actions = torch.randint(0, env.action_dim, (seq_len,))
+            imgs, _ = generate_visual_trajectory(env, init_state, actions, dt, render_opts)
+            all_images.append(imgs)
+            all_actions.append(actions)
+
+        images_batch = torch.stack(all_images).to(device)
+        actions_batch = torch.stack(all_actions).to(device)
+
+        # Run visual rollout
+        rollout = visual_open_loop_rollout(model, images_batch, actions_batch)
+        pred_images = rollout["pred_images"]       # (n_seqs, horizon, C, H, W)
+        true_latents = rollout["true_latents"]     # (n_seqs, T+1, D)
+        pred_latents = rollout["pred_latents"]     # (n_seqs, horizon, D)
+
+        horizon = pred_images.shape[1]
+        gt_images = images_batch[:, ctx_len:]      # (n_seqs, horizon, C, H, W)
+        gt_latents = true_latents[:, ctx_len:]     # (n_seqs, horizon, D)
+
+        latent_mse = ((pred_latents - gt_latents) ** 2).mean().item()
+        vis_metrics = compute_visual_metrics(pred_images, gt_images)
+
+        # Build rollout grid (GT | Pred | Error) for a few samples
+        N = images_batch.shape[1]  # total frames
+        n_show = min(4, n_seqs)
+        ctx_flat = images_batch[:n_show, :ctx_len].reshape(n_show * ctx_len, *images_batch.shape[2:])
+        ctx_mu, _ = model.encode(ctx_flat)
+        C, H, W = images_batch.shape[2], images_batch.shape[3], images_batch.shape[4]
+        ctx_recon = model.decode(ctx_mu).reshape(n_show, ctx_len, C, H, W)
+
+        rows = []
+        for i in range(n_show):
+            gt_row = torch.cat([images_batch[i, t] for t in range(N)], dim=-1)
+            recon_frames = [ctx_recon[i, t] for t in range(ctx_len)]
+            pred_frames = [pred_images[i, t] for t in range(horizon)]
+            pred_row = torch.cat(recon_frames + pred_frames, dim=-1)
+            blank = [torch.zeros(C, H, W, device=device)] * ctx_len
+            err_frames = [(pred_images[i, t] - gt_images[i, t]).abs() for t in range(horizon)]
+            err_row = torch.cat(blank + err_frames, dim=-1)
+            rows.extend([gt_row, pred_row, err_row])
+
+        grid = torch.cat(rows, dim=-2).clamp(0, 1).cpu()
+
+        results[dt] = {
+            "pred_images": pred_images,
+            "true_images": gt_images,
+            "metrics": vis_metrics,
+            "latent_mse": latent_mse,
+            "rollout_grid": grid,
+        }
+
+    return results

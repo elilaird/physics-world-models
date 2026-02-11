@@ -22,7 +22,10 @@ from torch.utils.data import DataLoader
 
 from src.eval.utils import load_checkpoint, rebuild_model, rebuild_env, is_visual_checkpoint
 from src.eval.metrics import mse_over_horizon, energy_drift, compute_visual_metrics
-from src.eval.rollout import open_loop_rollout, dt_generalization_test, visual_open_loop_rollout
+from src.eval.rollout import (
+    open_loop_rollout, dt_generalization_test,
+    visual_open_loop_rollout, visual_dt_generalization_test,
+)
 from src.data.precomputed import PrecomputedDataset
 
 log = logging.getLogger(__name__)
@@ -218,6 +221,67 @@ def evaluate_visual(cfg, train_cfg, model, device, output_dir):
     plt.close()
     log.info(f"Saved: {grid_path}")
 
+    # --- dt generalization test ---
+    dt_values = list(cfg.eval.dt_values)
+    dt_seq_len = cfg.eval.get("dt_seq_len", None) or (horizon + ctx_len)
+    env = rebuild_env(train_cfg)
+    log.info(f"Running visual dt generalization test: {dt_values} (seq_len={dt_seq_len})")
+    dt_results = visual_dt_generalization_test(
+        model, env, dt_values, train_cfg,
+        n_seqs=n_rollouts, seq_len=dt_seq_len,
+    )
+
+    dt_sorted = sorted(dt_results.keys())
+    for dt_val in dt_sorted:
+        m = dt_results[dt_val]["metrics"]
+        log.info(
+            f"  dt={dt_val}: MAE={m['mae']:.4f} | PSNR={m['psnr']:.2f} | "
+            f"SSIM={m['ssim']:.4f} | LPIPS={m['lpips']:.4f} | "
+            f"Latent MSE={dt_results[dt_val]['latent_mse']:.6f}"
+        )
+
+    # Save rollout grids per dt
+    dt_grid_paths = {}
+    for dt_val in dt_sorted:
+        dt_grid = dt_results[dt_val]["rollout_grid"]
+        C_grid = dt_grid.shape[0]
+        dt_grid_path = os.path.join(output_dir, f"dt_rollout_{dt_val}.png")
+        fig_dt = plt.figure(figsize=(max(16, dt_grid.shape[-1] // 32), dt_grid.shape[-2] // 16))
+        if C_grid == 1:
+            plt.imshow(dt_grid.squeeze(0).numpy(), cmap="gray")
+        else:
+            plt.imshow(dt_grid.permute(1, 2, 0).numpy())
+        plt.axis("off")
+        plt.title(f"dt={dt_val} — GT | Pred (ctx recon + rollout) | |Error|")
+        plt.tight_layout()
+        plt.savefig(dt_grid_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        dt_grid_paths[dt_val] = dt_grid_path
+        log.info(f"Saved: {dt_grid_path}")
+
+    # Plot dt generalization bar charts
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    dt_labels = [str(d) for d in dt_sorted]
+    for ax, metric_key, label in zip(
+        axes.flat,
+        ["mae", "psnr", "ssim", "lpips"],
+        ["MAE (lower=better)", "PSNR dB (higher=better)",
+         "SSIM (higher=better)", "LPIPS (lower=better)"],
+    ):
+        vals = [dt_results[d]["metrics"][metric_key] for d in dt_sorted]
+        ax.bar(dt_labels, vals, color="steelblue")
+        ax.set_xlabel("dt")
+        ax.set_ylabel(label)
+        ax.set_title(label)
+        ax.grid(True, alpha=0.3, axis="y")
+
+    fig.suptitle(f"{train_cfg.model.name} / {train_cfg.predictor.name} — dt Generalization")
+    plt.tight_layout()
+    dt_plot_path = os.path.join(output_dir, "visual_dt_generalization.png")
+    plt.savefig(dt_plot_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    log.info(f"Saved: {dt_plot_path}")
+
     # --- Save all metrics ---
     all_metrics = {
         "model": train_cfg.model.name,
@@ -229,6 +293,13 @@ def evaluate_visual(cfg, train_cfg, model, device, output_dir):
         "latent_mse": latent_mse,
         "latent_mse_per_step": latent_mse_per_step.cpu().numpy().tolist(),
         **vis_metrics,
+        "dt_generalization": {
+            str(d): {
+                "latent_mse": dt_results[d]["latent_mse"],
+                **dt_results[d]["metrics"],
+            }
+            for d in dt_sorted
+        },
     }
     metrics_pt_path = os.path.join(output_dir, "eval_metrics.pt")
     torch.save(all_metrics, metrics_pt_path)
@@ -252,9 +323,10 @@ def evaluate_visual(cfg, train_cfg, model, device, output_dir):
                 caption="GT | Pred (ctx recon + rollout) | |Error|",
             ),
             "eval/metrics_plot": wandb_mod.Image(metrics_path),
+            "eval/dt_generalization_plot": wandb_mod.Image(dt_plot_path),
         }
 
-        # Log per-step metrics as line plots
+        # Log per-step rollout metrics
         for t in range(horizon):
             wandb_log[f"eval_step/mae"] = vis_metrics["mae_per_step"][t]
             wandb_log[f"eval_step/psnr"] = vis_metrics["psnr_per_step"][t]
@@ -263,6 +335,22 @@ def evaluate_visual(cfg, train_cfg, model, device, output_dir):
             wandb_log["eval_step/step"] = t + 1
             wandb_mod.log(wandb_log)
             wandb_log = {}
+
+        # Log dt generalization metrics and rollout grids
+        for d in dt_sorted:
+            m = dt_results[d]["metrics"]
+            wandb_mod.log({
+                "eval_dt/dt": d,
+                "eval_dt/mae": m["mae"],
+                "eval_dt/psnr": m["psnr"],
+                "eval_dt/ssim": m["ssim"],
+                "eval_dt/lpips": m["lpips"],
+                "eval_dt/latent_mse": dt_results[d]["latent_mse"],
+                "eval_dt/rollout_grid": wandb_mod.Image(
+                    dt_results[d]["rollout_grid"].clamp(0, 1),
+                    caption=f"dt={d} — GT | Pred | |Error|",
+                ),
+            })
 
         wandb_mod.finish()
         log.info("Logged results to wandb")

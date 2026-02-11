@@ -26,9 +26,8 @@ from src.envs import ENV_REGISTRY
 from src.models import MODEL_REGISTRY
 from src.models.wrappers import TrajectoryMatchingModel
 from src.data.dataset import SequenceDataset
-from src.data.visual_dataset import build_visual_dataset
 from src.data.precomputed import PrecomputedDataset
-from src.eval.rollout import visual_open_loop_rollout
+from src.eval.rollout import visual_open_loop_rollout, visual_dt_generalization_test
 from src.eval.metrics import compute_visual_metrics
 
 log = logging.getLogger(__name__)
@@ -95,9 +94,9 @@ def build_dataset(env, cfg):
         env=env,
         variable_params=variable_params,
         init_state_range=init_state_range,
-        n_seqs=cfg.data.n_seqs,
-        seq_len=cfg.data.seq_len,
-        dt=cfg.data.dt,
+        n_seqs=cfg.dataset.n_seqs,
+        seq_len=cfg.dataset.seq_len,
+        dt=cfg.dataset.dt,
         observation_noise_std=cfg.env.get("observation_noise_std", 0.0),
     )
 
@@ -462,7 +461,7 @@ def main(cfg: DictConfig):
             if is_visual:
                 losses = visual_train_step(model, batch, optimizers)
             else:
-                losses = train_step(model, batch, optimizer, cfg.data.dt, is_ode)
+                losses = train_step(model, batch, optimizer, cfg.dataset.dt, is_ode)
             for k in loss_keys:
                 train_accum[k] += losses[k]
 
@@ -480,7 +479,7 @@ def main(cfg: DictConfig):
             if is_visual:
                 losses = visual_eval_step(model, batch)
             else:
-                losses = eval_step(model, batch, cfg.data.dt, is_ode)
+                losses = eval_step(model, batch, cfg.dataset.dt, is_ode)
             for k in loss_keys:
                 val_accum[k] += losses[k]
 
@@ -489,7 +488,6 @@ def main(cfg: DictConfig):
 
         val_avg = {k: v / len(val_loader) for k, v in val_accum.items()}
 
-        avg_train = train_avg["total_loss"]
         avg_val = val_avg["total_loss"]
 
         pbar.set_description(
@@ -556,7 +554,7 @@ def main(cfg: DictConfig):
         if is_visual:
             losses = visual_eval_step(model, batch)
         else:
-            losses = eval_step(model, batch, cfg.data.dt, is_ode)
+            losses = eval_step(model, batch, cfg.dataset.dt, is_ode)
         for k in loss_keys:
             test_accum[k] += losses[k]
     test_avg = {k: v / len(test_loader) for k, v in test_accum.items()}
@@ -593,6 +591,40 @@ def main(cfg: DictConfig):
                 wandb.log({
                     "test/rollout_grid": test_rollout.pop("rollout_grid"),
                     **{f"test/rollout_{k}": v for k, v in test_rollout.items()},
+                })
+
+    # dt generalization test (visual only)
+    if is_visual:
+        dt_values = list(cfg.eval.dt_values)
+        dt_seq_len = cfg.eval.get("dt_seq_len", None) or cfg.dataset.get("seq_len", 20)
+        env = build_env(cfg)
+        n_rollouts = cfg.eval.get("n_rollouts", 8)
+        log.info(f"Running visual dt generalization test: {dt_values} (seq_len={dt_seq_len})")
+        dt_results = visual_dt_generalization_test(
+            model, env, dt_values, cfg,
+            n_seqs=n_rollouts, seq_len=dt_seq_len,
+        )
+        for dt_val in sorted(dt_results.keys()):
+            m = dt_results[dt_val]["metrics"]
+            log.info(
+                f"  dt={dt_val}: MAE={m['mae']:.4f} | PSNR={m['psnr']:.2f} | "
+                f"SSIM={m['ssim']:.4f} | LPIPS={m['lpips']:.4f} | "
+                f"Latent MSE={dt_results[dt_val]['latent_mse']:.6f}"
+            )
+        if cfg.wandb.enabled:
+            for dt_val in sorted(dt_results.keys()):
+                m = dt_results[dt_val]["metrics"]
+                wandb.log({
+                    "dt_gen/dt": dt_val,
+                    "dt_gen/mae": m["mae"],
+                    "dt_gen/psnr": m["psnr"],
+                    "dt_gen/ssim": m["ssim"],
+                    "dt_gen/lpips": m["lpips"],
+                    "dt_gen/latent_mse": dt_results[dt_val]["latent_mse"],
+                    "dt_gen/rollout_grid": wandb.Image(
+                        dt_results[dt_val]["rollout_grid"].clamp(0, 1),
+                        caption=f"dt={dt_val} — GT | Pred | |Error|",
+                    ),
                 })
 
     log.info(f"Training complete. Best val loss: {best_val_loss:.6f}. Test loss: {avg_test:.6f}.")
