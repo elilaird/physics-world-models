@@ -1,12 +1,12 @@
 defaults:
-  - /predictor@predictor: latent_mlp
+  - _self_
 
 name: visual_world_model
 type: visual
-latent_dim: 32
-beta: 0.1
+latent_dim: 8
+beta: 0.001
 free_bits: 0.0
-hidden_dim: 128
+hidden_dim: 32
 action_embedding_dim: 8
 context_length: 3
 predictor_weight: 1.0

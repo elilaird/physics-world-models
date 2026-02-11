@@ -1,7 +1,9 @@
 defaults:
+  - _self_
   - dataset: oscillator_visual_testing
 
 seed: 42
 
-data_root: datasets
+ckpt_base_path: '/lustre/smuexa01/client/users/ejlaird/physics-world-models'
+data_root: ${ckpt_base_path}/datasets
 dataset_name: null

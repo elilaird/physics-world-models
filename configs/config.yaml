@@ -10,18 +10,28 @@ seed: 42
 training:
   epochs: 200
   batch_size: 32
-  lr: 1e-3
+  encoder_lr: 1e-4
+  decoder_lr: 1e-4
+  predictor_lr: 1e-3
   train_split: 0.8
 
-data_root: '/Volumes/SHARGE DISK 512GB/Data/physics-world-models/datasets/'
+ckpt_base_path: '/lustre/smuexa01/client/users/ejlaird/physics-world-models'
+data_root: ${ckpt_base_path}/datasets
+
+hydra:
+  run:
+    dir: ${ckpt_base_path}/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}/${model.name}
+  sweep:
+    dir: ${ckpt_base_path}/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${model.name}
 
 wandb:
-  enabled: false
+  enabled: true
   project: physics-world-models
-  log_images_every: 10
-  n_log_images: 4
+  log_images_every: 1
+  n_log_images: 1
 
-checkpoint_dir: ${hydra:runtime.output_dir}
+checkpoint_dir: ${ckpt_base_path}/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}/${model.name}
 
 # evaluate.py settings
 checkpoint: null
@@ -35,11 +45,6 @@ checkpoints: []
 report_checkpoint_dir: null
 
 report:
-  output_dir: reports/${now:%Y-%m-%d_%H-%M-%S}
+  output_dir: ${ckpt_base_path}/reports/${now:%Y-%m-%d_%H-%M-%S}
 
-hydra:
-  run:
-    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}/${model.name}
-  sweep:
-    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
-    subdir: ${model.name}
+

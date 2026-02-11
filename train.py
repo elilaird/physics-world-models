@@ -127,7 +127,7 @@ def visual_train_step(model, batch, optimizers):
         z = model.reparameterize(mu, logvar)
         recon = model.decode(z)
 
-        recon_loss = ((recon - window_frames) ** 2).mean()
+        recon_loss = (torch.abs(recon - window_frames)).mean()
         kl_loss = model.kl_loss(mu, logvar)
 
         z_window = z.detach().reshape(B, win_len, -1)
@@ -178,7 +178,7 @@ def visual_eval_step(model, batch):
         z = mu  # posterior mean for eval
         recon = model.decode(z)
 
-        batch_losses["recon_loss"] += ((recon - window_frames) ** 2).mean().item() / num_windows
+        batch_losses["recon_loss"] += (torch.abs(recon - window_frames)).mean().item() / num_windows
         batch_losses["kl_loss"] += model.kl_loss(mu, logvar).item() / num_windows
 
         z_window = z.reshape(B, win_len, -1)
@@ -303,10 +303,12 @@ def main(cfg: DictConfig):
     np.random.seed(cfg.seed)
 
     if cfg.wandb.enabled:
+        # slurm id
+        slurm_id = os.environ.get("SLURM_JOB_ID", "")
         wandb.init(
             project=cfg.wandb.project,
             config=OmegaConf.to_container(cfg, resolve=True),
-            name=f"{cfg.env.name}_{cfg.model.name}_{cfg.model.get('predictor').name}",
+            name=f"{cfg.env.name}_{cfg.model.name}_{cfg.predictor.name}_{slurm_id}",
         )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -333,16 +335,15 @@ def main(cfg: DictConfig):
     test_loader = DataLoader(test_data, batch_size=cfg.training.batch_size, shuffle=False)
 
     if is_visual:
-        lr = cfg.training.lr
         optimizers = {
-            "encoder": optim.Adam(model.encoder_parameters(), lr=lr),
-            "decoder": optim.Adam(model.decoder_parameters(), lr=lr),
-            "predictor": optim.Adam(model.predictor_parameters(), lr=lr),
+            "encoder": optim.Adam(model.encoder_parameters(), lr=cfg.training.encoder_lr),
+            "decoder": optim.Adam(model.decoder_parameters(), lr=cfg.training.decoder_lr),
+            "predictor": optim.Adam(model.predictor_parameters(), lr=cfg.training.predictor_lr),
         }
         optimizer = None
     else:
         optimizers = None
-        optimizer = optim.Adam(model.parameters(), lr=cfg.training.lr)
+        optimizer = optim.Adam(model.parameters(), lr=cfg.training.predictor_lr)
 
     # Training loop
     best_val_loss = float("inf")

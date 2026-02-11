@@ -18,12 +18,9 @@ class VisionEncoder(nn.Module):
             nn.Conv2d(64, 128, 4, 2, 1),
             nn.BatchNorm2d(128),
             nn.ReLU(),
-            nn.Conv2d(128, 256, 4, 2, 1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
         )
-        self.fc_mu = nn.Linear(256 * 4 * 4, latent_dim)
-        self.fc_logvar = nn.Linear(256 * 4 * 4, latent_dim)
+        self.fc_mu = nn.Linear(128 * 8 * 8, latent_dim)
+        self.fc_logvar = nn.Linear(128 * 8 * 8, latent_dim)
 
     def forward(self, x):
         h = self.net(x).flatten(1)
@@ -35,11 +32,8 @@ class VisionDecoder(nn.Module):
 
     def __init__(self, channels=3, latent_dim=32):
         super().__init__()
-        self.fc = nn.Linear(latent_dim, 256 * 4 * 4)
+        self.fc = nn.Linear(latent_dim, 128 * 8 * 8)
         self.net = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, 4, 2, 1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
             nn.ConvTranspose2d(128, 64, 4, 2, 1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
@@ -51,7 +45,7 @@ class VisionDecoder(nn.Module):
         )
 
     def forward(self, z):
-        h = self.fc(z).view(-1, 256, 4, 4)
+        h = self.fc(z).view(-1, 128, 8, 8)
         return self.net(h)
 
 
