@@ -7,13 +7,21 @@ defaults:
 
 seed: 42
 
+# Path to a pretrained checkpoint to load weights from (null = train from scratch)
+pretrained_checkpoint: /lustre/smuexa01/client/users/ejlaird/physics-world-models/outputs/2026-02-11/16-29-59/visual_world_model/best_model.pt
+
 training:
-  epochs: 200
+  epochs: 100
   batch_size: 32
   encoder_lr: 1e-4
   decoder_lr: 1e-4
   predictor_lr: 1e-3
   train_split: 0.8
+  # Which visual model components to train (false = frozen).
+  # Only applies when model.type == "visual".
+  train_encoder: true
+  train_decoder: true
+  train_predictor: true
 
 ckpt_base_path: '/lustre/smuexa01/client/users/ejlaird/physics-world-models'
 data_root: ${ckpt_base_path}/datasets

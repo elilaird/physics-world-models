@@ -69,23 +69,30 @@ which python
 echo $CONDA_PREFIX
 
 # Clone repo for this job
-cd ${WORK_DIR}
-
-if [ \"${TYPE}\" = \"jupyter\" ]; then
-    echo Skipping clone for jupyter
-elif [ "${BRANCH}" = "local" ]; then
-    echo "Using local branch"
+if [ \"${BRANCH}\" = \"local\" ]; then
+    echo Skipping clone for local testing
 else
-    mkdir -p physics-world-models_${SLURM_JOB_ID}
-    cd physics-world-models_${SLURM_JOB_ID}
+    cd ${WORK_DIR}
+    mkdir -p physics-world-models_\${SLURM_JOB_ID}
+    cd physics-world-models_\${SLURM_JOB_ID}
+    echo "Current working directory: physics-world-models_\${SLURM_JOB_ID}"
     git clone git@github.com:elilaird/physics-world-models.git .
     git checkout ${BRANCH}
+
+    # Print git state information
+    echo \"=== GIT STATE ===\"
+    echo \"Branch: \$(git branch --show-current)\"
+    echo \"Commit hash: \$(git rev-parse HEAD)\"
+    echo \"Commit short: \$(git rev-parse --short HEAD)\"
+    echo \"Commit message: \$(git log -1 --pretty=format:'%s')\"
+    echo \"Commit author: \$(git log -1 --pretty=format:'%an <%ae>')\"
+    echo \"Commit date: \$(git log -1 --pretty=format:'%ad' --date=iso)\"
+    echo \"===============\"
 fi
 
-echo "WORK_DIR: $(pwd)"
+echo \"WORK_DIR: \$(pwd)\"
 echo "COMMAND: GPU=${GPU} CPUS=${CPUS} MEM=${MEM} PARTITION=${PARTITION} TYPE=${TYPE} TIME=${TIME} CONDA_ENV=${CONDA_ENV} ./make_sbatch.sh ${COMMAND}"
 
-# export LD_LIBRARY_PATH=/users/ejlaird/.mujoco/mujoco210/bin:$LD_LIBRARY_PATH
 srun --ntasks=${NODES} --distribution=block  bash -c \"${COMMAND}\"
 " > ${TYPE}_${DATETIME}.sbatch
 

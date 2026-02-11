@@ -95,6 +95,7 @@ Pixel-based observations for environments with `render_state()`. Oscillator and 
 - **`VisualSequenceDataset`**: generates `(images, actions, target_images)` tuples in `(T, C, H, W)` format, includes vector states for validation
 - **`visual` config section**: `img_size`, `channels`, `color`, `render_quality`
 - **`VisualWorldModel`** (`model=visual_world_model`): beta-VAE + swappable latent predictor. Config exposes `latent_dim`, `beta` (KL weight), `free_bits` (per-dimension KL floor), `context_length`, `predictor_weight`, `predictor` (registry key, default `latent_mlp`). Training uses `visual_train_step` which reconstructs all frames via ELBO (recon + beta * KL) and predicts next-latent from a context window of past sampled latents. Gradient isolation via `.detach()` separates autoencoder and predictor objectives. Eval uses posterior mean (no sampling) for deterministic evaluation.
+- **Pretrained checkpoint loading**: `pretrained_checkpoint` config loads weights from a prior checkpoint via `strict=False` (allows architecture changes like swapping predictors). `training.train_encoder`, `training.train_decoder`, `training.train_predictor` (all default `true`) control which components are trainable — set to `false` to freeze. Only trainable components get optimizers.
 - Visual rollout evaluation is not yet implemented — `evaluate.py` raises `NotImplementedError` for visual checkpoints
 
 ```bash
@@ -109,6 +110,20 @@ python train.py env=pendulum_visual model=visual_world_model
 # Override visual model hyperparams
 python train.py env=oscillator_visual model=visual_world_model model.latent_dim=64 model.context_length=2
 python train.py env=oscillator_visual model=visual_world_model model.beta=1.0 model.free_bits=0.25
+
+# Two-phase training: train VAE first, then freeze and train predictor only
+# Phase 1: train encoder/decoder only (disable predictor training and loss)
+python train.py env=oscillator_visual model=visual_world_model \
+    training.train_predictor=false model.predictor_weight=0.0
+
+# Phase 2: load pretrained VAE, freeze encoder/decoder, train predictor
+python train.py env=oscillator_visual model=visual_world_model \
+    pretrained_checkpoint=/path/to/best_model.pt \
+    training.train_encoder=false training.train_decoder=false
+
+# Or fine-tune all components together from a pretrained checkpoint
+python train.py env=oscillator_visual model=visual_world_model \
+    pretrained_checkpoint=/path/to/best_model.pt
 ```
 
 ### Legacy systems (kept for reference)

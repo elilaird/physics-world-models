@@ -110,10 +110,8 @@ def visual_train_step(model, batch, optimizers):
     step_size = context_length
     num_windows = max(1, 1 + (N - window_size) // step_size)
 
-    opt_enc, opt_dec, opt_pred = optimizers["encoder"], optimizers["decoder"], optimizers["predictor"]
-    opt_enc.zero_grad()
-    opt_dec.zero_grad()
-    opt_pred.zero_grad()
+    for opt in optimizers.values():
+        opt.zero_grad()
 
     batch_losses = defaultdict(float)
 
@@ -144,9 +142,8 @@ def visual_train_step(model, batch, optimizers):
         batch_losses["kl_loss"] += kl_loss.item() / num_windows
         batch_losses["predictor_loss"] += pred_loss.item() / num_windows
 
-    opt_enc.step()
-    opt_dec.step()
-    opt_pred.step()
+    for opt in optimizers.values():
+        opt.step()
 
     batch_losses["total_loss"] = (
         batch_losses["recon_loss"] + model.beta * batch_losses["kl_loss"]
@@ -318,8 +315,30 @@ def main(cfg: DictConfig):
     is_ode = cfg.model.type == "ode"
     is_visual = cfg.model.type == "visual"
 
+    # Load pretrained checkpoint if specified
+    if cfg.get("pretrained_checkpoint"):
+        ckpt = torch.load(cfg.pretrained_checkpoint, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        log.info(f"Loaded pretrained weights from {cfg.pretrained_checkpoint}")
+
+    # Freeze visual model components based on config
+    if is_visual:
+        if not cfg.training.get("train_encoder", True):
+            for p in model.encoder.parameters():
+                p.requires_grad = False
+            log.info("Froze encoder parameters")
+        if not cfg.training.get("train_decoder", True):
+            for p in model.decoder.parameters():
+                p.requires_grad = False
+            log.info("Froze decoder parameters")
+        if not cfg.training.get("train_predictor", True):
+            for p in model.predictor.parameters():
+                p.requires_grad = False
+            log.info("Froze predictor parameters")
+
     param_count = sum(p.numel() for p in model.parameters())
-    log.info(f"Model: {cfg.model.name} ({param_count} params)")
+    trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    log.info(f"Model: {cfg.model.name} ({param_count} params, {trainable_count} trainable)")
 
     dataset_version = os.path.join(cfg.dataset.name, cfg.dataset.version)
     train_data = PrecomputedDataset(os.path.join(cfg.data_root, dataset_version, "train.npz"))
@@ -335,11 +354,13 @@ def main(cfg: DictConfig):
     test_loader = DataLoader(test_data, batch_size=cfg.training.batch_size, shuffle=False)
 
     if is_visual:
-        optimizers = {
-            "encoder": optim.Adam(model.encoder_parameters(), lr=cfg.training.encoder_lr),
-            "decoder": optim.Adam(model.decoder_parameters(), lr=cfg.training.decoder_lr),
-            "predictor": optim.Adam(model.predictor_parameters(), lr=cfg.training.predictor_lr),
-        }
+        optimizers = {}
+        if cfg.training.get("train_encoder", True):
+            optimizers["encoder"] = optim.Adam(model.encoder_parameters(), lr=cfg.training.encoder_lr)
+        if cfg.training.get("train_decoder", True):
+            optimizers["decoder"] = optim.Adam(model.decoder_parameters(), lr=cfg.training.decoder_lr)
+        if cfg.training.get("train_predictor", True):
+            optimizers["predictor"] = optim.Adam(model.predictor_parameters(), lr=cfg.training.predictor_lr)
         optimizer = None
     else:
         optimizers = None
@@ -449,6 +470,13 @@ def main(cfg: DictConfig):
             test_accum[k] += losses[k]
     test_avg = {k: v / len(test_loader) for k, v in test_accum.items()}
     avg_test = test_avg["total_loss"]
+
+    # Test recon grid
+    if is_visual:
+        n_log = cfg.wandb.get("n_log_images", 4)
+        test_img = make_recon_grid(model, batch, n_log)
+        if test_img is not None:
+            wandb.log({"test/reconstructions": test_img})
 
     if cfg.wandb.enabled:
         wandb.log({"test/total_loss": avg_test})
