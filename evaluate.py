@@ -134,7 +134,9 @@ def evaluate_visual(cfg, train_cfg, model, device, output_dir):
     actions = batch["actions"]  # (B, T)
     B, N, C, H, W = images.shape
     ctx_len = model.context_length
-    horizon = N - ctx_len
+    K = model.encoder_frames
+    N_latents = N - K + 1
+    horizon = N_latents - ctx_len
 
     log.info(f"Running visual open-loop rollout: {n_rollouts} sequences, "
              f"context={ctx_len}, horizon={horizon}")
@@ -142,12 +144,11 @@ def evaluate_visual(cfg, train_cfg, model, device, output_dir):
     # Run rollout
     result = visual_open_loop_rollout(model, images, actions)
     pred_latents = result["pred_latents"]  # (B, horizon, D)
-    true_latents = result["true_latents"]  # (B, N, D)
+    true_latents = result["true_latents"]  # (B, N_latents, D)
     pred_images = result["pred_images"]    # (B, horizon, C, H, W)
 
-    # Ground-truth frames for the predicted portion
-    gt_images = images[:, ctx_len:]  # (B, horizon, C, H, W)
-    gt_latents = true_latents[:, ctx_len:]  # (B, horizon, D)
+    gt_images = images[:, K - 1 + ctx_len:]  # (B, horizon, C, H, W)
+    gt_latents = true_latents[:, ctx_len:]   # (B, horizon, D)
 
     # Latent MSE
     latent_mse_per_step = ((pred_latents - gt_latents) ** 2).mean(dim=(0, 2))  # (horizon,)
@@ -187,23 +188,23 @@ def evaluate_visual(cfg, train_cfg, model, device, output_dir):
 
     # --- Build rollout grid images ---
     n_show = min(4, B)
-    # Reconstruct context frames through encoder for comparison
-    ctx_flat = images[:n_show, :ctx_len].reshape(n_show * ctx_len, C, H, W)
-    ctx_mu, _ = model.encode(ctx_flat)
-    ctx_recon = model.decode(ctx_mu).reshape(n_show, ctx_len, C, H, W)
+    ctx_images = images[:n_show, :ctx_len + K - 1]
+    ctx_mu, _ = model.encode_sequence(ctx_images)  # (n_show, ctx_len, D)
+    ctx_recon = model.decode(
+        ctx_mu.reshape(n_show * ctx_len, -1)
+    ).reshape(n_show, ctx_len, C, H, W)
 
+    blank = torch.zeros(C, H, W, device=device)
     grids = []
     for i in range(n_show):
-        # Row 1: all ground-truth frames
         gt_row = torch.cat([images[i, t] for t in range(N)], dim=-1)
-        # Row 2: context recons + predicted frames
+        lead_blanks = [blank] * (K - 1)
         recon_frames = [ctx_recon[i, t] for t in range(ctx_len)]
         pred_frames = [pred_images[i, t] for t in range(horizon)]
-        pred_row = torch.cat(recon_frames + pred_frames, dim=-1)
-        # Row 3: |error| (black for context, heatmap for predicted)
-        blank = [torch.zeros(C, H, W, device=device)] * ctx_len
+        pred_row = torch.cat(lead_blanks + recon_frames + pred_frames, dim=-1)
+        err_blanks = [blank] * (K - 1 + ctx_len)
         err_frames = [(pred_images[i, t] - gt_images[i, t]).abs() for t in range(horizon)]
-        err_row = torch.cat(blank + err_frames, dim=-1)
+        err_row = torch.cat(err_blanks + err_frames, dim=-1)
         grids.extend([gt_row, pred_row, err_row])
 
     grid = torch.cat(grids, dim=-2).clamp(0, 1).cpu()  # (C, n_show*3*H, N*W)

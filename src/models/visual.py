@@ -4,12 +4,17 @@ import torch
 import torch.nn as nn
 
 class VisionEncoder(nn.Module):
-    """Encodes (B, C, 64, 64) images to (B, latent_dim) mu and logvar."""
+    """Encodes (B, in_channels, 64, 64) images to (B, latent_dim) mu and logvar.
 
-    def __init__(self, channels=3, latent_dim=32):
+    When encoder_frames > 1, in_channels = channels * encoder_frames (channel-
+    concatenated consecutive frames).
+    """
+
+    def __init__(self, channels=3, latent_dim=32, encoder_frames=1):
         super().__init__()
+        in_channels = channels * encoder_frames
         self.net = nn.Sequential(
-            nn.Conv2d(channels, 32, 4, 2, 1),
+            nn.Conv2d(in_channels, 32, 4, 2, 1),
             nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.Conv2d(32, 64, 4, 2, 1),
@@ -78,7 +83,7 @@ class VisualWorldModel(nn.Module):
 
     def __init__(self, predictor, latent_dim=32, beta=1.0, free_bits=0.5,
                  context_length=3, predictor_weight=1.0, channels=3,
-                 velocity_weight=1.0, observation_dt=0.1):
+                 velocity_weight=1.0, observation_dt=0.1, encoder_frames=1):
         super().__init__()
         assert latent_dim % 2 == 0, "Structured latent requires even latent_dim"
         self.latent_dim = latent_dim
@@ -89,14 +94,37 @@ class VisualWorldModel(nn.Module):
         self.predictor_weight = predictor_weight
         self.velocity_weight = velocity_weight
         self.observation_dt = observation_dt
+        self.encoder_frames = encoder_frames
+        self.channels = channels
 
-        self.encoder = VisionEncoder(channels=channels, latent_dim=latent_dim)
+        self.encoder = VisionEncoder(
+            channels=channels, latent_dim=latent_dim, encoder_frames=encoder_frames,
+        )
         self.decoder = VisionDecoder(channels=channels, latent_dim=self.half_dim)
         self.predictor = predictor
 
     def encode(self, images):
-        """Returns (mu, logvar) each of shape (B, latent_dim)."""
+        """Encode pre-formed input (B, encoder_frames*C, H, W) → (mu, logvar)."""
         return self.encoder(images)
+
+    def encode_sequence(self, images):
+        """Encode a frame sequence using overlapping channel-concatenated windows.
+
+        Args:
+            images: (B, T, C, H, W)
+        Returns:
+            mu, logvar: each (B, T - encoder_frames + 1, latent_dim)
+        """
+        B, T, C, H, W = images.shape
+        K = self.encoder_frames
+        n_out = T - K + 1
+        windows = torch.cat(
+            [images[:, t:t + K].reshape(B, K * C, H, W).unsqueeze(1)
+             for t in range(n_out)], dim=1,
+        )
+        flat = windows.reshape(B * n_out, K * C, H, W)
+        mu, logvar = self.encoder(flat)
+        return mu.reshape(B, n_out, -1), logvar.reshape(B, n_out, -1)
 
     def reparameterize(self, mu, logvar):
         """Sample z = mu + eps * std."""

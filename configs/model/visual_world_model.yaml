@@ -12,6 +12,7 @@ context_length: 3
 predictor_weight: 1.0
 velocity_weight: 0.0
 observation_dt: ${dataset.dt}
+encoder_frames: 2
 # ODE predictor settings (ignored by non-ODE predictors)
 predictor_dt: ${dataset.dt}
 integration_method: rk4

@@ -81,10 +81,9 @@ def dt_generalization_test(model, env, init_state, actions, dt_values, variable_
 def visual_open_loop_rollout(model, images, actions):
     """Open-loop rollout for visual world models.
 
-    Encodes the first context_length frames, then autoregressively predicts
-    remaining frames using the predictor. At each step the predictor sees
-    exactly context_length latents and one action, produces one next-latent,
-    and the context window shifts right by one.
+    Encodes all frames with channel-concatenated overlapping windows, then
+    autoregressively predicts remaining latents. Each step the predictor sees
+    context_length latents, produces one next-latent, and the window shifts.
 
     Args:
         model: VisualWorldModel (encoder, decoder, predictor).
@@ -93,37 +92,37 @@ def visual_open_loop_rollout(model, images, actions):
 
     Returns:
         dict with:
-            pred_latents: (B, T+1-context_length, latent_dim) predicted latents
-            true_latents: (B, T+1, latent_dim) encoded ground-truth latents
-            pred_images: (B, T+1-context_length, C, H, W) decoded predicted frames
+            pred_latents: (B, horizon, latent_dim) predicted latents
+            true_latents: (B, N_latents, latent_dim) encoded ground-truth latents
+            pred_images: (B, horizon, C, H, W) decoded predicted frames
+        where N_latents = N - encoder_frames + 1, horizon = N_latents - ctx_len
     """
     B, N, C, H, W = images.shape
     ctx_len = model.context_length
-    horizon = N - ctx_len  # number of frames to predict
+    K = model.encoder_frames
 
-    # Encode all ground-truth frames to get true latents (posterior mean)
-    all_flat = images.reshape(B * N, C, H, W)
-    mu_all, _ = model.encode(all_flat)
-    true_latents = mu_all.reshape(B, N, -1)  # (B, N, D)
+    # Encode all ground-truth frames → (B, N-K+1, D) posterior means
+    mu_all, _ = model.encode_sequence(images)
+    true_latents = mu_all  # (B, N_latents, D)
+    N_latents = true_latents.shape[1]
+    horizon = N_latents - ctx_len
 
-    # Seed the context with the first ctx_len encoded frames
+    # Seed context with the first ctx_len encoded latents
     context = true_latents[:, :ctx_len].clone()  # (B, ctx_len, D)
 
     pred_latents = []
     for t in range(horizon):
-        # actions[:, t:t+ctx_len] aligns each context frame z_i with the
-        # action a_i that transitions it to z_{i+1}
-        act = actions[:, t:t + ctx_len].long()  # (B, ctx_len)
+        # Latent index t corresponds to frame K-1+t; action at that frame
+        # transitions to the next latent
+        act_start = K - 1 + t
+        act = actions[:, act_start:act_start + ctx_len].long()
         pred = model.predictor(context, act)  # (B, ctx_len, D)
-        z_next = pred[:, -1]  # (B, D) — last prediction is the new frame
+        z_next = pred[:, -1]  # (B, D)
         pred_latents.append(z_next)
-
-        # Shift context: drop oldest, append new prediction
         context = torch.cat([context[:, 1:], z_next.unsqueeze(1)], dim=1)
 
     pred_latents = torch.stack(pred_latents, dim=1)  # (B, horizon, D)
 
-    # Decode predicted latents to images
     pred_images = model.decode(
         pred_latents.reshape(B * horizon, -1)
     ).reshape(B, horizon, C, H, W)
@@ -238,35 +237,42 @@ def visual_dt_generalization_test(
         actions_batch = torch.stack(all_actions).to(device)
 
         # Run visual rollout
+        K = model.encoder_frames
         rollout = visual_open_loop_rollout(model, images_batch, actions_batch)
         pred_images = rollout["pred_images"]       # (n_seqs, horizon, C, H, W)
-        true_latents = rollout["true_latents"]     # (n_seqs, T+1, D)
+        true_latents = rollout["true_latents"]     # (n_seqs, N_latents, D)
         pred_latents = rollout["pred_latents"]     # (n_seqs, horizon, D)
 
         horizon = pred_images.shape[1]
-        gt_images = images_batch[:, ctx_len:]      # (n_seqs, horizon, C, H, W)
-        gt_latents = true_latents[:, ctx_len:]     # (n_seqs, horizon, D)
+        gt_images = images_batch[:, K - 1 + ctx_len:]  # (n_seqs, horizon, C, H, W)
+        gt_latents = true_latents[:, ctx_len:]          # (n_seqs, horizon, D)
 
         latent_mse = ((pred_latents - gt_latents) ** 2).mean().item()
         vis_metrics = compute_visual_metrics(pred_images, gt_images)
 
         # Build rollout grid (GT | Pred | Error) for a few samples
-        N = images_batch.shape[1]  # total frames
-        n_show = min(4, n_seqs)
-        ctx_flat = images_batch[:n_show, :ctx_len].reshape(n_show * ctx_len, *images_batch.shape[2:])
-        ctx_mu, _ = model.encode(ctx_flat)
+        N = images_batch.shape[1]  # total raw frames
         C, H, W = images_batch.shape[2], images_batch.shape[3], images_batch.shape[4]
-        ctx_recon = model.decode(ctx_mu).reshape(n_show, ctx_len, C, H, W)
+        n_show = min(4, n_seqs)
+        blank = torch.zeros(C, H, W, device=device)
+
+        # Encode context: need ctx_len + K - 1 frames → ctx_len latents
+        ctx_images = images_batch[:n_show, :ctx_len + K - 1]
+        ctx_mu, _ = model.encode_sequence(ctx_images)  # (n_show, ctx_len, D)
+        ctx_recon = model.decode(
+            ctx_mu.reshape(n_show * ctx_len, -1)
+        ).reshape(n_show, ctx_len, C, H, W)
 
         rows = []
         for i in range(n_show):
             gt_row = torch.cat([images_batch[i, t] for t in range(N)], dim=-1)
+            lead_blanks = [blank] * (K - 1)
             recon_frames = [ctx_recon[i, t] for t in range(ctx_len)]
             pred_frames = [pred_images[i, t] for t in range(horizon)]
-            pred_row = torch.cat(recon_frames + pred_frames, dim=-1)
-            blank = [torch.zeros(C, H, W, device=device)] * ctx_len
+            pred_row = torch.cat(lead_blanks + recon_frames + pred_frames, dim=-1)
+            err_blanks = [blank] * (K - 1 + ctx_len)
             err_frames = [(pred_images[i, t] - gt_images[i, t]).abs() for t in range(horizon)]
-            err_row = torch.cat(blank + err_frames, dim=-1)
+            err_row = torch.cat(err_blanks + err_frames, dim=-1)
             rows.extend([gt_row, pred_row, err_row])
 
         grid = torch.cat(rows, dim=-2).clamp(0, 1).cpu()

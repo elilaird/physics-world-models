@@ -68,6 +68,7 @@ def build_model(cfg):
             predictor_weight=cfg.model.predictor_weight,
             velocity_weight=cfg.model.velocity_weight,
             observation_dt=cfg.model.observation_dt,
+            encoder_frames=cfg.model.get("encoder_frames", 1),
         )
 
     kwargs = {
@@ -110,7 +111,8 @@ def visual_train_step(model, batch, optimizers):
 
     B, N, C, H, W = all_images.shape
     context_length = model.context_length
-    window_size = context_length + 1
+    K = model.encoder_frames
+    window_size = context_length + K  # raw frames needed per window
     step_size = context_length
     num_windows = max(1, 1 + (N - window_size) // step_size)
 
@@ -118,33 +120,40 @@ def visual_train_step(model, batch, optimizers):
         opt.zero_grad()
 
     batch_losses = defaultdict(float)
-
     half_dim = model.half_dim
 
     for w in range(num_windows):
         start = w * step_size
         end = min(start + window_size, N)
-        win_len = end - start
 
-        window_frames = all_images[:, start:end].reshape(B * win_len, C, H, W)
-        mu, logvar = model.encode(window_frames)
-        z = model.reparameterize(mu, logvar)
+        # Encode with channel-concat overlapping windows → (B, n_latents, D)
+        window_images = all_images[:, start:end]
+        mu, logvar = model.encode_sequence(window_images)
+        n_latents = mu.shape[1]
+
+        mu_flat = mu.reshape(B * n_latents, -1)
+        logvar_flat = logvar.reshape(B * n_latents, -1)
+        z = model.reparameterize(mu_flat, logvar_flat)
+
+        # Reconstruct — each latent corresponds to the last frame in its encoder window
+        recon_targets = window_images[:, K - 1:].reshape(B * n_latents, C, H, W)
         recon = model.decode(z)
-
-        recon_loss = (torch.abs(recon - window_frames)).mean()
-        kl_loss = model.kl_loss(mu, logvar)
+        recon_loss = (torch.abs(recon - recon_targets)).mean()
+        kl_loss = model.kl_loss(mu_flat, logvar_flat)
 
         # Velocity consistency: mu_p direction should match finite-difference velocity
-        mu_window = mu.reshape(B, win_len, -1)
-        mu_q = mu_window[..., :half_dim]
-        mu_p = mu_window[..., half_dim:]
+        mu_q = mu[..., :half_dim]
+        mu_p = mu[..., half_dim:]
         dq = mu_q[:, 1:] - mu_q[:, :-1]
         vel_loss = (1 - F.cosine_similarity(mu_p[:, :-1], dq, dim=-1)).mean()
 
-        z_window = z.detach().reshape(B, win_len, -1)
+        # Predictor: latents are detached from encoder
+        z_window = z.detach().reshape(B, n_latents, -1)
         ctx = z_window[:, :context_length]
         targets = z_window[:, 1:]
-        window_actions = actions[:, start:start + context_length].long()
+        # Actions aligned to latent indices (first latent = frame start+K-1)
+        act_start = start + K - 1
+        window_actions = actions[:, act_start:act_start + context_length].long()
         pred_z = model.predictor(ctx, window_actions)
         pred_loss = ((pred_z - targets) ** 2).mean()
 
@@ -176,7 +185,8 @@ def visual_eval_step(model, batch):
 
     B, N, C, H, W = all_images.shape
     context_length = model.context_length
-    window_size = context_length + 1
+    K = model.encoder_frames
+    window_size = context_length + K
     step_size = context_length
     num_windows = max(1, 1 + (N - window_size) // step_size)
     half_dim = model.half_dim
@@ -186,28 +196,32 @@ def visual_eval_step(model, batch):
     for w in range(num_windows):
         start = w * step_size
         end = min(start + window_size, N)
-        win_len = end - start
 
-        window_frames = all_images[:, start:end].reshape(B * win_len, C, H, W)
-        mu, logvar = model.encode(window_frames)
-        z = mu  # posterior mean for eval
+        window_images = all_images[:, start:end]
+        mu, logvar = model.encode_sequence(window_images)
+        n_latents = mu.shape[1]
+
+        mu_flat = mu.reshape(B * n_latents, -1)
+        logvar_flat = logvar.reshape(B * n_latents, -1)
+        z = mu_flat  # posterior mean for eval
         recon = model.decode(z)
 
-        batch_losses["recon_loss"] += (torch.abs(recon - window_frames)).mean().item() / num_windows
-        batch_losses["kl_loss"] += model.kl_loss(mu, logvar).item() / num_windows
+        recon_targets = window_images[:, K - 1:].reshape(B * n_latents, C, H, W)
+        batch_losses["recon_loss"] += (torch.abs(recon - recon_targets)).mean().item() / num_windows
+        batch_losses["kl_loss"] += model.kl_loss(mu_flat, logvar_flat).item() / num_windows
 
         # Velocity consistency
-        mu_window = mu.reshape(B, win_len, -1)
-        mu_q = mu_window[..., :half_dim]
-        mu_p = mu_window[..., half_dim:]
+        mu_q = mu[..., :half_dim]
+        mu_p = mu[..., half_dim:]
         dq = mu_q[:, 1:] - mu_q[:, :-1]
         vel_loss = (1 - F.cosine_similarity(mu_p[:, :-1], dq, dim=-1)).mean().item()
         batch_losses["velocity_loss"] += vel_loss / num_windows
 
-        z_window = z.reshape(B, win_len, -1)
+        z_window = z.reshape(B, n_latents, -1)
         ctx = z_window[:, :context_length]
         targets = z_window[:, 1:]
-        window_actions = actions[:, start:start + context_length].long()
+        act_start = start + K - 1
+        window_actions = actions[:, act_start:act_start + context_length].long()
         pred_z = model.predictor(ctx, window_actions)
         batch_losses["predictor_loss"] += ((pred_z - targets) ** 2).mean().item() / num_windows
 
@@ -270,8 +284,8 @@ def eval_step(model, batch, dt, is_ode):
 def make_recon_grid(model, batch, n_samples=4):
     """Build a reconstruction grid image for wandb.
 
-    For each sample, shows 3 rows across one window (ctx+1 frames):
-      Row 1: ground truth frames
+    For each sample, shows 3 rows across one window:
+      Row 1: ground truth frames (those corresponding to latents)
       Row 2: encoder reconstructions (encode → decode)
       Row 3: predictor reconstructions (predict next → decode, first col blank)
 
@@ -282,39 +296,42 @@ def make_recon_grid(model, batch, n_samples=4):
 
     B, N, C, H, W = all_images.shape
     context_length = model.context_length
-    window_size = context_length + 1
+    K = model.encoder_frames
+    window_size = context_length + K  # raw frames needed
+    n_latents = context_length + 1
     n = min(n_samples, B)
 
     if N < window_size:
         return None
 
-    # Encode first window
-    window = all_images[:n, :window_size]  # (n, ws, C, H, W)
-    flat = window.reshape(n * window_size, C, H, W)
-    mu, _ = model.encode(flat)
+    window = all_images[:n, :window_size]  # (n, window_size, C, H, W)
+    mu, _ = model.encode_sequence(window)  # (n, n_latents, D)
 
-    # Encoder reconstructions
-    enc_recon = model.decode(mu).reshape(n, window_size, C, H, W)
+    enc_recon = model.decode(
+        mu.reshape(n * n_latents, -1)
+    ).reshape(n, n_latents, C, H, W)
+
+    # GT frames corresponding to latents (last frame of each encoder window)
+    gt_frames = window[:, K - 1:]  # (n, n_latents, C, H, W)
 
     # Predictor reconstructions
-    z = mu.reshape(n, window_size, -1)
-    ctx = z[:, :context_length]
-    window_actions = actions[:n, :context_length].long()
-    pred_z = model.predictor(ctx, window_actions)  # (n, ctx, D)
+    ctx = mu[:, :context_length]
+    act_start = K - 1
+    window_actions = actions[:n, act_start:act_start + context_length].long()
+    pred_z = model.predictor(ctx, window_actions)
     pred_recon = model.decode(
         pred_z.reshape(n * context_length, -1)
     ).reshape(n, context_length, C, H, W)
 
-    # Build grid: 3 rows per sample, ws columns
     blank = torch.zeros(C, H, W, device=window.device)
     rows = []
     for i in range(n):
-        gt_row = torch.cat([window[i, t] for t in range(window_size)], dim=-1)
-        enc_row = torch.cat([enc_recon[i, t] for t in range(window_size)], dim=-1)
+        gt_row = torch.cat([gt_frames[i, t] for t in range(n_latents)], dim=-1)
+        enc_row = torch.cat([enc_recon[i, t] for t in range(n_latents)], dim=-1)
         pred_row = torch.cat([blank] + [pred_recon[i, t] for t in range(context_length)], dim=-1)
         rows.extend([gt_row, enc_row, pred_row])
 
-    grid = torch.cat(rows, dim=-2)  # (C, n*3*H, ws*W)
+    grid = torch.cat(rows, dim=-2)
     return wandb.Image(grid.clamp(0, 1).cpu(), caption="GT | Enc recon | Pred recon")
 
 
@@ -334,41 +351,47 @@ def compute_rollout_metrics(model, batch, n_samples=4):
     actions = batch["actions"]
     B, N, C, H, W = images.shape
     ctx_len = model.context_length
-    horizon = N - ctx_len
+    K = model.encoder_frames
+    N_latents = N - K + 1
+    horizon = N_latents - ctx_len
 
     if horizon <= 0:
         return None
 
     result = visual_open_loop_rollout(model, images, actions)
     pred_latents = result["pred_latents"]    # (B, horizon, D)
-    true_latents = result["true_latents"]    # (B, N, D)
+    true_latents = result["true_latents"]    # (B, N_latents, D)
     pred_images = result["pred_images"]      # (B, horizon, C, H, W)
 
-    gt_images = images[:, ctx_len:]          # (B, horizon, C, H, W)
-    gt_latents = true_latents[:, ctx_len:]   # (B, horizon, D)
+    # Frames corresponding to predicted latents start at K-1+ctx_len
+    gt_images = images[:, K - 1 + ctx_len:]  # (B, horizon, C, H, W)
+    gt_latents = true_latents[:, ctx_len:]    # (B, horizon, D)
 
-    # Latent MSE
     latent_mse = ((pred_latents - gt_latents) ** 2).mean().item()
-
-    # Visual metrics (MAE, PSNR, SSIM, LPIPS)
     vis_metrics = compute_visual_metrics(pred_images, gt_images)
 
-    # Build rollout grid for visualization
+    # Build rollout grid
     n_show = min(n_samples, B)
-    ctx_flat = images[:n_show, :ctx_len].reshape(n_show * ctx_len, C, H, W)
-    ctx_mu, _ = model.encode(ctx_flat)
-    ctx_recon = model.decode(ctx_mu).reshape(n_show, ctx_len, C, H, W)
+    # Encode context: need ctx_len + K - 1 frames to get ctx_len latents
+    ctx_images = images[:n_show, :ctx_len + K - 1]
+    ctx_mu, _ = model.encode_sequence(ctx_images)  # (n_show, ctx_len, D)
+    ctx_recon = model.decode(
+        ctx_mu.reshape(n_show * ctx_len, -1)
+    ).reshape(n_show, ctx_len, C, H, W)
 
     rows = []
     device = images.device
+    blank = torch.zeros(C, H, W, device=device)
     for i in range(n_show):
         gt_row = torch.cat([images[i, t] for t in range(N)], dim=-1)
+        # K-1 blanks (no latent for first K-1 frames) + ctx recon + pred images
+        lead_blanks = [blank] * (K - 1)
         recon_frames = [ctx_recon[i, t] for t in range(ctx_len)]
         pred_frames = [pred_images[i, t] for t in range(horizon)]
-        pred_row = torch.cat(recon_frames + pred_frames, dim=-1)
-        blank = [torch.zeros(C, H, W, device=device)] * ctx_len
+        pred_row = torch.cat(lead_blanks + recon_frames + pred_frames, dim=-1)
+        err_blanks = [blank] * (K - 1 + ctx_len)
         err_frames = [(pred_images[i, t] - gt_images[i, t]).abs() for t in range(horizon)]
-        err_row = torch.cat(blank + err_frames, dim=-1)
+        err_row = torch.cat(err_blanks + err_frames, dim=-1)
         rows.extend([gt_row, pred_row, err_row])
 
     grid = torch.cat(rows, dim=-2).clamp(0, 1).cpu()

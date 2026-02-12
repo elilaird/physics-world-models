@@ -31,6 +31,7 @@ def rebuild_model(cfg):
             predictor_weight=cfg.model.predictor_weight,
             velocity_weight=cfg.model.get("velocity_weight", 1.0),
             observation_dt=cfg.model.get("observation_dt", 0.1),
+            encoder_frames=cfg.model.get("encoder_frames", 1),
             channels=cfg.env.get("channels", 3),
         )
 
