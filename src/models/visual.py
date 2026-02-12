@@ -69,19 +69,29 @@ def kl_divergence_free_bits(mu, logvar, free_bits=0.5):
 
 
 class VisualWorldModel(nn.Module):
-    """Beta-VAE encoder/decoder + swappable latent-space predictor world model."""
+    """Beta-VAE encoder/decoder + swappable latent-space predictor world model.
+
+    Latent space is structured as z = [z_q, z_p] where z_q (position) and
+    z_p (momentum) each have latent_dim // 2 dimensions. The decoder
+    reconstructs from z_q only.
+    """
 
     def __init__(self, predictor, latent_dim=32, beta=1.0, free_bits=0.5,
-                 context_length=3, predictor_weight=1.0, channels=3):
+                 context_length=3, predictor_weight=1.0, channels=3,
+                 velocity_weight=1.0, observation_dt=0.1):
         super().__init__()
+        assert latent_dim % 2 == 0, "Structured latent requires even latent_dim"
         self.latent_dim = latent_dim
+        self.half_dim = latent_dim // 2
         self.beta = beta
         self.free_bits = free_bits
         self.context_length = context_length
         self.predictor_weight = predictor_weight
+        self.velocity_weight = velocity_weight
+        self.observation_dt = observation_dt
 
         self.encoder = VisionEncoder(channels=channels, latent_dim=latent_dim)
-        self.decoder = VisionDecoder(channels=channels, latent_dim=latent_dim)
+        self.decoder = VisionDecoder(channels=channels, latent_dim=self.half_dim)
         self.predictor = predictor
 
     def encode(self, images):
@@ -95,7 +105,8 @@ class VisualWorldModel(nn.Module):
         return mu + eps * std
 
     def decode(self, z):
-        return self.decoder(z)
+        z_q = z[..., :self.half_dim]
+        return self.decoder(z_q)
 
     def kl_loss(self, mu, logvar):
         return kl_divergence_free_bits(mu, logvar, self.free_bits)

@@ -8,7 +8,10 @@ defaults:
 seed: 42
 
 # Path to a pretrained checkpoint to load weights from (null = train from scratch)
-pretrained_checkpoint: /lustre/smuexa01/client/users/ejlaird/physics-world-models/outputs/2026-02-11/16-29-59/visual_world_model/best_model.pt
+# pretrained_checkpoint: /lustre/smuexa01/client/users/ejlaird/physics-world-models/outputs/2026-02-11/16-29-59/visual_world_model/best_model.pt
+
+# pos/mom split: decoder only uses pos latent (latentdim=16)
+pretrained_checkpoint: /lustre/smuexa01/client/users/ejlaird/physics-world-models/outputs/2026-02-12/13-53-34/visual_world_model/best_model.pt
 
 training:
   epochs: 100

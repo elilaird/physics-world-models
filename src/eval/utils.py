@@ -29,6 +29,8 @@ def rebuild_model(cfg):
             free_bits=cfg.model.free_bits,
             context_length=cfg.model.context_length,
             predictor_weight=cfg.model.predictor_weight,
+            velocity_weight=cfg.model.get("velocity_weight", 1.0),
+            observation_dt=cfg.model.get("observation_dt", 0.1),
             channels=cfg.env.get("channels", 3),
         )
 

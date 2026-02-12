@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class FirstOrderODENet(nn.Module):
@@ -44,7 +45,8 @@ class NewtonianDynamicsModel(nn.Module):
 
     def forward(self, t, state, action_emb):
         x, v = state[..., 0:1], state[..., 1:2]
-        damping = torch.exp(self.log_damping)
+        # damping = torch.exp(self.log_damping)
+        damping = F.softplus(self.log_damping)
         acc_pred = self.net(torch.cat([x, v, action_emb], dim=-1))
         forces = acc_pred - damping * v
         return torch.cat([v, forces], dim=-1)

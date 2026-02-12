@@ -248,20 +248,53 @@ class _LatentHamiltonianFunc(nn.Module):
     def set_damping(self, damping):
         self._damping = damping
 
-    def forward(self, t, z):
+    def H_gradients(self, z):
+        """Compute dH/dq and dH/dp from the Hamiltonian network."""
         if not z.requires_grad:
             z.requires_grad_(True)
-
         with torch.enable_grad():
             H = self.H_net(z)
             dH = torch.autograd.grad(H, z, torch.ones_like(H), create_graph=True)[0]
-            dH_dq = dH[..., : self.half_dim]
-            dH_dp = dH[..., self.half_dim :]
+        return dH[..., : self.half_dim], dH[..., self.half_dim :]
 
+    def forward(self, t, z):
+        dH_dq, dH_dp = self.H_gradients(z)
         G_u = self.G_net(self._action_emb)
         dq_dt = dH_dp
         dp_dt = -dH_dq - self._damping * dH_dp + G_u
         return torch.cat([dq_dt, dp_dt], dim=-1)
+
+
+def leapfrog_step(func, z, dt):
+    """Kick-drift-kick leapfrog step for port-Hamiltonian systems.
+
+    Args:
+        func: _LatentHamiltonianFunc with action_emb and damping already set.
+        z: (..., 2*half_dim) tensor of [q, p].
+        dt: scalar timestep.
+
+    Returns:
+        z_next: (..., 2*half_dim) updated state.
+    """
+    hd = func.half_dim
+    q, p = z[..., :hd], z[..., hd:]
+    G_u = func.G_net(func._action_emb)
+
+    # Half-step kick: p_{1/2}
+    dH_dq, dH_dp = func.H_gradients(z)
+    p_half = p + (dt / 2) * (-dH_dq - func._damping * dH_dp + G_u)
+
+    # Full-step drift: q_1
+    z_half = torch.cat([q, p_half], dim=-1)
+    _, dH_dp_half = func.H_gradients(z_half)
+    q_next = q + dt * dH_dp_half
+
+    # Half-step kick: p_1
+    z_tmp = torch.cat([q_next, p_half], dim=-1)
+    dH_dq_next, dH_dp_next = func.H_gradients(z_tmp)
+    p_next = p_half + (dt / 2) * (-dH_dq_next - func._damping * dH_dp_next + G_u)
+
+    return torch.cat([q_next, p_next], dim=-1)
 
 
 class LatentHamiltonianPredictor(nn.Module):
@@ -309,6 +342,10 @@ class LatentHamiltonianPredictor(nn.Module):
         emb = self.act_emb(action)  # (B, T, emb_dim)
         self.ode_func.set_action_emb(emb)
         self.ode_func.set_damping(torch.exp(self.log_damping))
+
+        if self.integration_method == "leapfrog":
+            return leapfrog_step(self.ode_func, context, self.dt)
+
         t_span = torch.tensor([0.0, self.dt], device=context.device, dtype=context.dtype)
         z_next = odeint(self.ode_func, context, t_span, method=self.integration_method)
         return z_next[-1]

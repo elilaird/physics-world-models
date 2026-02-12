@@ -16,6 +16,7 @@ import hydra
 import hydra.utils
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
@@ -65,6 +66,8 @@ def build_model(cfg):
             free_bits=cfg.model.free_bits,
             context_length=cfg.model.context_length,
             predictor_weight=cfg.model.predictor_weight,
+            velocity_weight=cfg.model.velocity_weight,
+            observation_dt=cfg.model.observation_dt,
         )
 
     kwargs = {
@@ -116,6 +119,8 @@ def visual_train_step(model, batch, optimizers):
 
     batch_losses = defaultdict(float)
 
+    half_dim = model.half_dim
+
     for w in range(num_windows):
         start = w * step_size
         end = min(start + window_size, N)
@@ -129,6 +134,13 @@ def visual_train_step(model, batch, optimizers):
         recon_loss = (torch.abs(recon - window_frames)).mean()
         kl_loss = model.kl_loss(mu, logvar)
 
+        # Velocity consistency: mu_p direction should match finite-difference velocity
+        mu_window = mu.reshape(B, win_len, -1)
+        mu_q = mu_window[..., :half_dim]
+        mu_p = mu_window[..., half_dim:]
+        dq = mu_q[:, 1:] - mu_q[:, :-1]
+        vel_loss = (1 - F.cosine_similarity(mu_p[:, :-1], dq, dim=-1)).mean()
+
         z_window = z.detach().reshape(B, win_len, -1)
         ctx = z_window[:, :context_length]
         targets = z_window[:, 1:]
@@ -136,12 +148,15 @@ def visual_train_step(model, batch, optimizers):
         pred_z = model.predictor(ctx, window_actions)
         pred_loss = ((pred_z - targets) ** 2).mean()
 
-        window_loss = recon_loss + model.beta * kl_loss + model.predictor_weight * pred_loss
+        window_loss = (recon_loss + model.beta * kl_loss
+                       + model.predictor_weight * pred_loss
+                       + model.velocity_weight * vel_loss)
         (window_loss / num_windows).backward()
 
         batch_losses["recon_loss"] += recon_loss.item() / num_windows
         batch_losses["kl_loss"] += kl_loss.item() / num_windows
         batch_losses["predictor_loss"] += pred_loss.item() / num_windows
+        batch_losses["velocity_loss"] += vel_loss.item() / num_windows
 
     for opt in optimizers.values():
         opt.step()
@@ -149,6 +164,7 @@ def visual_train_step(model, batch, optimizers):
     batch_losses["total_loss"] = (
         batch_losses["recon_loss"] + model.beta * batch_losses["kl_loss"]
         + model.predictor_weight * batch_losses["predictor_loss"]
+        + model.velocity_weight * batch_losses["velocity_loss"]
     )
     return dict(batch_losses)
 
@@ -163,6 +179,7 @@ def visual_eval_step(model, batch):
     window_size = context_length + 1
     step_size = context_length
     num_windows = max(1, 1 + (N - window_size) // step_size)
+    half_dim = model.half_dim
 
     batch_losses = defaultdict(float)
 
@@ -179,6 +196,14 @@ def visual_eval_step(model, batch):
         batch_losses["recon_loss"] += (torch.abs(recon - window_frames)).mean().item() / num_windows
         batch_losses["kl_loss"] += model.kl_loss(mu, logvar).item() / num_windows
 
+        # Velocity consistency
+        mu_window = mu.reshape(B, win_len, -1)
+        mu_q = mu_window[..., :half_dim]
+        mu_p = mu_window[..., half_dim:]
+        dq = mu_q[:, 1:] - mu_q[:, :-1]
+        vel_loss = (1 - F.cosine_similarity(mu_p[:, :-1], dq, dim=-1)).mean().item()
+        batch_losses["velocity_loss"] += vel_loss / num_windows
+
         z_window = z.reshape(B, win_len, -1)
         ctx = z_window[:, :context_length]
         targets = z_window[:, 1:]
@@ -189,6 +214,7 @@ def visual_eval_step(model, batch):
     batch_losses["total_loss"] = (
         batch_losses["recon_loss"] + model.beta * batch_losses["kl_loss"]
         + model.predictor_weight * batch_losses["predictor_loss"]
+        + model.velocity_weight * batch_losses["velocity_loss"]
     )
     return dict(batch_losses)
 
@@ -438,7 +464,7 @@ def main(cfg: DictConfig):
     pbar = tqdm(range(1, cfg.training.epochs + 1), desc="Training")
 
     # Keys to accumulate for visual vs non-visual
-    loss_keys = ["total_loss", "recon_loss", "kl_loss", "predictor_loss"] if is_visual else ["total_loss"]
+    loss_keys = ["total_loss", "recon_loss", "kl_loss", "predictor_loss", "velocity_loss"] if is_visual else ["total_loss"]
 
     ckpt_path = os.path.join(
         cfg.checkpoint_dir,
