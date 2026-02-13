@@ -637,14 +637,9 @@ def main(cfg: DictConfig):
                 wandb_log[f"train/{k}"] = train_avg[k]
                 wandb_log[f"val/{k}"] = val_avg[k]
 
-            if is_hgn:
-                recon_img = make_hgn_recon_grid(model, first_train_batch, n_log)
-                val_recon_img = make_hgn_recon_grid(model, batch, n_log)
-            else:
-                # Import make_recon_grid from train.py for detached mode
-                from train import make_recon_grid
-                recon_img = make_recon_grid(model, first_train_batch, n_log)
-                val_recon_img = make_recon_grid(model, batch, n_log)
+            # Both HGN and detached modes use spatial latents, so use make_hgn_recon_grid
+            recon_img = make_hgn_recon_grid(model, first_train_batch, n_log)
+            val_recon_img = make_hgn_recon_grid(model, batch, n_log)
 
             if recon_img is not None:
                 wandb_log["train/reconstructions"] = recon_img
