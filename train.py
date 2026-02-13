@@ -61,7 +61,7 @@ def build_model(cfg):
         predictor = build_predictor(cfg)
         return model_cls(
             predictor=predictor,
-            latent_dim=cfg.model.latent_dim,
+            latent_channels=cfg.model.latent_channels,
             beta=cfg.model.beta,
             free_bits=cfg.model.free_bits,
             context_length=cfg.model.context_length,
@@ -69,6 +69,7 @@ def build_model(cfg):
             velocity_weight=cfg.model.velocity_weight,
             observation_dt=cfg.model.observation_dt,
             encoder_frames=cfg.model.get("encoder_frames", 1),
+            spatial_size=cfg.model.get("spatial_size", 8),
         )
 
     kwargs = {
@@ -178,6 +179,86 @@ def visual_train_step(model, batch, optimizers):
     return dict(batch_losses)
 
 
+def visual_train_step_e2e(model, batch, optimizers):
+    """End-to-end visual train step: gradients flow through predictor into encoder.
+
+    Instead of detaching latents, predicted latents are decoded to images and
+    compared to GT frames in pixel space.
+    """
+    all_images = batch["images"]  # (B, T+1, C, H, W)
+    actions = batch["actions"]    # (B, T)
+
+    B, N, C, H, W = all_images.shape
+    context_length = model.context_length
+    K = model.encoder_frames
+    window_size = context_length + K
+    step_size = context_length
+    num_windows = max(1, 1 + (N - window_size) // step_size)
+
+    for opt in optimizers.values():
+        opt.zero_grad()
+
+    batch_losses = defaultdict(float)
+    half_dim = model.half_dim
+
+    for w in range(num_windows):
+        start = w * step_size
+        end = min(start + window_size, N)
+
+        window_images = all_images[:, start:end]
+        mu, logvar = model.encode_sequence(window_images)
+        n_latents = mu.shape[1]
+
+        mu_flat = mu.reshape(B * n_latents, -1)
+        logvar_flat = logvar.reshape(B * n_latents, -1)
+        z = model.reparameterize(mu_flat, logvar_flat)
+
+        # Encoder reconstruction
+        recon_targets = window_images[:, K - 1:].reshape(B * n_latents, C, H, W)
+        recon = model.decode(z)
+        recon_loss = (torch.abs(recon - recon_targets)).mean()
+        kl_loss = model.kl_loss(mu_flat, logvar_flat)
+
+        # Velocity consistency
+        mu_q = mu[..., :half_dim]
+        mu_p = mu[..., half_dim:]
+        dq = mu_q[:, 1:] - mu_q[:, :-1]
+        vel_loss = (1 - F.cosine_similarity(mu_p[:, :-1], dq, dim=-1)).mean()
+
+        # Predictor — no detach, gradients flow end-to-end
+        z_window = z.reshape(B, n_latents, -1)
+        ctx = z_window[:, :context_length]
+        act_start = start + K - 1
+        window_actions = actions[:, act_start:act_start + context_length].long()
+        pred_z = model.predictor(ctx, window_actions)
+
+        # Decode predicted latents and compare to GT frames in pixel space
+        target_frames = window_images[:, K:].reshape(B * context_length, C, H, W)
+        pred_images = model.decode(pred_z.reshape(B * context_length, -1))
+        predictor_loss = (torch.abs(pred_images - target_frames)).mean()
+
+        window_loss = (recon_loss + model.beta * kl_loss
+                       + model.predictor_weight * predictor_loss
+                       + model.velocity_weight * vel_loss)
+        (window_loss / num_windows).backward()
+
+        batch_losses["recon_loss"] += recon_loss.item() / num_windows
+        batch_losses["kl_loss"] += kl_loss.item() / num_windows
+        batch_losses["predictor_loss"] += predictor_loss.item() / num_windows
+        batch_losses["velocity_loss"] += vel_loss.item() / num_windows
+
+    for opt in optimizers.values():
+        opt.step()
+
+    batch_losses["total_loss"] = (
+        batch_losses["recon_loss"]
+        + model.beta * batch_losses["kl_loss"]
+        + model.predictor_weight * batch_losses["predictor_loss"]
+        + model.velocity_weight * batch_losses["velocity_loss"]
+    )
+    return dict(batch_losses)
+
+
 @torch.no_grad()
 def visual_eval_step(model, batch):
     all_images = batch["images"]  # (B, T+1, C, H, W)
@@ -203,7 +284,7 @@ def visual_eval_step(model, batch):
 
         mu_flat = mu.reshape(B * n_latents, -1)
         logvar_flat = logvar.reshape(B * n_latents, -1)
-        z = mu_flat  # posterior mean for eval
+        z = model.to_state(mu_flat)  # posterior mean → phase-space state
         recon = model.decode(z)
 
         recon_targets = window_images[:, K - 1:].reshape(B * n_latents, C, H, W)
@@ -306,16 +387,17 @@ def make_recon_grid(model, batch, n_samples=4):
 
     window = all_images[:n, :window_size]  # (n, window_size, C, H, W)
     mu, _ = model.encode_sequence(window)  # (n, n_latents, D)
+    s = model.to_state(mu)
 
     enc_recon = model.decode(
-        mu.reshape(n * n_latents, -1)
+        s.reshape(n * n_latents, -1)
     ).reshape(n, n_latents, C, H, W)
 
     # GT frames corresponding to latents (last frame of each encoder window)
     gt_frames = window[:, K - 1:]  # (n, n_latents, C, H, W)
 
     # Predictor reconstructions
-    ctx = mu[:, :context_length]
+    ctx = s[:, :context_length]
     act_start = K - 1
     window_actions = actions[:n, act_start:act_start + context_length].long()
     pred_z = model.predictor(ctx, window_actions)
@@ -375,8 +457,9 @@ def compute_rollout_metrics(model, batch, n_samples=4):
     # Encode context: need ctx_len + K - 1 frames to get ctx_len latents
     ctx_images = images[:n_show, :ctx_len + K - 1]
     ctx_mu, _ = model.encode_sequence(ctx_images)  # (n_show, ctx_len, D)
+    ctx_s = model.to_state(ctx_mu)
     ctx_recon = model.decode(
-        ctx_mu.reshape(n_show * ctx_len, -1)
+        ctx_s.reshape(n_show * ctx_len, -1)
     ).reshape(n_show, ctx_len, C, H, W)
 
     rows = []
@@ -443,6 +526,7 @@ def main(cfg: DictConfig):
             for p in model.encoder.parameters():
                 p.requires_grad = False
             log.info("Froze encoder parameters")
+
         if not cfg.training.get("train_decoder", True):
             for p in model.decoder.parameters():
                 p.requires_grad = False
@@ -450,7 +534,9 @@ def main(cfg: DictConfig):
         if not cfg.training.get("train_predictor", True):
             for p in model.predictor.parameters():
                 p.requires_grad = False
-            log.info("Froze predictor parameters")
+            for p in model.state_transform.parameters():
+                p.requires_grad = False
+            log.info("Froze predictor + state_transform parameters")
 
     param_count = sum(p.numel() for p in model.parameters())
     trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -487,7 +573,18 @@ def main(cfg: DictConfig):
     pbar = tqdm(range(1, cfg.training.epochs + 1), desc="Training")
 
     # Keys to accumulate for visual vs non-visual
-    loss_keys = ["total_loss", "recon_loss", "kl_loss", "predictor_loss", "velocity_loss"] if is_visual else ["total_loss"]
+    if is_visual:
+        e2e = cfg.training.get("end_to_end", False)
+        loss_keys = [
+            "total_loss",
+            "recon_loss",
+            "kl_loss",
+            "velocity_loss",
+            "predictor_loss",
+        ]
+    else:
+        e2e = False
+        loss_keys = ["total_loss"]
 
     ckpt_path = os.path.join(
         cfg.checkpoint_dir,
@@ -507,7 +604,9 @@ def main(cfg: DictConfig):
             batch = batch_to_device(batch, device)
             if first_train_batch is None:
                 first_train_batch = batch
-            if is_visual:
+            if is_visual and e2e:
+                losses = visual_train_step_e2e(model, batch, optimizers)
+            elif is_visual:
                 losses = visual_train_step(model, batch, optimizers)
             else:
                 losses = train_step(model, batch, optimizer, cfg.dataset.dt, is_ode)

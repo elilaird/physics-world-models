@@ -24,7 +24,7 @@ def rebuild_model(cfg):
         predictor = hydra.utils.instantiate(cfg.predictor)
         return model_cls(
             predictor=predictor,
-            latent_dim=cfg.model.latent_dim,
+            latent_channels=cfg.model.latent_channels,
             beta=cfg.model.beta,
             free_bits=cfg.model.free_bits,
             context_length=cfg.model.context_length,
@@ -33,6 +33,7 @@ def rebuild_model(cfg):
             observation_dt=cfg.model.get("observation_dt", 0.1),
             encoder_frames=cfg.model.get("encoder_frames", 1),
             channels=cfg.env.get("channels", 3),
+            spatial_size=cfg.model.get("spatial_size", 8),
         )
 
     kwargs = {

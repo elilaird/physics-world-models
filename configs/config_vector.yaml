@@ -11,7 +11,7 @@ seed: 42
 # pretrained_checkpoint: /lustre/smuexa01/client/users/ejlaird/physics-world-models/outputs/2026-02-11/16-29-59/visual_world_model/best_model.pt
 
 # pos/mom split: decoder only uses pos latent (latentdim=16 and channel concat)
-pretrained_checkpoint: null #/lustre/smuexa01/client/users/ejlaird/physics-world-models/outputs/2026-02-12/15-17-31/visual_world_model/best_model.pt
+pretrained_checkpoint: /lustre/smuexa01/client/users/ejlaird/physics-world-models/outputs/2026-02-12/15-17-31/visual_world_model/best_model.pt
 
 # latent 16 split but no channel concat
 #/lustre/smuexa01/client/users/ejlaird/physics-world-models/outputs/2026-02-12/13-53-34/visual_world_model/best_model.pt
@@ -23,17 +23,17 @@ training:
   lr: 1.5e-4
   # Separate optimizer learning rates (used in detached mode)
   encoder_lr: 1e-4
-  decoder_lr: 1e-4
+  decoder_lr: 1e-5
   predictor_lr: 1e-3
   train_split: 0.8
   # Which visual model components to train (false = frozen).
   # Only applies when model.type == "visual".
-  train_encoder: true
+  train_encoder: false
   train_decoder: true
   train_predictor: true
   # End-to-end training: predictor loss in pixel space, gradients flow into encoder.
   # false = detached (latent-space predictor loss, compatible with JEPA etc.)
-  end_to_end: true
+  end_to_end: false
   # Training mode for train_visual.py: "hgn" (encode init → rollout → decode all)
   # or "detached" (per-frame encoding with detached predictor loss)
   training_mode: hgn

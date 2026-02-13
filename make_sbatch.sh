@@ -37,6 +37,8 @@ if [ "${TYPE}" = "jupyter" ]; then
     WORK_DIR=${HOME_DIR}
     COMMAND="jupyter notebook --ip=0.0.0.0 --port=8888 --no-browser --allow-root"
 elif [ "${TYPE}" = "train" ]; then
+    COMMAND="HYDRA_FULL_ERROR=1 python train_visual.py ${PY_ARGS}"
+elif [ "${TYPE}" = "train_vector" ]; then
     COMMAND="HYDRA_FULL_ERROR=1 python train.py ${PY_ARGS}"
 elif [ "${TYPE}" = "generate_dataset" ]; then
     COMMAND="HYDRA_FULL_ERROR=1 python generate_dataset.py ${PY_ARGS}"

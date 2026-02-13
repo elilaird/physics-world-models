@@ -21,3 +21,4 @@ multirun/
 *.pkl
 wandb/
 output/
+notes/

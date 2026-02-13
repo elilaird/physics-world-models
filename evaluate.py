@@ -150,8 +150,8 @@ def evaluate_visual(cfg, train_cfg, model, device, output_dir):
     gt_images = images[:, K - 1 + ctx_len:]  # (B, horizon, C, H, W)
     gt_latents = true_latents[:, ctx_len:]   # (B, horizon, D)
 
-    # Latent MSE
-    latent_mse_per_step = ((pred_latents - gt_latents) ** 2).mean(dim=(0, 2))  # (horizon,)
+    # Latent MSE — flatten non-batch/time dims for per-step mean
+    latent_mse_per_step = ((pred_latents - gt_latents) ** 2).flatten(2).mean(dim=(0, 2))  # (horizon,)
     latent_mse = latent_mse_per_step.mean().item()
     log.info(f"Latent MSE (mean): {latent_mse:.6f}")
 
@@ -189,10 +189,10 @@ def evaluate_visual(cfg, train_cfg, model, device, output_dir):
     # --- Build rollout grid images ---
     n_show = min(4, B)
     ctx_images = images[:n_show, :ctx_len + K - 1]
-    ctx_mu, _ = model.encode_sequence(ctx_images)  # (n_show, ctx_len, D)
-    ctx_recon = model.decode(
-        ctx_mu.reshape(n_show * ctx_len, -1)
-    ).reshape(n_show, ctx_len, C, H, W)
+    ctx_mu, _ = model.encode_sequence(ctx_images)  # (n_show, ctx_len, C_lat, sH, sW)
+    C_lat, sH, sW = ctx_mu.shape[2], ctx_mu.shape[3], ctx_mu.shape[4]
+    ctx_s = model.to_state(ctx_mu.reshape(n_show * ctx_len, C_lat, sH, sW))
+    ctx_recon = model.decode(ctx_s).reshape(n_show, ctx_len, C, H, W)
 
     blank = torch.zeros(C, H, W, device=device)
     grids = []

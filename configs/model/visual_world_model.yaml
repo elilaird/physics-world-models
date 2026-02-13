@@ -3,12 +3,14 @@ defaults:
 
 name: visual_world_model
 type: visual
-latent_dim: 16
+latent_channels: 32
+spatial_size: 8
 beta: 0.001
 free_bits: 0.0
-hidden_dim: 32
+hidden_channels: 64
 action_embedding_dim: 2
 context_length: 3
+pred_length: 1
 predictor_weight: 1.0
 velocity_weight: 0.0
 observation_dt: ${dataset.dt}

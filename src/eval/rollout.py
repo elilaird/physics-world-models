@@ -77,9 +77,27 @@ def dt_generalization_test(model, env, init_state, actions, dt_values, variable_
     return results
 
 
+def _merge_actions(actions, K):
+    """Create overlapping action windows mirroring frame concatenation.
+
+    Args:
+        actions: (B, T) discrete action indices.
+        K: number of frames per state (encoder_frames).
+
+    Returns:
+        If K == 1: actions unchanged, (B, T).
+        If K > 1: (B, T - K + 1, K) merged action windows.
+    """
+    if K <= 1:
+        return actions
+    B, T = actions.shape
+    n_out = T - K + 1
+    return torch.stack([actions[:, t:t + K] for t in range(n_out)], dim=1)
+
+
 @torch.no_grad()
 def visual_open_loop_rollout(model, images, actions):
-    """Open-loop rollout for visual world models.
+    """Open-loop rollout for visual world models with spatial latents.
 
     Encodes all frames with channel-concatenated overlapping windows, then
     autoregressively predicts remaining latents. Each step the predictor sees
@@ -92,8 +110,8 @@ def visual_open_loop_rollout(model, images, actions):
 
     Returns:
         dict with:
-            pred_latents: (B, horizon, latent_dim) predicted latents
-            true_latents: (B, N_latents, latent_dim) encoded ground-truth latents
+            pred_latents: (B, horizon, C_lat, sH, sW) predicted latents
+            true_latents: (B, N_latents, C_lat, sH, sW) encoded ground-truth latents
             pred_images: (B, horizon, C, H, W) decoded predicted frames
         where N_latents = N - encoder_frames + 1, horizon = N_latents - ctx_len
     """
@@ -101,30 +119,33 @@ def visual_open_loop_rollout(model, images, actions):
     ctx_len = model.context_length
     K = model.encoder_frames
 
-    # Encode all ground-truth frames → (B, N-K+1, D) posterior means
+    # Encode all ground-truth frames → posterior means → phase-space states
     mu_all, _ = model.encode_sequence(images)
-    true_latents = mu_all  # (B, N_latents, D)
-    N_latents = true_latents.shape[1]
+    N_latents = mu_all.shape[1]
+    C_lat, sH, sW = mu_all.shape[2], mu_all.shape[3], mu_all.shape[4]
+
+    mu_flat = mu_all.reshape(B * N_latents, C_lat, sH, sW)
+    true_latents = model.to_state(mu_flat).reshape(B, N_latents, C_lat, sH, sW)
     horizon = N_latents - ctx_len
 
+    # Merge actions into overlapping K-windows: (B, N_latents-1, K)
+    merged_actions = _merge_actions(actions, K)
+
     # Seed context with the first ctx_len encoded latents
-    context = true_latents[:, :ctx_len].clone()  # (B, ctx_len, D)
+    context = true_latents[:, :ctx_len].clone()  # (B, ctx_len, C_lat, sH, sW)
 
     pred_latents = []
     for t in range(horizon):
-        # Latent index t corresponds to frame K-1+t; action at that frame
-        # transitions to the next latent
-        act_start = K - 1 + t
-        act = actions[:, act_start:act_start + ctx_len].long()
-        pred = model.predictor(context, act)  # (B, ctx_len, D)
-        z_next = pred[:, -1]  # (B, D)
+        act = merged_actions[:, t:t + ctx_len].long()
+        pred = model.predictor(context, act)  # (B, ctx_len, C_lat, sH, sW)
+        z_next = pred[:, -1]  # (B, C_lat, sH, sW)
         pred_latents.append(z_next)
         context = torch.cat([context[:, 1:], z_next.unsqueeze(1)], dim=1)
 
-    pred_latents = torch.stack(pred_latents, dim=1)  # (B, horizon, D)
+    pred_latents = torch.stack(pred_latents, dim=1)  # (B, horizon, C_lat, sH, sW)
 
     pred_images = model.decode(
-        pred_latents.reshape(B * horizon, -1)
+        pred_latents.reshape(B * horizon, C_lat, sH, sW)
     ).reshape(B, horizon, C, H, W)
 
     return {
@@ -258,10 +279,10 @@ def visual_dt_generalization_test(
 
         # Encode context: need ctx_len + K - 1 frames → ctx_len latents
         ctx_images = images_batch[:n_show, :ctx_len + K - 1]
-        ctx_mu, _ = model.encode_sequence(ctx_images)  # (n_show, ctx_len, D)
-        ctx_recon = model.decode(
-            ctx_mu.reshape(n_show * ctx_len, -1)
-        ).reshape(n_show, ctx_len, C, H, W)
+        ctx_mu, _ = model.encode_sequence(ctx_images)  # (n_show, ctx_len, C_lat, sH, sW)
+        C_lat, sH, sW = ctx_mu.shape[2], ctx_mu.shape[3], ctx_mu.shape[4]
+        ctx_s = model.to_state(ctx_mu.reshape(n_show * ctx_len, C_lat, sH, sW))
+        ctx_recon = model.decode(ctx_s).reshape(n_show, ctx_len, C, H, W)
 
         rows = []
         for i in range(n_show):
