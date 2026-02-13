@@ -693,11 +693,8 @@ def main(cfg: DictConfig):
             f"Latent MSE: {test_rollout['latent_mse']:.6f}"
         )
 
-    if is_hgn:
-        test_img = make_hgn_recon_grid(model, batch, n_log)
-    else:
-        from train import make_recon_grid
-        test_img = make_recon_grid(model, batch, n_log)
+    # Both HGN and detached modes use spatial latents, so use spatial-latent-aware visualization
+    test_img = make_hgn_recon_grid(model, batch, n_log)
 
     if cfg.wandb.enabled:
         wandb.log({"test/total_loss": avg_test})
