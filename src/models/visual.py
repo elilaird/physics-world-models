@@ -17,34 +17,31 @@ class VisionEncoder(nn.Module):
         in_channels = channels * encoder_frames
         self.net = nn.Sequential(
             # Downsample layers
-            nn.Conv2d(in_channels, 32, 4, 2, 1),   # 64→32
-            nn.BatchNorm2d(32),
+            nn.Conv2d(in_channels, 24, 4, 2, 1),   # 64→32, reduced from 32→24 channels
+            nn.BatchNorm2d(24),
             nn.LeakyReLU(0.2),
-            nn.Conv2d(32, 64, 4, 2, 1),             # 32→16
-            nn.BatchNorm2d(64),
+            nn.Conv2d(24, 48, 4, 2, 1),            # 32→16, reduced from 64→48 channels
+            nn.BatchNorm2d(48),
             nn.LeakyReLU(0.2),
             # Depth blocks at 16×16
-            nn.Conv2d(64, 64, 3, 1, 1),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(48, 48, 3, 1, 1),            # reduced from 64→48 channels
+            nn.BatchNorm2d(48),
             nn.LeakyReLU(0.2),
-            nn.Conv2d(64, 64, 3, 1, 1),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(48, 48, 3, 1, 1),            # reduced from 64→48 channels
+            nn.BatchNorm2d(48),
             nn.LeakyReLU(0.2),
             # Downsample
-            nn.Conv2d(64, 128, 4, 2, 1),            # 16→8
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2),
-            # Depth blocks at 8×8
-            nn.Conv2d(128, 128, 3, 1, 1),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(128, 128, 3, 1, 1),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2),
-            # Final channel reduce
-            nn.Conv2d(128, 64, 3, 1, 1),            # 8×8
+            nn.Conv2d(48, 64, 4, 2, 1),            # 16→8, reduced from 128→64 channels
             nn.BatchNorm2d(64),
             nn.LeakyReLU(0.2),
+            # Depth blocks at 8×8
+            nn.Conv2d(64, 64, 3, 1, 1),            # reduced from 128→64 channels
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(64, 64, 3, 1, 1),            # reduced from 128→64 channels
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2),
+            # No separate final channel reduce needed - already at 64 channels
         )
         self.conv_mu = nn.Conv2d(64, latent_channels, 1)
         self.conv_logvar = nn.Conv2d(64, latent_channels, 1)
@@ -80,22 +77,22 @@ class VisionDecoder(nn.Module):
     def __init__(self, channels=3, latent_channels=16):
         super().__init__()
         self.expand = nn.Sequential(
-            nn.Conv2d(latent_channels, 64, 1),
+            nn.Conv2d(latent_channels, 48, 1),  # Reduced from 64→48 channels
             nn.LeakyReLU(0.2),
         )
         self.net = nn.Sequential(
-            _ResBlock(64),
+            _ResBlock(48),  # Reduced from 64→48 channels
             nn.Upsample(scale_factor=2, mode='nearest'),   # 8→16
-            _ResBlock(64),
+            _ResBlock(48),  # Reduced from 64→48 channels
             nn.Upsample(scale_factor=2, mode='nearest'),   # 16→32
-            _ResBlock(64),
+            _ResBlock(48),  # Reduced from 64→48 channels
             nn.Upsample(scale_factor=2, mode='nearest'),   # 32→64
-            nn.Conv2d(64, channels, 3, 1, 1),
+            nn.Conv2d(48, channels, 3, 1, 1),  # 48→channels instead of 64→channels
             nn.Sigmoid(),
         )
 
     def forward(self, z):
-        h = self.expand(z)  # (B, 64, 8, 8)
+        h = self.expand(z)  # (B, 48, 8, 8)
         return self.net(h)
 
 

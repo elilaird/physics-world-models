@@ -224,6 +224,10 @@ class LatentNewtonianPredictor(nn.Module):
         emb = self.act_emb(action)  # (B, T, emb_dim)
         self.ode_func.set_action_emb(emb)
         self.ode_func.set_damping(torch.exp(self.log_damping))
+        
+        if self.integration_method == "leapfrog":
+            return newtonian_leapfrog_step(self.ode_func, context, self.dt)
+            
         t_span = torch.tensor([0.0, self.dt], device=context.device, dtype=context.dtype)
         z_next = odeint(self.ode_func, context, t_span, method=self.integration_method)
         return z_next[-1]
@@ -285,6 +289,38 @@ class _LatentHamiltonianFunc(nn.Module):
         dq_dt = dH_dp
         dp_dt = -dH_dq - self._damping * dH_dp + G_u
         return torch.cat([dq_dt, dp_dt], dim=-1)
+
+
+def newtonian_leapfrog_step(func, z, dt):
+    """Kick-drift-kick leapfrog for flat Newtonian systems.
+    
+    Args:
+        func: _LatentNewtonianFunc with action_emb and damping set.
+        z: (..., 2*half_dim) tensor of [q, p].
+        dt: scalar timestep.
+    
+    Returns:
+        z_next: (..., 2*half_dim) updated state.
+    """
+    hd = func.half_dim
+    q, p = z[..., :hd], z[..., hd:]
+    
+    # Compute acceleration at current state
+    acc = func.net(torch.cat([q, p, func._action_emb], dim=-1))
+    
+    # Half-step kick: p_{1/2} = p + dt/2 * (acc - damping*p)
+    p_half = p + (dt / 2) * (acc - func._damping * p)
+    
+    # Full-step drift: q_1 = q + dt * p_{1/2}
+    q_next = q + dt * p_half
+    
+    # Recompute acceleration at new position
+    acc_next = func.net(torch.cat([q_next, p_half, func._action_emb], dim=-1))
+    
+    # Half-step kick: p_1 = p_{1/2} + dt/2 * (acc_next - damping*p_{1/2})
+    p_next = p_half + (dt / 2) * (acc_next - func._damping * p_half)
+    
+    return torch.cat([q_next, p_next], dim=-1)
 
 
 def leapfrog_step(func, z, dt):
@@ -702,6 +738,11 @@ class SpatialNewtonianPredictor(nn.Module):
         a_spatial = _broadcast_action(self.act_emb, action, self.spatial_size)
         self.ode_func.set_action_spatial(a_spatial)
         self.ode_func.set_damping(torch.exp(self.log_damping))
+        
+        if self.integration_method == "leapfrog":
+            z_next = spatial_newtonian_leapfrog_step(self.ode_func, z_flat, self.dt)
+            return z_next.reshape(B, T, C, H, W)
+            
         t_span = torch.tensor([0.0, self.dt], device=z_flat.device, dtype=z_flat.dtype)
         z_next = odeint(self.ode_func, z_flat, t_span, method=self.integration_method)
         return z_next[-1].reshape(B, T, C, H, W)
@@ -785,6 +826,40 @@ class _SpatialHamiltonianFunc(nn.Module):
         dq_dt = dT_dp
         dp_dt = -dV_dq - self._damping * dT_dp + G_u
         return torch.cat([dq_dt, dp_dt], dim=1)
+
+
+def spatial_newtonian_leapfrog_step(func, z, dt):
+    """Kick-drift-kick leapfrog for spatial Newtonian systems.
+    
+    For Newtonian dynamics: dq/dt = p, dp/dt = f(q,p,a) - damping*p
+    
+    Args:
+        func: _SpatialNewtonianFunc with action_spatial and damping set.
+        z: (B, 2*half_ch, H, W) tensor, channels split as [q, p].
+        dt: scalar timestep.
+    
+    Returns:
+        z_next: (B, 2*half_ch, H, W) updated state.
+    """
+    hc = func.half_channels
+    q, p = z[:, :hc], z[:, hc:]
+    
+    # Compute acceleration at current state
+    acc = func.net(torch.cat([q, p, func._action_spatial], dim=1))
+    
+    # Half-step kick: p_{1/2} = p + dt/2 * (acc - damping*p)
+    p_half = p + (dt / 2) * (acc - func._damping * p)
+    
+    # Full-step drift: q_1 = q + dt * p_{1/2}  
+    q_next = q + dt * p_half
+    
+    # Recompute acceleration at new position with half-momentum
+    acc_next = func.net(torch.cat([q_next, p_half, func._action_spatial], dim=1))
+    
+    # Half-step kick: p_1 = p_{1/2} + dt/2 * (acc_next - damping*p_{1/2})
+    p_next = p_half + (dt / 2) * (acc_next - func._damping * p_half)
+    
+    return torch.cat([q_next, p_next], dim=1)
 
 
 def spatial_leapfrog_step(func, z, dt):
