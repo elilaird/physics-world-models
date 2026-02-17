@@ -126,7 +126,7 @@ class VisualWorldModel(nn.Module):
     def __init__(self, predictor, latent_channels=32, beta=1.0, free_bits=0.5,
                  context_length=3, pred_length=1, predictor_weight=1.0,
                  channels=3, velocity_weight=1.0, observation_dt=0.1,
-                 encoder_frames=1, spatial_size=8):
+                 encoder_frames=1, spatial_size=8, fixed_logvar=False):
         super().__init__()
         assert latent_channels % 2 == 0, "Structured latent requires even latent_channels"
         self.latent_channels = latent_channels
@@ -134,6 +134,7 @@ class VisualWorldModel(nn.Module):
         self.spatial_size = spatial_size
         self.beta = beta
         self.free_bits = free_bits
+        self.fixed_logvar = fixed_logvar
         self.context_length = context_length
         self.pred_length = pred_length
         self.predictor_weight = predictor_weight
@@ -164,7 +165,10 @@ class VisualWorldModel(nn.Module):
 
     def encode(self, images):
         """Encode pre-formed input (B, encoder_frames*C, H, W) → spatial (mu, logvar)."""
-        return self.encoder(images)
+        mu, logvar = self.encoder(images)
+        if self.fixed_logvar:
+            logvar = torch.zeros_like(mu)
+        return mu, logvar
 
     def encode_sequence(self, images):
         """Encode a frame sequence using overlapping channel-concatenated windows.
@@ -183,6 +187,8 @@ class VisualWorldModel(nn.Module):
         )
         flat = windows.reshape(B * n_out, K * C, H, W)
         mu, logvar = self.encoder(flat)  # each (B*n_out, C_lat, sH, sW)
+        if self.fixed_logvar:
+            logvar = torch.zeros_like(mu)
         C_lat, sH, sW = mu.shape[1], mu.shape[2], mu.shape[3]
         return (mu.reshape(B, n_out, C_lat, sH, sW),
                 logvar.reshape(B, n_out, C_lat, sH, sW))

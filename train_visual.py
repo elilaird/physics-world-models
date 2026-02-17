@@ -88,6 +88,7 @@ def build_model(cfg):
         latent_channels=cfg.model.latent_channels,
         beta=cfg.model.beta,
         free_bits=cfg.model.free_bits,
+        fixed_logvar=cfg.model.get("fixed_logvar", False),
         context_length=cfg.model.context_length,
         pred_length=cfg.model.get("pred_length", 1),
         predictor_weight=cfg.model.predictor_weight,

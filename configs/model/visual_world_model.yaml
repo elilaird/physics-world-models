@@ -7,6 +7,7 @@ latent_channels: 32
 spatial_size: 8
 beta: 0.001
 free_bits: 0.0
+fixed_logvar: false
 hidden_channels: 64
 action_embedding_dim: 2
 context_length: 3
