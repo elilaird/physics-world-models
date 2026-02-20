@@ -7,6 +7,6 @@ action_frames: ${model.encoder_frames}
 hidden_channels: ${model.hidden_channels}
 context_length: ${model.context_length}
 spatial_size: ${model.spatial_size}
-integration_method: ${model.integration_method}
+integration_method: leapfrog
 dt: ${model.predictor_dt}
 damping_init: ${model.damping_init}
