@@ -1,11 +1,11 @@
 defaults:
   - /env: oscillator_visual
 
-name: oscillator_visual_60k_dt20Hz
+name: oscillator_visual_60k_dt2Hz
 version: null # leave null until generated with generate_dataset.py
 n_seqs: 60000
 seq_len: 30
-dt: 0.2 # 5Hz sampling rate
+dt: 0.5 # 2Hz sampling rate
 val_split: 0.1
 test_split: 0.1
 chunk_size: 100
