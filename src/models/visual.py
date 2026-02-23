@@ -125,8 +125,9 @@ class VisualWorldModel(nn.Module):
 
     def __init__(self, predictor, latent_channels=32, beta=1.0, free_bits=0.5,
                  context_length=3, pred_length=1, predictor_weight=1.0,
-                 channels=3, velocity_weight=1.0, observation_dt=0.1,
-                 encoder_frames=1, spatial_size=8, fixed_logvar=False):
+                 latent_pred_weight=1.0, channels=3, velocity_weight=1.0,
+                 observation_dt=0.1, encoder_frames=1, spatial_size=8,
+                 fixed_logvar=False):
         super().__init__()
         assert latent_channels % 2 == 0, "Structured latent requires even latent_channels"
         self.latent_channels = latent_channels
@@ -138,6 +139,7 @@ class VisualWorldModel(nn.Module):
         self.context_length = context_length
         self.pred_length = pred_length
         self.predictor_weight = predictor_weight
+        self.latent_pred_weight = latent_pred_weight
         self.velocity_weight = velocity_weight
         self.observation_dt = observation_dt
         self.encoder_frames = encoder_frames

@@ -92,6 +92,7 @@ def build_model(cfg):
         context_length=cfg.model.context_length,
         pred_length=cfg.model.get("pred_length", 1),
         predictor_weight=cfg.model.predictor_weight,
+        latent_pred_weight=cfg.model.get("latent_pred_weight", 1.0),
         velocity_weight=cfg.model.velocity_weight,
         observation_dt=cfg.model.observation_dt,
         encoder_frames=cfg.model.get("encoder_frames", 1),
@@ -139,6 +140,7 @@ def hgn_train_step(model, batch, optimizer):
     num_windows = max(1, 1 + (N_lat - window_size) // step_size)
 
     recon_loss = torch.tensor(0.0, device=images.device)
+    latent_pred_loss = torch.tensor(0.0, device=images.device)
     for w in range(num_windows):
         start = w * step_size
         end = min(start + window_size, N_lat)
@@ -157,11 +159,16 @@ def hgn_train_step(model, batch, optimizer):
         gt_frames = images[:, gt_start:gt_start + n_pred].reshape(B * n_pred, C, H, W)
         recon_loss = recon_loss + ((pred_decoded - gt_frames) ** 2).mean() / num_windows
 
+        # Latent prediction loss: MSE between predicted and GT encoded states
+        # Detach targets so encoder doesn't collapse to ease prediction
+        target_states = w_states[:, 1:].detach()   # (B, n_pred, C_lat, sH, sW)
+        latent_pred_loss = latent_pred_loss + ((pred_z - target_states) ** 2).mean() / num_windows
+
     # 3. KL loss (over all encoded states)
     kl_loss = model.kl_loss(mu_flat, logvar_flat)
 
     # 4. Total loss
-    loss = recon_loss + model.beta * kl_loss
+    loss = recon_loss + model.beta * kl_loss + model.latent_pred_weight * latent_pred_loss
 
     optimizer.zero_grad()
     loss.backward()
@@ -170,6 +177,7 @@ def hgn_train_step(model, batch, optimizer):
     losses = {
         "recon_loss": recon_loss.item(),
         "kl_loss": kl_loss.item(),
+        "latent_pred_loss": latent_pred_loss.item(),
         "total_loss": loss.item(),
     }
 
@@ -214,6 +222,7 @@ def hgn_eval_step(model, batch):
     num_windows = max(1, 1 + (N_lat - window_size) // step_size)
 
     recon_loss = 0.0
+    latent_pred_loss = 0.0
     for w in range(num_windows):
         start = w * step_size
         end = min(start + window_size, N_lat)
@@ -230,11 +239,15 @@ def hgn_eval_step(model, batch):
         gt_frames = images[:, gt_start:gt_start + n_pred].reshape(B * n_pred, C, H, W)
         recon_loss += ((pred_decoded - gt_frames) ** 2).mean().item() / num_windows
 
-    total_loss = recon_loss + model.beta * kl_loss
+        target_states = w_states[:, 1:]
+        latent_pred_loss += ((pred_z - target_states) ** 2).mean().item() / num_windows
+
+    total_loss = recon_loss + model.beta * kl_loss + model.latent_pred_weight * latent_pred_loss
 
     losses = {
         "recon_loss": recon_loss,
         "kl_loss": kl_loss,
+        "latent_pred_loss": latent_pred_loss,
         "total_loss": total_loss,
     }
 
@@ -546,7 +559,7 @@ def main(cfg: DictConfig):
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = optim.Adam(trainable_params, lr=lr)
         optimizers = None
-        loss_keys = ["total_loss", "recon_loss", "kl_loss"]
+        loss_keys = ["total_loss", "recon_loss", "kl_loss", "latent_pred_loss"]
         if _has_energy(model.predictor):
             loss_keys.extend(["energy_mean", "energy_std", "energy_time_var"])
     else:

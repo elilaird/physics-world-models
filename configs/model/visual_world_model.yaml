@@ -13,6 +13,7 @@ action_embedding_dim: 2
 context_length: 3
 pred_length: 1
 predictor_weight: 1.0
+latent_pred_weight: 1.0
 velocity_weight: 0.0
 observation_dt: ${dataset.dt}
 encoder_frames: 2
