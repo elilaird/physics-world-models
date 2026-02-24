@@ -1,0 +1,13 @@
+_target_: src.models.predictors.TemporalSpatialLSTMPredictor
+name: temporal_lstm_lstm
+latent_channels: ${model.latent_channels}
+action_dim: ${env.action_dim}
+action_embedding_dim: ${model.action_embedding_dim}
+action_frames: ${model.encoder_frames}
+hidden_channels: ${model.hidden_channels}
+context_length: ${model.context_length}
+spatial_size: ${model.spatial_size}
+backbone_type: lstm
+backbone_layers: 2
+backbone_dim: 256
+backbone_nhead: 4

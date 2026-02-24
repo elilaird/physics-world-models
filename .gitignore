@@ -22,3 +22,5 @@ multirun/
 wandb/
 output/
 notes/
+tests/
+docs/

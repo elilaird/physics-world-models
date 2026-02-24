@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Important Rules
+
+- Do NOT run any Python commands. The user will test everything themselves.
+
 ## Project Overview
 
 Research project comparing neural network architectures for learning physics dynamics as world models. Trains models on simulated physics environments (oscillators, pendulums) and evaluates how well different inductive biases (discrete jumps, Newtonian mechanics, Hamiltonian structure) capture the true dynamics.
@@ -44,6 +48,20 @@ python train_visual.py predictor=spatial_jump training.lr=1.5e-4
 # Sweep spatial predictors
 python train_visual.py --multirun predictor=spatial_jump,spatial_lstm,spatial_ode,spatial_newtonian,spatial_hamiltonian
 
+# Train with temporal backbone-enriched predictors (5 families × 3 backbones)
+python train_visual.py predictor=temporal_jump_lstm
+python train_visual.py predictor=temporal_lstm_transformer
+python train_visual.py predictor=temporal_ode_conv_attn
+python train_visual.py predictor=temporal_newtonian_lstm
+python train_visual.py predictor=temporal_hamiltonian_transformer
+
+# Sweep temporal variants per family
+python train_visual.py --multirun predictor=temporal_jump_lstm,temporal_jump_transformer,temporal_jump_conv_attn
+python train_visual.py --multirun predictor=temporal_lstm_lstm,temporal_lstm_transformer,temporal_lstm_conv_attn
+python train_visual.py --multirun predictor=temporal_ode_lstm,temporal_ode_transformer,temporal_ode_conv_attn
+python train_visual.py --multirun predictor=temporal_newtonian_lstm,temporal_newtonian_transformer,temporal_newtonian_conv_attn
+python train_visual.py --multirun predictor=temporal_hamiltonian_lstm,temporal_hamiltonian_transformer,temporal_hamiltonian_conv_attn
+
 # Evaluate a checkpoint
 python evaluate.py checkpoint=outputs/<date>/<time>/<model>/best_model.pt
 
@@ -68,7 +86,7 @@ Hydra outputs (checkpoints, logs, plots) go to `outputs/<date>/<time>/<model_nam
 Hydra with composable groups. `configs/config.yaml` sets defaults and training params. Override with `env=<name>` and `model=<name>`.
 - **env configs**: oscillator, pendulum, spaceship, three_body — each defines state_dim, action_dim, physics params, variable_params ranges, init_state_range
 - **model configs**: jump, lstm, first_order_ode, newtonian, velocity, port_hamiltonian, visual_world_model — each defines type (discrete/ode/visual), hidden_dim, integration_method
-- **predictor configs** (`configs/predictor/`): `spatial_jump` (default), `spatial_lstm`, `spatial_ode`, `spatial_newtonian`, `spatial_hamiltonian` — spatial convolutional predictors for the visual world model. Legacy flat predictors (`latent_mlp`, `latent_lstm`, etc.) are kept for backward compat with vector-state models.
+- **predictor configs** (`configs/predictor/`): `spatial_jump` (default), `spatial_lstm`, `spatial_ode`, `spatial_newtonian`, `spatial_hamiltonian` — spatial convolutional predictors for the visual world model. `temporal_{jump,lstm,ode,newtonian,hamiltonian}_{lstm,transformer,conv_attn}` — 5 predictor families × 3 temporal backbone variants (15 total). Legacy flat predictors (`latent_mlp`, `latent_lstm`, etc.) are kept for backward compat with vector-state models.
 
 ### Models (`src/models/`)
 All models use `nn.Embedding` for discrete action spaces. Registry in `src/models/__init__.py`.
@@ -90,10 +108,19 @@ Two families of predictors, registered in `PREDICTOR_REGISTRY`:
 - `SpatialNewtonianPredictor` (`spatial_newtonian`): `dq/dt = p, dp/dt = ConvNet(q,p,a) - γp`
 - `SpatialHamiltonianPredictor` (`spatial_hamiltonian`): separable `H(q,p) = T(p) + V(q)` with ConvNet energy networks (Conv→Softplus→Conv→Softplus→AdaptiveAvgPool→Linear→scalar), autograd gives spatial force fields; supports leapfrog integration. `.energy(z)` method for monitoring.
 
+**Temporal predictors** — spatial latents with temporal backbone (LSTM/Transformer/Conv+Attn) for cross-frame context enrichment. Each backbone variant selectable via `backbone_type` config param. 5 predictor families × 3 backbones = 15 configs:
+- `TemporalSpatialJumpPredictor` (`temporal_jump_{lstm,transformer,conv_attn}`): backbone → 2-layer MLP output projection → residual. Direct computation, no ODE.
+- `TemporalSpatialLSTMPredictor` (`temporal_lstm_{lstm,transformer,conv_attn}`): backbone → single Linear projection → residual. Simpler output head mirroring ConvLSTM.
+- `TemporalSpatialODEPredictor` (`temporal_ode_{lstm,transformer,conv_attn}`): backbone features → MLP dynamics net → `dz/dt`, integrated via `odeint`.
+- `TemporalSpatialNewtonianPredictor` (`temporal_newtonian_{lstm,transformer,conv_attn}`): backbone features → acceleration net, Newtonian structure `dq/dt = p, dp/dt = accel - damping*p`, integrated via `odeint`.
+- `TemporalSpatialHamiltonianPredictor` (`temporal_hamiltonian_{lstm,transformer,conv_attn}`): backbone features split into q/p halves, separable `H(q,p) = T(p) + V(q)` via MLP energy networks, spatial force fields via autograd. `.energy(z)` method for monitoring.
+
 **Flat (vector) predictors** — operate on `(B, T, D)` flat latents (legacy, for vector-state models):
 - `LatentPredictor` (`latent_mlp`), `LatentLSTMPredictor` (`latent_lstm`), `LatentODEPredictor` (`latent_ode`), `LatentNewtonianPredictor` (`latent_newtonian`), `LatentHamiltonianPredictor` (`latent_hamiltonian`)
 
 Action handling: `_broadcast_action()` embeds discrete actions via `nn.Embedding` and tiles to `(B*T, emb_dim, H, W)` for spatial concatenation with latents.
+
+**Important implementation detail**: Temporal predictors using Transformer or ConvAttn backbones use **float additive masks** (`-inf` for blocked positions) rather than boolean masks. This forces PyTorch to use standard attention instead of the efficient kernel, which is necessary because the Hamiltonian/Newtonian/ODE variants use `torch.autograd.grad` inside the ODE function, creating nested autograd that requires second-order gradient support.
 
 ### Environments (`src/envs/`)
 `PhysicsControlEnv` base class with discrete action maps. Registry in `src/envs/__init__.py`.
