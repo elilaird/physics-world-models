@@ -960,65 +960,144 @@ def spatial_leapfrog_step(func, z, dt):
 
 
 # ---------------------------------------------------------------------------
-# Temporal backbones for enriched Hamiltonian predictors
+# Block-causal transformer infrastructure
 # ---------------------------------------------------------------------------
 
 
-class TemporalBackbone(nn.Module):
-    """Base class for temporal context aggregation over flattened spatial latents."""
+def build_block_causal_mask(T, S, device):
+    """Build a block-causal attention mask for T frames with S spatial tokens each.
 
-    def __init__(self, input_dim, d_model):
+    Within each frame: full attention (all S tokens attend to each other).
+    Across frames: causal (frame t can only attend to frames <= t).
+
+    Args:
+        T: number of frames.
+        S: number of spatial positions per frame (H * W).
+        device: torch device.
+
+    Returns:
+        (T*S, T*S) float mask with 0.0 for allowed and -inf for blocked.
+    """
+    # Frame-level causal mask: (T, T)
+    frame_mask = torch.triu(
+        torch.full((T, T), float("-inf"), device=device), diagonal=1
+    )
+    # Expand to token level: each frame has S tokens
+    # (T, T) -> (T*S, T*S) via repeat_interleave on both dims
+    return frame_mask.repeat_interleave(S, dim=0).repeat_interleave(S, dim=1)
+
+
+def _tokenize_spatial(context, action_emb):
+    """Convert spatial latents + action embeddings to a flat token sequence.
+
+    Args:
+        context: (B, T, C, H, W) spatial latents.
+        action_emb: (B, T, emb_dim) action embeddings.
+
+    Returns:
+        tokens: (B, T*S, C + emb_dim) where S = H * W.
+    """
+    B, T, C, H, W = context.shape
+    S = H * W
+    # (B, T, C, H, W) -> (B, T, C, S) -> (B, T, S, C)
+    z_tokens = context.reshape(B, T, C, S).permute(0, 1, 3, 2)  # (B, T, S, C)
+    # Broadcast action to each spatial position: (B, T, 1, emb) -> (B, T, S, emb)
+    a_broadcast = action_emb.unsqueeze(2).expand(-1, -1, S, -1)
+    # Concatenate and flatten time*space
+    tokens = torch.cat([z_tokens, a_broadcast], dim=-1)  # (B, T, S, C+emb)
+    return tokens.reshape(B, T * S, -1)
+
+
+def _detokenize_spatial(tokens, T, H, W):
+    """Convert flat token sequence back to spatial latents.
+
+    Args:
+        tokens: (B, T*S, C) token features (spatial channels only).
+        T: number of frames.
+        H, W: spatial dimensions.
+
+    Returns:
+        (B, T, C, H, W) spatial latents.
+    """
+    B, _, C = tokens.shape
+    S = H * W
+    # (B, T*S, C) -> (B, T, S, C) -> (B, T, C, S) -> (B, T, C, H, W)
+    return tokens.reshape(B, T, S, C).permute(0, 1, 3, 2).reshape(B, T, C, H, W)
+
+
+class BlockCausalTransformer(nn.Module):
+    """Block-causal transformer where each spatial position is a token.
+
+    Full attention within frames, causal attention across frames.
+    Reuses SimpleTransformerEncoder for the core attention layers.
+
+    Args:
+        input_dim: per-token input dimension (C + action_emb_dim).
+        d_model: transformer hidden dimension.
+        nhead: number of attention heads.
+        num_layers: number of transformer layers.
+        spatial_size: H = W of spatial latent maps.
+        max_frames: maximum number of frames for temporal positional embeddings.
+    """
+
+    def __init__(
+        self,
+        input_dim,
+        d_model,
+        nhead=4,
+        num_layers=3,
+        spatial_size=8,
+        max_frames=64,
+    ):
         super().__init__()
-        self.input_dim = input_dim
         self.d_model = d_model
+        self.spatial_size = spatial_size
+        S = spatial_size * spatial_size
 
-    def forward(self, x):
-        """
-        Args:
-            x: (B, T, input_dim) concatenated [z_flat, action_emb] per timestep.
-        Returns:
-            (B, T, d_model) temporally-enriched features.
-        """
-        raise NotImplementedError
+        # Input projection
+        self.input_proj = nn.Linear(input_dim, d_model)
 
-
-class LSTMBackbone(TemporalBackbone):
-    """LSTM temporal backbone."""
-
-    def __init__(self, input_dim, d_model, num_layers=2):
-        super().__init__(input_dim, d_model)
-        self.proj = nn.Linear(input_dim, d_model)
-        self.num_layers = num_layers
-        # Use LSTMCell layers instead of packed/cuDNN LSTM to allow double-backward
-        self.cells = nn.ModuleList(
-            [nn.LSTMCell(d_model, d_model) for _ in range(num_layers)]
+        # Learned positional embeddings
+        self.spatial_pos = nn.Parameter(torch.randn(1, 1, S, d_model) * 0.02)
+        self.temporal_pos = nn.Parameter(
+            torch.randn(1, max_frames, 1, d_model) * 0.02
         )
 
-    def forward(self, x):
-        B, T, _ = x.shape
-        h_in = self.proj(x)  # (B, T, d_model)
+        # Core transformer with block-causal masking
+        self.transformer = SimpleTransformerEncoder(
+            d_model=d_model, nhead=nhead, num_layers=num_layers
+        )
 
-        # Initialize hidden/cell states for each layer
-        h_states = [
-            torch.zeros(B, self.d_model, device=x.device, dtype=x.dtype)
-            for _ in range(self.num_layers)
-        ]
-        c_states = [
-            torch.zeros(B, self.d_model, device=x.device, dtype=x.dtype)
-            for _ in range(self.num_layers)
-        ]
+    def forward(self, tokens, T):
+        """
+        Args:
+            tokens: (B, T*S, input_dim) tokenized spatial latents + actions.
+            T: number of frames (needed for positional embeddings and mask).
 
-        outputs = []
-        for t in range(T):
-            inp = h_in[:, t, :]
-            for l in range(self.num_layers):
-                h_l, c_l = self.cells[l](inp, (h_states[l], c_states[l]))
-                h_states[l] = h_l
-                c_states[l] = c_l
-                inp = h_l
-            outputs.append(h_l.unsqueeze(1))
+        Returns:
+            (B, T*S, d_model) transformer output features.
+        """
+        B = tokens.shape[0]
+        S = self.spatial_size * self.spatial_size
 
-        return torch.cat(outputs, dim=1)
+        # Project input
+        h = self.input_proj(tokens)  # (B, T*S, d_model)
+
+        # Add positional embeddings: reshape to (B, T, S, d_model), add, flatten
+        h = h.reshape(B, T, S, self.d_model)
+        h = h + self.spatial_pos[:, :, :S] + self.temporal_pos[:, :T]
+        h = h.reshape(B, T * S, self.d_model)
+
+        # Block-causal mask
+        mask = build_block_causal_mask(T, S, tokens.device)
+        mask = mask.to(h.dtype)
+
+        return self.transformer(h, attn_mask=mask)
+
+
+# ---------------------------------------------------------------------------
+# Transformer building blocks (used by BlockCausalTransformer)
+# ---------------------------------------------------------------------------
 
 
 class SimpleMultiHeadAttention(nn.Module):
@@ -1113,248 +1192,89 @@ class SimpleTransformerEncoder(nn.Module):
         return x
 
 
-class TransformerBackbone(TemporalBackbone):
-    """Causal transformer temporal backbone."""
+class _BlockCausalHamiltonianFunc(nn.Module):
+    """Per-position Hamiltonian ODE using fixed transformer features.
 
-    def __init__(self, input_dim, d_model, num_layers=2, nhead=4, max_len=64):
-        super().__init__(input_dim, d_model)
-        self.proj = nn.Linear(input_dim, d_model)
-        self.pos_emb = nn.Parameter(torch.randn(1, max_len, d_model) * 0.02)
-        self.transformer = SimpleTransformerEncoder(
-            d_model=d_model, nhead=nhead, num_layers=num_layers
-        )
-
-    def forward(self, x):
-        B, T, _ = x.shape
-        h = self.proj(x) + self.pos_emb[:, :T]
-        # Causal mask: each position attends only to itself and earlier positions
-        mask = torch.triu(
-            torch.full((T, T), float("-inf"), device=x.device), diagonal=1
-        )
-        mask = mask.to(h.dtype)
-        return self.transformer(h, attn_mask=mask)
-
-
-class ConvAttnBackbone(TemporalBackbone):
-    """Conv spatial processing + cross-frame causal attention."""
-
-    def __init__(
-        self,
-        input_dim,
-        d_model,
-        latent_channels,
-        spatial_size,
-        hidden_channels=64,
-        num_layers=2,
-        nhead=4,
-        max_len=64,
-    ):
-        super().__init__(input_dim, d_model)
-        self.latent_channels = latent_channels
-        self.spatial_size = spatial_size
-        # Per-frame spatial conv (operates on raw spatial latents, not the flat concat)
-        self.spatial_conv = nn.Sequential(
-            nn.Conv2d(latent_channels, hidden_channels, 3, 1, 1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(hidden_channels, hidden_channels, 3, 1, 1),
-            nn.LeakyReLU(0.2),
-        )
-        conv_flat_dim = hidden_channels * spatial_size * spatial_size
-        self.action_emb_dim = (
-            input_dim - latent_channels * spatial_size * spatial_size
-        )
-        self.proj = nn.Linear(conv_flat_dim + self.action_emb_dim, d_model)
-        self.pos_emb = nn.Parameter(torch.randn(1, max_len, d_model) * 0.02)
-        self.transformer = SimpleTransformerEncoder(
-            d_model=d_model, nhead=nhead, num_layers=num_layers
-        )
-
-    def forward(self, x):
-        B, T, _ = x.shape
-        z_flat_dim = (
-            self.latent_channels * self.spatial_size * self.spatial_size
-        )
-        z_flat = x[..., :z_flat_dim]  # (B, T, C*H*W)
-        a_emb = x[..., z_flat_dim:]  # (B, T, action_emb_dim)
-
-        # Reshape to spatial and apply conv
-        z_spatial = z_flat.reshape(
-            B * T, self.latent_channels, self.spatial_size, self.spatial_size
-        )
-        conv_out = self.spatial_conv(z_spatial)  # (B*T, hidden_ch, H, W)
-        conv_flat = conv_out.reshape(B, T, -1)  # (B, T, hidden_ch*H*W)
-
-        # Concat conv features + action embeddings, project, attend
-        h = self.proj(torch.cat([conv_flat, a_emb], dim=-1))
-        h = h + self.pos_emb[:, :T]
-        # Use float mask (not bool) to force standard attention for nested autograd
-        mask = torch.triu(
-            torch.full((T, T), float("-inf"), device=x.device), diagonal=1
-        )
-        mask = mask.to(h.dtype)
-        return self.transformer(h, attn_mask=mask)
-
-
-BACKBONE_REGISTRY = {
-    "lstm": LSTMBackbone,
-    "transformer": TransformerBackbone,
-    "conv_attn": ConvAttnBackbone,
-}
-
-
-def build_backbone(
-    backbone_type,
-    input_dim,
-    d_model,
-    num_layers=2,
-    latent_channels=None,
-    spatial_size=None,
-    hidden_channels=64,
-    nhead=4,
-    max_len=64,
-):
-    """Build a temporal backbone by type name."""
-    if backbone_type == "conv_attn":
-        return ConvAttnBackbone(
-            input_dim=input_dim,
-            d_model=d_model,
-            latent_channels=latent_channels,
-            spatial_size=spatial_size,
-            hidden_channels=hidden_channels,
-            num_layers=num_layers,
-            nhead=nhead,
-            max_len=max_len,
-        )
-    elif backbone_type == "transformer":
-        return TransformerBackbone(
-            input_dim=input_dim,
-            d_model=d_model,
-            num_layers=num_layers,
-            nhead=nhead,
-            max_len=max_len,
-        )
-    elif backbone_type == "lstm":
-        return LSTMBackbone(
-            input_dim=input_dim,
-            d_model=d_model,
-            num_layers=num_layers,
-        )
-    else:
-        raise ValueError(f"Unknown backbone_type: {backbone_type}")
-
-
-class _TemporalSpatialHamiltonianFunc(nn.Module):
-    """Temporal port-Hamiltonian ODE with backbone-enriched energy.
-
-    Backbone processes (B, T, C*H*W + action_emb) -> (B, T, d_model).
-    Energy networks T_net/V_net operate on backbone features (MLP, not ConvNet).
-    Autograd of scalar H w.r.t. original spatial z yields spatial force fields.
+    Separable H(q,p) = T(p, features) + V(q, features) with autograd through
+    energy nets only. Transformer features are fixed during integration.
     """
 
-    def __init__(
-        self,
-        half_channels,
-        action_embedding_dim,
-        hidden_channels,
-        spatial_size,
-        backbone,
-        d_model,
-        action_frames=1,
-    ):
+    def __init__(self, half_channels, d_model, hidden_channels):
         super().__init__()
         self.half_channels = half_channels
-        self.spatial_size = spatial_size
-        self.backbone = backbone
-        half_d = d_model // 2
 
-        # Energy networks on backbone features (MLP-based)
+        # Energy networks: per-position MLP operating on (z_half, features)
         self.T_net = nn.Sequential(
-            nn.Linear(half_d, hidden_channels),
+            nn.Linear(half_channels + d_model, hidden_channels),
             nn.Softplus(),
             nn.Linear(hidden_channels, 1),
         )
         self.V_net = nn.Sequential(
-            nn.Linear(half_d, hidden_channels),
+            nn.Linear(half_channels + d_model, hidden_channels),
             nn.Softplus(),
             nn.Linear(hidden_channels, 1),
         )
 
-        # Input port: action -> spatial force
-        self.G_net = nn.Conv2d(
-            action_embedding_dim * action_frames, half_channels, 1
-        )
+        # Input port: features -> force on momentum
+        self.G_net = nn.Linear(d_model, half_channels)
 
-        self._action_spatial = None  # (B*T, emb, H, W) for G_net
-        self._action_emb_flat = None  # (B, T, emb_dim) for backbone input
+        self._features = None  # (B*T*S, d_model)
         self._damping = None
-        self._B = None
-        self._T = None
 
-    def set_context(self, action_spatial, action_emb_flat, damping, B, T):
-        """Set all context needed for forward pass."""
-        self._action_spatial = action_spatial
-        self._action_emb_flat = action_emb_flat
+    def set_features(self, features):
+        self._features = features
+
+    def set_damping(self, damping):
         self._damping = damping
-        self._B = B
-        self._T = T
 
-    def _run_backbone(self, z):
-        """Flatten spatial z, concat actions, run backbone -> (B*T, d_model)."""
-        B, T = self._B, self._T
+    def T(self, p, feat):
+        """Kinetic energy: (N, half_ch), (N, d_model) -> (N, 1)."""
+        return self.T_net(torch.cat([p, feat], dim=-1))
 
-        # z is (B*T, 2*hc, H, W) -- reshape to (B, T, C*H*W)
-        z_flat = z.reshape(B, T, -1)  # (B, T, 2*hc*H*W)
-        backbone_input = torch.cat([z_flat, self._action_emb_flat], dim=-1)
-        features = self.backbone(backbone_input)  # (B, T, d_model)
-        return features.reshape(B * T, -1)  # (B*T, d_model)
+    def V(self, q, feat):
+        """Potential energy: (N, half_ch), (N, d_model) -> (N, 1)."""
+        return self.V_net(torch.cat([q, feat], dim=-1))
 
-    def H(self, q_feat, p_feat):
-        """Compute H = T(p_feat) + V(q_feat). Inputs are backbone feature halves."""
-        return self.T_net(p_feat) + self.V_net(q_feat)
-
-    def H_gradients(self, z):
-        """Compute dH/dz via autograd through backbone + energy networks.
-
-        Args:
-            z: (B*T, 2*hc, H, W) spatial phase-space state.
-        Returns:
-            dH_dz: (B*T, 2*hc, H, W) spatial gradient of scalar energy.
-        """
-        if not z.requires_grad:
-            z = z.detach().requires_grad_(True)
-        with torch.enable_grad():
-            features = self._run_backbone(z)  # (B*T, d_model)
-            half_d = features.shape[-1] // 2
-            q_feat, p_feat = features[..., :half_d], features[..., half_d:]
-            H = self.H(q_feat, p_feat)  # (B*T, 1)
-            dH_dz = torch.autograd.grad(H.sum(), z, create_graph=True)[0]
-        return dH_dz
+    def H(self, q, p, feat):
+        return self.T(p, feat) + self.V(q, feat)
 
     def forward(self, t, z):
-        """ODE right-hand side: Hamiltonian dynamics.
-
+        """
         Args:
-            t: scalar time (unused, required by odeint).
-            z: (B*T, 2*hc, H, W) spatial phase-space state.
-        Returns:
-            dz_dt: (B*T, 2*hc, H, W) time derivative.
+            t: scalar time.
+            z: (B*T*S, C) with C = 2*half_channels.
         """
         hc = self.half_channels
-        dH_dz = self.H_gradients(z)
-        dH_dq = dH_dz[:, :hc]
-        dH_dp = dH_dz[:, hc:]
-        G_u = self.G_net(self._action_spatial)
-        dq_dt = dH_dp
-        dp_dt = -dH_dq - self._damping * dH_dp + G_u
-        return torch.cat([dq_dt, dp_dt], dim=1)
+        q, p = z[..., :hc], z[..., hc:]
+
+        # Autograd through energy nets
+        if not q.requires_grad:
+            q = q.detach().requires_grad_(True)
+        if not p.requires_grad:
+            p = p.detach().requires_grad_(True)
+
+        with torch.enable_grad():
+            V = self.V(q, self._features)
+            T_val = self.T(p, self._features)
+            dV_dq = torch.autograd.grad(
+                V, q, torch.ones_like(V), create_graph=True
+            )[0]
+            dT_dp = torch.autograd.grad(
+                T_val, p, torch.ones_like(T_val), create_graph=True
+            )[0]
+
+        G_u = self.G_net(self._features)
+        dq_dt = dT_dp
+        dp_dt = -dV_dq - self._damping * dT_dp + G_u
+        return torch.cat([dq_dt, dp_dt], dim=-1)
 
 
 class TemporalSpatialHamiltonianPredictor(nn.Module):
-    """Temporal port-Hamiltonian predictor on spatial latents.
+    """Block-causal transformer + per-position Hamiltonian ODE on spatial latents.
 
-    Uses a temporal backbone (transformer, LSTM, or conv+attn) to enrich
-    per-frame features with temporal context before computing Hamiltonian
-    energy. Dynamics derived via autograd preserve symplectic structure.
+    Runs transformer once for temporal context, then per-position Hamiltonian
+    dynamics with separable H(q,p) = T(p,feat) + V(q,feat), autograd through
+    energy nets.
     """
 
     def __init__(
@@ -1366,10 +1286,9 @@ class TemporalSpatialHamiltonianPredictor(nn.Module):
         context_length=3,
         spatial_size=8,
         action_frames=1,
-        backbone_type="lstm",
-        backbone_layers=2,
-        backbone_dim=256,
-        backbone_nhead=4,
+        d_model=128,
+        nhead=4,
+        num_layers=3,
         integration_method="rk4",
         dt=1.0,
         damping_init=-1.0,
@@ -1382,30 +1301,21 @@ class TemporalSpatialHamiltonianPredictor(nn.Module):
         self.half_channels = latent_channels // 2
         self.spatial_size = spatial_size
         self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
+        self.d_model = d_model
 
-        # Build temporal backbone
-        z_flat_dim = latent_channels * spatial_size * spatial_size
         emb_dim = action_embedding_dim * action_frames
-        backbone_input_dim = z_flat_dim + emb_dim
-        backbone = build_backbone(
-            backbone_type=backbone_type,
-            input_dim=backbone_input_dim,
-            d_model=backbone_dim,
-            num_layers=backbone_layers,
-            latent_channels=latent_channels,
+        input_dim = latent_channels + emb_dim
+        self.transformer = BlockCausalTransformer(
+            input_dim=input_dim,
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
             spatial_size=spatial_size,
-            hidden_channels=hidden_channels,
-            nhead=backbone_nhead,
         )
-
-        self.ode_func = _TemporalSpatialHamiltonianFunc(
+        self.ode_func = _BlockCausalHamiltonianFunc(
             half_channels=self.half_channels,
-            action_embedding_dim=action_embedding_dim,
+            d_model=d_model,
             hidden_channels=hidden_channels,
-            spatial_size=spatial_size,
-            backbone=backbone,
-            d_model=backbone_dim,
-            action_frames=action_frames,
         )
         self.log_damping = nn.Parameter(torch.tensor(damping_init))
         self.integration_method = integration_method
@@ -1420,23 +1330,23 @@ class TemporalSpatialHamiltonianPredictor(nn.Module):
             (B, T, C, H, W) predicted next latent for each frame.
         """
         B, T, C, H, W = context.shape
-        z_flat = context.reshape(B * T, C, H, W)
-
-        # Action embeddings: spatial for G_net, flat for backbone
-        a_spatial = _broadcast_action(self.act_emb, action, self.spatial_size)
+        S = H * W
         if action.dim() == 2:
-            a_emb_flat = self.act_emb(action)  # (B, T, emb_dim)
+            a_emb = self.act_emb(action)
         else:
-            a_emb_flat = self.act_emb(action)  # (B, T, K, emb_dim)
-            a_emb_flat = a_emb_flat.reshape(B, T, -1)  # (B, T, K*emb_dim)
+            a_emb = self.act_emb(action).reshape(B, T, -1)
 
-        self.ode_func.set_context(
-            action_spatial=a_spatial,
-            action_emb_flat=a_emb_flat,
-            damping=torch.exp(self.log_damping),
-            B=B,
-            T=T,
-        )
+        # Run transformer once
+        tokens = _tokenize_spatial(context, a_emb)
+        features = self.transformer(tokens, T)  # (B, T*S, d_model)
+
+        # Per-position z for ODE (channel-last for q/p split)
+        z_tokens = context.reshape(B, T, C, S).permute(0, 1, 3, 2)
+        z_flat = z_tokens.reshape(B * T * S, C)
+        feat_flat = features.reshape(B * T * S, -1)
+
+        self.ode_func.set_features(feat_flat)
+        self.ode_func.set_damping(torch.exp(self.log_damping))
 
         t_span = torch.tensor(
             [0.0, self.dt], device=z_flat.device, dtype=z_flat.dtype
@@ -1444,14 +1354,13 @@ class TemporalSpatialHamiltonianPredictor(nn.Module):
         z_next = odeint(
             self.ode_func, z_flat, t_span, method=self.integration_method
         )
-        return z_next[-1].reshape(B, T, C, H, W)
+        z_out = z_next[-1].reshape(B, T, S, C).permute(0, 1, 3, 2)
+        return z_out.reshape(B, T, C, H, W)
 
     def energy(self, z):
-        """Compute H(q,p) for monitoring.
+        """Compute H(q,p) for monitoring energy conservation.
 
-        Note: For temporal predictors, energy depends on the backbone context.
-        When called with a full sequence, we run the backbone with zero action
-        embeddings to get context-dependent energy.
+        Uses zero action embeddings and runs the transformer to get features.
 
         Args:
             z: (B, T, C, H, W) or (B, C, H, W) phase-space state.
@@ -1461,33 +1370,33 @@ class TemporalSpatialHamiltonianPredictor(nn.Module):
         if z.dim() == 4:
             z = z.unsqueeze(1)  # (B, 1, C, H, W)
         B, T, C, H, W = z.shape
+        S = H * W
 
-        # Use zero action embeddings for energy monitoring
-        emb_dim = (
-            self.ode_func._action_emb_flat.shape[-1]
-            if self.ode_func._action_emb_flat is not None
-            else self.act_emb.embedding_dim
-        )
-        zero_action_emb = torch.zeros(
-            B, T, emb_dim, device=z.device, dtype=z.dtype
-        )
-        z_flat_vec = z.reshape(B, T, -1)  # (B, T, C*H*W)
-        backbone_input = torch.cat([z_flat_vec, zero_action_emb], dim=-1)
-        features = self.ode_func.backbone(backbone_input)  # (B, T, d_model)
-        features_flat = features.reshape(B * T, -1)
-        half_d = features_flat.shape[-1] // 2
-        q_feat = features_flat[..., :half_d]
-        p_feat = features_flat[..., half_d:]
-        H = self.ode_func.H(q_feat, p_feat)  # (B*T, 1)
-        return H.reshape(B, T, 1)
+        # Zero action embeddings for energy monitoring
+        emb_dim = self.act_emb.embedding_dim
+        zero_emb = torch.zeros(B, T, emb_dim, device=z.device, dtype=z.dtype)
+
+        tokens = _tokenize_spatial(z, zero_emb)
+        features = self.transformer(tokens, T)  # (B, T*S, d_model)
+
+        # Per-position energy
+        z_tokens = z.reshape(B, T, C, S).permute(0, 1, 3, 2)  # (B,T,S,C)
+        z_flat = z_tokens.reshape(B * T * S, C)
+        feat_flat = features.reshape(B * T * S, -1)
+
+        hc = self.half_channels
+        q, p = z_flat[..., :hc], z_flat[..., hc:]
+        H_per_pos = self.ode_func.H(q, p, feat_flat)  # (B*T*S, 1)
+        # Sum energy over spatial positions per frame
+        H = H_per_pos.reshape(B, T, S, 1).sum(dim=2)  # (B, T, 1)
+        return H
 
 
 class TemporalSpatialJumpPredictor(nn.Module):
-    """Temporal backbone-enriched residual predictor on spatial latents.
+    """Block-causal transformer residual predictor on spatial latents.
 
-    Flattens spatial latents, processes with temporal backbone (LSTM/Transformer/
-    Conv+Attn) for cross-frame context, then applies a 2-layer MLP output
-    projection reshaped back to spatial dims as a residual.
+    Each spatial position (8x8=64 per frame) is a token. Full attention within
+    frames, causal attention across frames. Output: 2-layer MLP per token → residual.
     """
 
     def __init__(
@@ -1499,10 +1408,9 @@ class TemporalSpatialJumpPredictor(nn.Module):
         context_length=3,
         spatial_size=8,
         action_frames=1,
-        backbone_type="lstm",
-        backbone_layers=2,
-        backbone_dim=256,
-        backbone_nhead=4,
+        d_model=128,
+        nhead=4,
+        num_layers=3,
         name="temporal_jump",
     ):
         super().__init__()
@@ -1511,40 +1419,36 @@ class TemporalSpatialJumpPredictor(nn.Module):
         self.spatial_size = spatial_size
         self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
 
-        z_flat_dim = latent_channels * spatial_size * spatial_size
         emb_dim = action_embedding_dim * action_frames
-        backbone_input_dim = z_flat_dim + emb_dim
-        self.backbone = build_backbone(
-            backbone_type=backbone_type,
-            input_dim=backbone_input_dim,
-            d_model=backbone_dim,
-            num_layers=backbone_layers,
-            latent_channels=latent_channels,
+        input_dim = latent_channels + emb_dim
+        self.transformer = BlockCausalTransformer(
+            input_dim=input_dim,
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
             spatial_size=spatial_size,
-            hidden_channels=hidden_channels,
-            nhead=backbone_nhead,
         )
         self.output_proj = nn.Sequential(
-            nn.Linear(backbone_dim, hidden_channels),
-            nn.Tanh(),
-            nn.Linear(hidden_channels, z_flat_dim),
+            nn.Linear(d_model, hidden_channels),
+            nn.GELU(),
+            nn.Linear(hidden_channels, latent_channels),
         )
 
     def forward(self, context, action):
         B, T, C, H, W = context.shape
-        z_flat = context.reshape(B, T, -1)  # (B, T, C*H*W)
         if action.dim() == 2:
             a_emb = self.act_emb(action)  # (B, T, emb_dim)
         else:
             a_emb = self.act_emb(action).reshape(B, T, -1)
-        backbone_input = torch.cat([z_flat, a_emb], dim=-1)
-        features = self.backbone(backbone_input)  # (B, T, backbone_dim)
-        delta = self.output_proj(features)  # (B, T, C*H*W)
-        return (z_flat + delta).reshape(B, T, C, H, W)
+        tokens = _tokenize_spatial(context, a_emb)  # (B, T*S, C+emb)
+        features = self.transformer(tokens, T)  # (B, T*S, d_model)
+        delta = self.output_proj(features)  # (B, T*S, C)
+        delta_spatial = _detokenize_spatial(delta, T, H, W)  # (B, T, C, H, W)
+        return context + delta_spatial
 
 
 class TemporalSpatialLSTMPredictor(nn.Module):
-    """Temporal backbone-enriched predictor with single linear output head.
+    """Block-causal transformer predictor with single linear output head.
 
     Same pattern as TemporalSpatialJumpPredictor but with a simpler single
     Linear output projection, mirroring the original ConvLSTM predictor's
@@ -1560,10 +1464,9 @@ class TemporalSpatialLSTMPredictor(nn.Module):
         context_length=3,
         spatial_size=8,
         action_frames=1,
-        backbone_type="lstm",
-        backbone_layers=2,
-        backbone_dim=256,
-        backbone_nhead=4,
+        d_model=128,
+        nhead=4,
+        num_layers=3,
         name="temporal_lstm",
     ):
         super().__init__()
@@ -1572,86 +1475,66 @@ class TemporalSpatialLSTMPredictor(nn.Module):
         self.spatial_size = spatial_size
         self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
 
-        z_flat_dim = latent_channels * spatial_size * spatial_size
         emb_dim = action_embedding_dim * action_frames
-        backbone_input_dim = z_flat_dim + emb_dim
-        self.backbone = build_backbone(
-            backbone_type=backbone_type,
-            input_dim=backbone_input_dim,
-            d_model=backbone_dim,
-            num_layers=backbone_layers,
-            latent_channels=latent_channels,
+        input_dim = latent_channels + emb_dim
+        self.transformer = BlockCausalTransformer(
+            input_dim=input_dim,
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
             spatial_size=spatial_size,
-            hidden_channels=hidden_channels,
-            nhead=backbone_nhead,
         )
-        self.output_proj = nn.Linear(backbone_dim, z_flat_dim)
+        self.output_proj = nn.Linear(d_model, latent_channels)
 
     def forward(self, context, action):
         B, T, C, H, W = context.shape
-        z_flat = context.reshape(B, T, -1)  # (B, T, C*H*W)
         if action.dim() == 2:
             a_emb = self.act_emb(action)
         else:
             a_emb = self.act_emb(action).reshape(B, T, -1)
-        backbone_input = torch.cat([z_flat, a_emb], dim=-1)
-        features = self.backbone(backbone_input)  # (B, T, backbone_dim)
-        delta = self.output_proj(features)  # (B, T, C*H*W)
-        return (z_flat + delta).reshape(B, T, C, H, W)
+        tokens = _tokenize_spatial(context, a_emb)  # (B, T*S, C+emb)
+        features = self.transformer(tokens, T)  # (B, T*S, d_model)
+        delta = self.output_proj(features)  # (B, T*S, C)
+        delta_spatial = _detokenize_spatial(delta, T, H, W)
+        return context + delta_spatial
 
 
-class _TemporalSpatialODEFunc(nn.Module):
-    """Temporal ODE function: backbone-enriched dz/dt.
+class _BlockCausalODEFunc(nn.Module):
+    """Per-position ODE function using fixed transformer features.
 
-    Flattens spatial z, runs backbone for temporal context, then MLP dynamics
-    network produces dz/dt reshaped back to spatial dims.
+    dz/dt = MLP(z_pos, features_pos) for each spatial position independently.
+    Transformer features are computed once and fixed during integration.
     """
 
-    def __init__(
-        self,
-        latent_channels,
-        hidden_channels,
-        spatial_size,
-        backbone,
-        backbone_dim,
-    ):
+    def __init__(self, latent_channels, d_model, hidden_channels):
         super().__init__()
         self.latent_channels = latent_channels
-        self.spatial_size = spatial_size
-        self.backbone = backbone
-        z_flat_dim = latent_channels * spatial_size * spatial_size
         self.dynamics_net = nn.Sequential(
-            nn.Linear(backbone_dim, hidden_channels),
-            nn.Tanh(),
-            nn.Linear(hidden_channels, z_flat_dim),
+            nn.Linear(latent_channels + d_model, hidden_channels),
+            nn.GELU(),
+            nn.Linear(hidden_channels, latent_channels),
         )
-        self._action_emb_flat = None
-        self._B = None
-        self._T = None
+        self._features = None  # (B*T*S, d_model), fixed during ODE integration
 
-    def set_context(self, action_emb_flat, B, T):
-        self._action_emb_flat = action_emb_flat
-        self._B = B
-        self._T = T
-
-    def _run_backbone(self, z):
-        B, T = self._B, self._T
-        z_flat = z.reshape(B, T, -1)
-        backbone_input = torch.cat([z_flat, self._action_emb_flat], dim=-1)
-        features = self.backbone(backbone_input)
-        return features.reshape(B * T, -1)
+    def set_features(self, features):
+        self._features = features
 
     def forward(self, t, z):
-        features = self._run_backbone(z)  # (B*T, backbone_dim)
-        dz_dt_flat = self.dynamics_net(features)  # (B*T, C*H*W)
-        return dz_dt_flat.reshape(z.shape)
+        """
+        Args:
+            t: scalar time (unused, required by odeint).
+            z: (B*T*S, C) per-position latent state.
+        Returns:
+            dz_dt: (B*T*S, C) time derivative.
+        """
+        return self.dynamics_net(torch.cat([z, self._features], dim=-1))
 
 
 class TemporalSpatialODEPredictor(nn.Module):
-    """Temporal backbone-enriched first-order ODE predictor on spatial latents.
+    """Block-causal transformer + per-position ODE predictor on spatial latents.
 
-    Uses a temporal backbone to enrich per-frame features with temporal context,
-    then integrates dz/dt = MLP(backbone_features) via odeint.
+    Runs transformer once for temporal context, then integrates per-position
+    dz/dt = MLP(z, fixed_features) via odeint.
     """
 
     def __init__(
@@ -1663,10 +1546,9 @@ class TemporalSpatialODEPredictor(nn.Module):
         context_length=3,
         spatial_size=8,
         action_frames=1,
-        backbone_type="lstm",
-        backbone_layers=2,
-        backbone_dim=256,
-        backbone_nhead=4,
+        d_model=128,
+        nhead=4,
+        num_layers=3,
         integration_method="rk4",
         dt=1.0,
         name="temporal_ode",
@@ -1677,104 +1559,93 @@ class TemporalSpatialODEPredictor(nn.Module):
         self.spatial_size = spatial_size
         self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
 
-        z_flat_dim = latent_channels * spatial_size * spatial_size
         emb_dim = action_embedding_dim * action_frames
-        backbone_input_dim = z_flat_dim + emb_dim
-        backbone = build_backbone(
-            backbone_type=backbone_type,
-            input_dim=backbone_input_dim,
-            d_model=backbone_dim,
-            num_layers=backbone_layers,
-            latent_channels=latent_channels,
+        input_dim = latent_channels + emb_dim
+        self.transformer = BlockCausalTransformer(
+            input_dim=input_dim,
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
             spatial_size=spatial_size,
-            hidden_channels=hidden_channels,
-            nhead=backbone_nhead,
         )
-        self.ode_func = _TemporalSpatialODEFunc(
+        self.ode_func = _BlockCausalODEFunc(
             latent_channels=latent_channels,
+            d_model=d_model,
             hidden_channels=hidden_channels,
-            spatial_size=spatial_size,
-            backbone=backbone,
-            backbone_dim=backbone_dim,
         )
         self.integration_method = integration_method
         self.dt = dt
 
     def forward(self, context, action):
         B, T, C, H, W = context.shape
-        z_flat = context.reshape(B * T, C, H, W)
+        S = H * W
         if action.dim() == 2:
-            a_emb_flat = self.act_emb(action)
+            a_emb = self.act_emb(action)
         else:
-            a_emb_flat = self.act_emb(action).reshape(B, T, -1)
-        self.ode_func.set_context(action_emb_flat=a_emb_flat, B=B, T=T)
+            a_emb = self.act_emb(action).reshape(B, T, -1)
+
+        # Run transformer once
+        tokens = _tokenize_spatial(context, a_emb)  # (B, T*S, C+emb)
+        features = self.transformer(tokens, T)  # (B, T*S, d_model)
+
+        # Extract per-position z and features for ODE
+        z_tokens = context.reshape(B, T, C, S).permute(0, 1, 3, 2)  # (B,T,S,C)
+        z_flat = z_tokens.reshape(B * T * S, C)
+        feat_flat = features.reshape(B * T * S, -1)
+
+        self.ode_func.set_features(feat_flat)
         t_span = torch.tensor(
             [0.0, self.dt], device=z_flat.device, dtype=z_flat.dtype
         )
         z_next = odeint(
             self.ode_func, z_flat, t_span, method=self.integration_method
         )
-        return z_next[-1].reshape(B, T, C, H, W)
+        # (B*T*S, C) -> (B, T, S, C) -> (B, T, C, H, W)
+        z_out = z_next[-1].reshape(B, T, S, C).permute(0, 1, 3, 2)
+        return z_out.reshape(B, T, C, H, W)
 
 
-class _TemporalSpatialNewtonianFunc(nn.Module):
-    """Temporal Newtonian ODE: backbone-enriched dq/dt = p, dp/dt = accel - damping*p.
+class _BlockCausalNewtonianFunc(nn.Module):
+    """Per-position Newtonian ODE using fixed transformer features.
 
-    Runs backbone on flattened spatial z, then acceleration network produces
-    force on the momentum channels.
+    dq/dt = p, dp/dt = MLP(q, p, features) - damping*p for each position.
     """
 
-    def __init__(
-        self,
-        half_channels,
-        hidden_channels,
-        spatial_size,
-        backbone,
-        backbone_dim,
-    ):
+    def __init__(self, half_channels, d_model, hidden_channels):
         super().__init__()
         self.half_channels = half_channels
-        self.spatial_size = spatial_size
-        self.backbone = backbone
-        half_flat_dim = half_channels * spatial_size * spatial_size
         self.accel_net = nn.Sequential(
-            nn.Linear(backbone_dim, hidden_channels),
-            nn.Tanh(),
-            nn.Linear(hidden_channels, half_flat_dim),
+            nn.Linear(half_channels * 2 + d_model, hidden_channels),
+            nn.GELU(),
+            nn.Linear(hidden_channels, half_channels),
         )
-        self._action_emb_flat = None
+        self._features = None  # (B*T*S, d_model)
         self._damping = None
-        self._B = None
-        self._T = None
 
-    def set_context(self, action_emb_flat, damping, B, T):
-        self._action_emb_flat = action_emb_flat
+    def set_features(self, features):
+        self._features = features
+
+    def set_damping(self, damping):
         self._damping = damping
-        self._B = B
-        self._T = T
-
-    def _run_backbone(self, z):
-        B, T = self._B, self._T
-        z_flat = z.reshape(B, T, -1)
-        backbone_input = torch.cat([z_flat, self._action_emb_flat], dim=-1)
-        features = self.backbone(backbone_input)
-        return features.reshape(B * T, -1)
 
     def forward(self, t, z):
+        """
+        Args:
+            t: scalar time.
+            z: (B*T*S, C) with C = 2*half_channels, first half q, second half p.
+        """
         hc = self.half_channels
-        q, p = z[:, :hc], z[:, hc:]
-        features = self._run_backbone(z)  # (B*T, backbone_dim)
-        acc_flat = self.accel_net(features)  # (B*T, half_ch*H*W)
-        acc = acc_flat.reshape(p.shape)
+        q, p = z[..., :hc], z[..., hc:]
+        acc = self.accel_net(torch.cat([q, p, self._features], dim=-1))
         dp_dt = acc - self._damping * p
-        return torch.cat([p, dp_dt], dim=1)
+        return torch.cat([p, dp_dt], dim=-1)
 
 
 class TemporalSpatialNewtonianPredictor(nn.Module):
-    """Temporal backbone-enriched Newtonian dynamics predictor on spatial latents.
+    """Block-causal transformer + per-position Newtonian ODE on spatial latents.
 
-    Uses a temporal backbone to enrich per-frame features, then enforces
-    dq/dt = p, dp/dt = accel_net(backbone_features) - damping*p structure.
+    Runs transformer once, then per-position Newtonian dynamics:
+    dq/dt = p, dp/dt = accel(q, p, features) - damping*p.
     """
 
     def __init__(
@@ -1786,10 +1657,9 @@ class TemporalSpatialNewtonianPredictor(nn.Module):
         context_length=3,
         spatial_size=8,
         action_frames=1,
-        backbone_type="lstm",
-        backbone_layers=2,
-        backbone_dim=256,
-        backbone_nhead=4,
+        d_model=128,
+        nhead=4,
+        num_layers=3,
         integration_method="rk4",
         dt=1.0,
         damping_init=-1.0,
@@ -1803,25 +1673,19 @@ class TemporalSpatialNewtonianPredictor(nn.Module):
         self.spatial_size = spatial_size
         self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
 
-        z_flat_dim = latent_channels * spatial_size * spatial_size
         emb_dim = action_embedding_dim * action_frames
-        backbone_input_dim = z_flat_dim + emb_dim
-        backbone = build_backbone(
-            backbone_type=backbone_type,
-            input_dim=backbone_input_dim,
-            d_model=backbone_dim,
-            num_layers=backbone_layers,
-            latent_channels=latent_channels,
+        input_dim = latent_channels + emb_dim
+        self.transformer = BlockCausalTransformer(
+            input_dim=input_dim,
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
             spatial_size=spatial_size,
-            hidden_channels=hidden_channels,
-            nhead=backbone_nhead,
         )
-        self.ode_func = _TemporalSpatialNewtonianFunc(
+        self.ode_func = _BlockCausalNewtonianFunc(
             half_channels=self.half_channels,
+            d_model=d_model,
             hidden_channels=hidden_channels,
-            spatial_size=spatial_size,
-            backbone=backbone,
-            backbone_dim=backbone_dim,
         )
         self.log_damping = nn.Parameter(torch.tensor(damping_init))
         self.integration_method = integration_method
@@ -1829,24 +1693,32 @@ class TemporalSpatialNewtonianPredictor(nn.Module):
 
     def forward(self, context, action):
         B, T, C, H, W = context.shape
-        z_flat = context.reshape(B * T, C, H, W)
+        S = H * W
         if action.dim() == 2:
-            a_emb_flat = self.act_emb(action)
+            a_emb = self.act_emb(action)
         else:
-            a_emb_flat = self.act_emb(action).reshape(B, T, -1)
-        self.ode_func.set_context(
-            action_emb_flat=a_emb_flat,
-            damping=torch.exp(self.log_damping),
-            B=B,
-            T=T,
-        )
+            a_emb = self.act_emb(action).reshape(B, T, -1)
+
+        # Run transformer once
+        tokens = _tokenize_spatial(context, a_emb)
+        features = self.transformer(tokens, T)  # (B, T*S, d_model)
+
+        # Per-position z for ODE (channel-last for q/p split)
+        z_tokens = context.reshape(B, T, C, S).permute(0, 1, 3, 2)  # (B,T,S,C)
+        z_flat = z_tokens.reshape(B * T * S, C)
+        feat_flat = features.reshape(B * T * S, -1)
+
+        self.ode_func.set_features(feat_flat)
+        self.ode_func.set_damping(torch.exp(self.log_damping))
+
         t_span = torch.tensor(
             [0.0, self.dt], device=z_flat.device, dtype=z_flat.dtype
         )
         z_next = odeint(
             self.ode_func, z_flat, t_span, method=self.integration_method
         )
-        return z_next[-1].reshape(B, T, C, H, W)
+        z_out = z_next[-1].reshape(B, T, S, C).permute(0, 1, 3, 2)
+        return z_out.reshape(B, T, C, H, W)
 
 
 class SpatialHamiltonianPredictor(nn.Module):
@@ -1951,20 +1823,10 @@ PREDICTOR_REGISTRY = {
     "spatial_ode": SpatialODEPredictor,
     "spatial_newtonian": SpatialNewtonianPredictor,
     "spatial_hamiltonian": SpatialHamiltonianPredictor,
-    # Temporal predictors (backbone-enriched)
-    "temporal_jump_lstm": TemporalSpatialJumpPredictor,
-    "temporal_jump_transformer": TemporalSpatialJumpPredictor,
-    "temporal_jump_conv_attn": TemporalSpatialJumpPredictor,
-    "temporal_lstm_lstm": TemporalSpatialLSTMPredictor,
-    "temporal_lstm_transformer": TemporalSpatialLSTMPredictor,
-    "temporal_lstm_conv_attn": TemporalSpatialLSTMPredictor,
-    "temporal_ode_lstm": TemporalSpatialODEPredictor,
-    "temporal_ode_transformer": TemporalSpatialODEPredictor,
-    "temporal_ode_conv_attn": TemporalSpatialODEPredictor,
-    "temporal_newtonian_lstm": TemporalSpatialNewtonianPredictor,
-    "temporal_newtonian_transformer": TemporalSpatialNewtonianPredictor,
-    "temporal_newtonian_conv_attn": TemporalSpatialNewtonianPredictor,
-    "temporal_hamiltonian_transformer": TemporalSpatialHamiltonianPredictor,
-    "temporal_hamiltonian_lstm": TemporalSpatialHamiltonianPredictor,
-    "temporal_hamiltonian_conv_attn": TemporalSpatialHamiltonianPredictor,
+    # Temporal predictors (block-causal transformer)
+    "temporal_jump": TemporalSpatialJumpPredictor,
+    "temporal_lstm": TemporalSpatialLSTMPredictor,
+    "temporal_ode": TemporalSpatialODEPredictor,
+    "temporal_newtonian": TemporalSpatialNewtonianPredictor,
+    "temporal_hamiltonian": TemporalSpatialHamiltonianPredictor,
 }
