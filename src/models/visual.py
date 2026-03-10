@@ -1,54 +1,39 @@
-"""Beta-VAE visual world model with spatial latent-space predictor."""
+"""Beta-VAE visual world model with flat latent-space predictor."""
 
 import torch
 import torch.nn as nn
 
 
 class VisionEncoder(nn.Module):
-    """Encodes (B, in_channels, 64, 64) images to spatial (B, C, 8, 8) mu and logvar.
-
-    HGN-style 8-layer conv encoder: 3 downsample layers + 5 same-resolution
-    depth layers with LeakyReLU.  Output is spatial — no flattening.
-    When encoder_frames > 1, in_channels = channels * encoder_frames.
-    """
 
     def __init__(self, channels=3, latent_channels=32, encoder_frames=1):
         super().__init__()
         in_channels = channels * encoder_frames
-        self.net = nn.Sequential(
-            # Downsample layers
-            nn.Conv2d(in_channels, 24, 4, 2, 1),   # 64→32, reduced from 32→24 channels
-            nn.BatchNorm2d(24),
+        self.cnn = nn.Sequential(
+            nn.Conv2d(in_channels, 64, 3, 1, 1), # 64×64
             nn.LeakyReLU(0.2),
-            nn.Conv2d(24, 48, 4, 2, 1),            # 32→16, reduced from 64→48 channels
-            nn.BatchNorm2d(48),
+            _ResBlock(64),
+            nn.Conv2d(64, 64, 4, 2, 1),  # 64→32
             nn.LeakyReLU(0.2),
-            # Depth blocks at 16×16
-            nn.Conv2d(48, 48, 3, 1, 1),            # reduced from 64→48 channels
-            nn.BatchNorm2d(48),
+            _ResBlock(64),  # 32×32
+            nn.Conv2d(64, 64, 4, 2, 1),  # 32→16
             nn.LeakyReLU(0.2),
-            nn.Conv2d(48, 48, 3, 1, 1),            # reduced from 64→48 channels
-            nn.BatchNorm2d(48),
+            _ResBlock(64),  # 16×16
+            nn.Conv2d(64, 64, 4, 2, 1),  # 16→8
             nn.LeakyReLU(0.2),
-            # Downsample
-            nn.Conv2d(48, 64, 4, 2, 1),            # 16→8, reduced from 128→64 channels
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2),
-            # Depth blocks at 8×8
-            nn.Conv2d(64, 64, 3, 1, 1),            # reduced from 128→64 channels
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(64, 64, 3, 1, 1),            # reduced from 128→64 channels
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2),
-            # No separate final channel reduce needed - already at 64 channels
+            _ResBlock(64),  # 8×8
         )
-        self.conv_mu = nn.Conv2d(64, latent_channels, 1)
-        self.conv_logvar = nn.Conv2d(64, latent_channels, 1)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(64 * 8 * 8, 256),
+            nn.LeakyReLU(0.2),
+            nn.Linear(256, latent_channels * 2)
+        )
 
     def forward(self, x):
-        h = self.net(x)  # (B, 64, 8, 8)
-        return self.conv_mu(h), self.conv_logvar(h)  # each (B, C, 8, 8)
+        return self.mlp(self.cnn(x).flatten(1)).chunk(
+            2, dim=-1
+        )  # (mu, logvar) each (B, latent_channels)
 
 
 class _ResBlock(nn.Module):
@@ -68,32 +53,31 @@ class _ResBlock(nn.Module):
 
 
 class VisionDecoder(nn.Module):
-    """Decodes spatial (B, C_q, 8, 8) latents to (B, C, 64, 64) images.
+    """Decodes flat (B, D_q) latents to (B, C, 64, 64) images.
 
-    HGN-style progressive decoder: 1×1 conv expand → ResBlock+Upsample ×3 → 64×64.
-    Input is already spatial — no Linear projection needed.
+    Projects flat latent to (B, 64, 8, 8) spatial, then ResBlock+Upsample ×3 → 64×64.
     """
 
     def __init__(self, channels=3, latent_channels=16):
         super().__init__()
-        self.expand = nn.Sequential(
-            nn.Conv2d(latent_channels, 48, 1),  # Reduced from 64→48 channels
+        self.project = nn.Sequential(
+            nn.Linear(latent_channels, 64 * 8 * 8),
             nn.LeakyReLU(0.2),
         )
-        self.net = nn.Sequential(
-            _ResBlock(48),  # Reduced from 64→48 channels
-            nn.Upsample(scale_factor=2, mode='nearest'),   # 8→16
-            _ResBlock(48),  # Reduced from 64→48 channels
-            nn.Upsample(scale_factor=2, mode='nearest'),   # 16→32
-            _ResBlock(48),  # Reduced from 64→48 channels
-            nn.Upsample(scale_factor=2, mode='nearest'),   # 32→64
-            nn.Conv2d(48, channels, 3, 1, 1),  # 48→channels instead of 64→channels
+        self.cnn = nn.Sequential(
+            _ResBlock(64),
+            nn.Upsample(scale_factor=2, mode="nearest"),  # 8→16
+            _ResBlock(64),
+            nn.Upsample(scale_factor=2, mode="nearest"),  # 16→32
+            _ResBlock(64),
+            nn.Upsample(scale_factor=2, mode="nearest"),  # 32→64
+            nn.Conv2d(64, channels, 3, 1, 1),
             nn.Sigmoid(),
         )
 
     def forward(self, z):
-        h = self.expand(z)  # (B, 48, 8, 8)
-        return self.net(h)
+        h = self.project(z).reshape(z.shape[0], 64, 8, 8)
+        return self.cnn(h)
 
 
 def kl_divergence_free_bits(mu, logvar, free_bits=0.5):
@@ -116,23 +100,35 @@ def kl_divergence_free_bits(mu, logvar, free_bits=0.5):
 
 
 class VisualWorldModel(nn.Module):
-    """Beta-VAE encoder/decoder + swappable spatial latent-space predictor.
+    """Beta-VAE encoder/decoder + swappable flat latent-space predictor.
 
-    Latent space is spatial: z ∈ (B, C, sH, sW) structured as z = [z_q, z_p]
-    split on channel dim. z_q (position, first half_channels) drives decoding;
-    z_p (momentum, second half_channels) carries dynamics information.
+    Latent space is flat: z ∈ (B, D) where D = latent_channels * 2 (after
+    state_transform). Structured as z = [z_q, z_p] split on last dim.
+    z_q (position, first latent_channels//2) drives decoding;
+    z_p (momentum, remaining dims) carries dynamics information.
     """
 
-    def __init__(self, predictor, latent_channels=32, beta=1.0, free_bits=0.5,
-                 context_length=3, pred_length=1, predictor_weight=1.0,
-                 latent_pred_weight=1.0, channels=3, velocity_weight=1.0,
-                 observation_dt=0.1, encoder_frames=1, spatial_size=8,
-                 fixed_logvar=False):
+    def __init__(
+        self,
+        predictor,
+        latent_channels=32,
+        beta=1.0,
+        free_bits=0.5,
+        context_length=3,
+        pred_length=1,
+        predictor_weight=1.0,
+        latent_pred_weight=1.0,
+        channels=3,
+        velocity_weight=1.0,
+        observation_dt=0.1,
+        encoder_frames=1,
+        fixed_logvar=False,
+    ):
         super().__init__()
-        assert latent_channels % 2 == 0, "Structured latent requires even latent_channels"
+        assert (
+            latent_channels % 2 == 0
+        ), "Structured latent requires even latent_channels"
         self.latent_channels = latent_channels
-        self.half_channels = latent_channels // 2
-        self.spatial_size = spatial_size
         self.beta = beta
         self.free_bits = free_bits
         self.fixed_logvar = fixed_logvar
@@ -146,27 +142,24 @@ class VisualWorldModel(nn.Module):
         self.channels = channels
 
         self.encoder = VisionEncoder(
-            channels=channels, latent_channels=latent_channels,
+            channels=channels,
+            latent_channels=latent_channels,
             encoder_frames=encoder_frames,
         )
         self.decoder = VisionDecoder(
-            channels=channels, latent_channels=self.half_channels,
+            channels=channels,
+            latent_channels=latent_channels // 2,
         )
         self.predictor = predictor
 
         # Learned map from variational latent z to phase-space state s = (q, p)
-        # 3-layer ConvNet ("encoder transformer" in HGN paper)
-        C = latent_channels
         self.state_transform = nn.Sequential(
-            nn.Conv2d(C, 64, 3, 1, 1),
-            nn.Tanh(),
-            nn.Conv2d(64, 64, 3, 1, 1),
-            nn.Tanh(),
-            nn.Conv2d(64, C, 3, 1, 1),
+            nn.Linear(latent_channels, latent_channels * 4),
+            nn.LeakyReLU(0.2),
+            nn.Linear(latent_channels * 4, latent_channels),
         )
 
     def encode(self, images):
-        """Encode pre-formed input (B, encoder_frames*C, H, W) → spatial (mu, logvar)."""
         mu, logvar = self.encoder(images)
         if self.fixed_logvar:
             logvar = torch.zeros_like(mu)
@@ -178,28 +171,28 @@ class VisualWorldModel(nn.Module):
         Args:
             images: (B, T, C, H, W)
         Returns:
-            mu, logvar: each (B, T - encoder_frames + 1, C_lat, sH, sW)
+            mu, logvar: each (B, T - encoder_frames + 1, latent_channels)
         """
         B, T, C, H, W = images.shape
         K = self.encoder_frames
         n_out = T - K + 1
         windows = torch.cat(
-            [images[:, t:t + K].reshape(B, K * C, H, W).unsqueeze(1)
-             for t in range(n_out)], dim=1,
+            [
+                images[:, t : t + K].reshape(B, K * C, H, W).unsqueeze(1)
+                for t in range(n_out)
+            ],
+            dim=1,
         )
-        flat = windows.reshape(B * n_out, K * C, H, W)
-        mu, logvar = self.encoder(flat)  # each (B*n_out, C_lat, sH, sW)
-        if self.fixed_logvar:
-            logvar = torch.zeros_like(mu)
-        C_lat, sH, sW = mu.shape[1], mu.shape[2], mu.shape[3]
-        return (mu.reshape(B, n_out, C_lat, sH, sW),
-                logvar.reshape(B, n_out, C_lat, sH, sW))
+        catted = windows.reshape(B * n_out, K * C, H, W)
+        mu, logvar = self.encode(catted)  # each (B*n_out, latent_channels)
+        D = mu.shape[-1]
+        return mu.reshape(B, n_out, D), logvar.reshape(B, n_out, D)
 
     def reparameterize(self, mu, logvar):
         """Sample z and map to phase-space state: z ~ N(mu, sigma) → s = f(z).
 
         Args:
-            mu, logvar: (B, C, sH, sW) or (B*T, C, sH, sW) spatial latents.
+            mu, logvar: (B, latent_channels)
         Returns:
             s: same shape, transformed phase-space state.
         """
@@ -209,19 +202,10 @@ class VisualWorldModel(nn.Module):
         return self.state_transform(z)
 
     def to_state(self, z):
-        """Map a spatial latent (e.g. posterior mean) through the state transform."""
         return self.state_transform(z)
 
     def decode(self, z):
-        """Decode from spatial phase-space state. Uses position channels only.
-
-        Args:
-            z: (B, C, sH, sW) spatial latent.
-        Returns:
-            (B, img_C, 64, 64) reconstructed image.
-        """
-        z_q = z[:, :self.half_channels]
-        return self.decoder(z_q)
+        return self.decoder(z[..., : self.latent_channels // 2])  # decode from z_q only
 
     def kl_loss(self, mu, logvar):
         return kl_divergence_free_bits(mu, logvar, self.free_bits)
@@ -233,24 +217,22 @@ class VisualWorldModel(nn.Module):
         yield from self.decoder.parameters()
 
     def autoregressive_rollout(self, z_init, actions, horizon):
-        """Roll out from a single initial state using the predictor.
+        """Roll out from context_length state using the predictor.
 
         Args:
-            z_init: (B, C, sH, sW) initial phase-space state.
+            z_init: (B, latent_channels) initial phase-space state.
             actions: (B, horizon) action indices.
             horizon: number of steps to predict.
 
         Returns:
-            z_all: (B, horizon, C, sH, sW) predicted states.
+            z_all: (B, horizon, latent_channels) predicted states.
         """
         states = []
-        z_t = z_init
+        z_t = z_init.unsqueeze(1)  # (B, 1, latent_channels)
         for t in range(horizon):
-            # Predictor expects (B, 1, C, sH, sW) context, (B, 1) action
-            z_next = self.predictor(z_t.unsqueeze(1), actions[:, t:t + 1])
-            z_next = z_next.squeeze(1)  # (B, C, sH, sW)
-            states.append(z_next)
-            z_t = z_next
+            z_next = self.predictor(z_t[:, -self.context_length:, :], actions[:, t : t + 1])
+            states.append(z_next.squeeze(1))
+            z_t = torch.cat([z_t, z_next], dim=1)
         return torch.stack(states, dim=1)
 
     def predictor_parameters(self):

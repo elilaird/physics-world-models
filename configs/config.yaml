@@ -2,7 +2,7 @@ defaults:
   - env: oscillator_visual
   - dataset: oscillator_visual_testing
   - model: visual_world_model
-  - predictor: spatial_jump
+  - predictor: mlp
   - _self_
 
 seed: 42
