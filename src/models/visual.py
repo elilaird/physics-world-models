@@ -6,7 +6,7 @@ import torch.nn as nn
 
 class VisionEncoder(nn.Module):
 
-    def __init__(self, channels=3, latent_channels=32, encoder_frames=1):
+    def __init__(self, channels=3, latent_channels=32, encoder_frames=1, hidden_channels=512):
         super().__init__()
         in_channels = channels * encoder_frames
         self.cnn = nn.Sequential(
@@ -25,9 +25,9 @@ class VisionEncoder(nn.Module):
         )
 
         self.mlp = nn.Sequential(
-            nn.Linear(64 * 8 * 8, 256),
+            nn.Linear(64 * 8 * 8, hidden_channels),
             nn.LeakyReLU(0.2),
-            nn.Linear(256, latent_channels * 2)
+            nn.Linear(hidden_channels, latent_channels * 2)
         )
 
     def forward(self, x):
@@ -58,11 +58,12 @@ class VisionDecoder(nn.Module):
     Projects flat latent to (B, 64, 8, 8) spatial, then ResBlock+Upsample ×3 → 64×64.
     """
 
-    def __init__(self, channels=3, latent_channels=16):
+    def __init__(self, channels=3, latent_channels=16, hidden_channels=512):
         super().__init__()
         self.project = nn.Sequential(
-            nn.Linear(latent_channels, 64 * 8 * 8),
+            nn.Linear(latent_channels, hidden_channels),
             nn.LeakyReLU(0.2),
+            nn.Linear(hidden_channels, 64 * 8 * 8),
         )
         self.cnn = nn.Sequential(
             _ResBlock(64),
@@ -112,6 +113,7 @@ class VisualWorldModel(nn.Module):
         self,
         predictor,
         latent_channels=32,
+        hidden_channels=512,
         beta=1.0,
         free_bits=0.5,
         context_length=3,
@@ -129,6 +131,7 @@ class VisualWorldModel(nn.Module):
             latent_channels % 2 == 0
         ), "Structured latent requires even latent_channels"
         self.latent_channels = latent_channels
+        self.hidden_channels = hidden_channels
         self.beta = beta
         self.free_bits = free_bits
         self.fixed_logvar = fixed_logvar
@@ -145,18 +148,20 @@ class VisualWorldModel(nn.Module):
             channels=channels,
             latent_channels=latent_channels,
             encoder_frames=encoder_frames,
+            hidden_channels=hidden_channels,
         )
         self.decoder = VisionDecoder(
             channels=channels,
             latent_channels=latent_channels // 2,
+            hidden_channels=hidden_channels,
         )
         self.predictor = predictor
 
         # Learned map from variational latent z to phase-space state s = (q, p)
         self.state_transform = nn.Sequential(
-            nn.Linear(latent_channels, latent_channels * 4),
+            nn.Linear(latent_channels, hidden_channels),
             nn.LeakyReLU(0.2),
-            nn.Linear(latent_channels * 4, latent_channels),
+            nn.Linear(hidden_channels, latent_channels),
         )
 
     def encode(self, images):
