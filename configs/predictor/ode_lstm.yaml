@@ -1,0 +1,10 @@
+_target_: src.models.predictors.ODEPredictor
+name: ode_lstm
+latent_dim: ${model.latent_channels}
+action_dim: ${env.action_dim}
+action_embedding_dim: ${model.action_embedding_dim}
+hidden_dim: 256
+dt: ${dataset.dt}
+integration_method: rk4
+backbone: lstm
+backbone_layers: 2
