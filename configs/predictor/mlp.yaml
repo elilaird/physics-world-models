@@ -1,0 +1,6 @@
+_target_: src.models.predictors.MLPPredictor
+name: mlp
+latent_dim: ${model.latent_channels}
+action_dim: ${env.action_dim}
+action_embedding_dim: ${model.action_embedding_dim}
+hidden_dim: 256

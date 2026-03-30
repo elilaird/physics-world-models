@@ -1,0 +1,7 @@
+_target_: src.models.predictors.LSTMPredictor
+name: lstm
+latent_dim: ${model.latent_channels}
+action_dim: ${env.action_dim}
+action_embedding_dim: ${model.action_embedding_dim}
+hidden_dim: 256
+num_layers: 2

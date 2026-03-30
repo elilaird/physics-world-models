@@ -1,17 +1,17 @@
 """
-HGN-faithful visual world model training script with spatial latents.
+Visual world model training script with flat latents.
 
-Implements the Hamiltonian Generative Network training regime:
-  1. Encoder sees first K frames → single initial state z₀ ∈ (B, C, sH, sW)
-  2. Predictor rolls out z₀ → z₁ → ... → z_T autoregressively
-  3. Decoder reconstructs EVERY frame from rolled-out states
+Implements end-to-end training:
+  1. Encoder sees overlapping K-frame windows → flat latent states z ∈ (B, D)
+  2. Predictor takes context window of states and predicts next states
+  3. Decoder reconstructs frames from predicted states
   4. Single ELBO loss: Σ recon(xₜ, decode(qₜ)) + β·KL
 
 Usage:
     python train_visual.py
-    python train_visual.py predictor=spatial_hamiltonian
-    python train_visual.py predictor=spatial_jump training.lr=1.5e-4
-    python train_visual.py training.training_mode=detached  # fallback to detached mode
+    python train_visual.py predictor=mlp
+    python train_visual.py predictor=lstm training.lr=1.5e-4
+    python train_visual.py training.training_mode=detached
 """
 
 import logging
@@ -47,29 +47,6 @@ def batch_to_device(batch, device):
     return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
 
-def _merge_actions(actions, K):
-    """Create overlapping action windows mirroring frame concatenation.
-
-    For K=2 encoder_frames, each state is encoded from frames (t, t+1).
-    The corresponding merged action is (action[t], action[t+1]), giving
-    the K actions that produced the K frames in that state's window.
-
-    Args:
-        actions: (B, T) discrete action indices.
-        K: number of frames per state (encoder_frames).
-
-    Returns:
-        If K == 1: actions unchanged, (B, T).
-        If K > 1: (B, T - K + 1, K) merged action windows.
-    """
-    if K <= 1:
-        return actions
-    _, T = actions.shape
-    n_out = T - K + 1
-    # Stack overlapping windows: each (B, K) → (B, n_out, K)
-    return torch.stack([actions[:, t:t + K] for t in range(n_out)], dim=1)
-
-
 def build_env(cfg):
     env_cls = ENV_REGISTRY[cfg.env.name]
     params = OmegaConf.to_container(cfg.env.params, resolve=True)
@@ -77,7 +54,8 @@ def build_env(cfg):
 
 
 def build_predictor(cfg):
-    return hydra.utils.instantiate(cfg.predictor)
+    state_dim = cfg.model.latent_channels
+    return hydra.utils.instantiate(cfg.predictor, latent_dim=state_dim)
 
 
 def build_model(cfg):
@@ -96,7 +74,6 @@ def build_model(cfg):
         velocity_weight=cfg.model.velocity_weight,
         observation_dt=cfg.model.observation_dt,
         encoder_frames=cfg.model.get("encoder_frames", 1),
-        spatial_size=cfg.model.get("spatial_size", 8),
     )
 
 
@@ -107,11 +84,10 @@ def build_model(cfg):
 def hgn_train_step(model, batch, optimizer):
     """HGN training step with sliding-window predictor.
 
-    Encode all overlapping K-frame windows → sequence of states →
+    Encode all overlapping K-frame windows → sequence of flat states →
     slide a window of (context_length + pred_length) states →
     predictor takes states[:-1] and predicts states[1:] →
-    decode *predicted* states for recon loss so decoder gradients flow
-    through the predictor, making learned dynamics essential for reconstruction.
+    decode *predicted* states for recon loss.
     """
     images = batch["images"]   # (B, T+1, C, H, W)
     actions = batch["actions"]  # (B, T)
@@ -120,19 +96,20 @@ def hgn_train_step(model, batch, optimizer):
     ctx_len = model.context_length
     pred_len = model.pred_length
 
-    # 1. Encode all frames via overlapping K-frame windows → state per pair
-    mu_all, logvar_all = model.encode_sequence(images)  # (B, N_lat, C_lat, sH, sW)
-    N_lat = mu_all.shape[1]  # N - K + 1
-    C_lat, sH, sW = mu_all.shape[2], mu_all.shape[3], mu_all.shape[4]
+    # 1. Encode all frames via overlapping K-frame windows → flat latents
+    mu_all, logvar_all = model.encode_sequence(images)  # each (B, N_lat, D_enc)
+    N_lat = mu_all.shape[1]
+    D_enc = mu_all.shape[2]
 
-    # Reparameterize all encoded states
-    mu_flat = mu_all.reshape(B * N_lat, C_lat, sH, sW)
-    logvar_flat = logvar_all.reshape(B * N_lat, C_lat, sH, sW)
-    all_states = model.reparameterize(mu_flat, logvar_flat).reshape(B, N_lat, C_lat, sH, sW)
+    # Reparameterize all encoded states → phase-space states
+    mu_flat = mu_all.reshape(B * N_lat, D_enc)
+    logvar_flat = logvar_all.reshape(B * N_lat, D_enc)
+    all_states = model.reparameterize(mu_flat, logvar_flat)  # (B*N_lat, D_state)
+    D_state = all_states.shape[-1]
+    all_states = all_states.reshape(B, N_lat, D_state)
 
-    # Merge actions into overlapping K-windows mirroring frame concatenation
-    # merged_actions: (B, N_lat-1, K) — one per state-to-state transition
-    merged_actions = _merge_actions(actions, K)
+    # Transition actions: for encoder_frames=K, action[K-1+i] drives latent i → i+1
+    transition_actions = actions[:, K - 1:]  # (B, N_lat - 1)
 
     # 2. Sliding window: predict → decode predicted states → recon loss
     window_size = ctx_len + pred_len
@@ -144,24 +121,23 @@ def hgn_train_step(model, batch, optimizer):
     for w in range(num_windows):
         start = w * step_size
         end = min(start + window_size, N_lat)
-        w_states = all_states[:, start:end]       # (B, w_len, C_lat, sH, sW)
+        w_states = all_states[:, start:end]       # (B, w_len, D_state)
         w_len = w_states.shape[1]
         n_pred = w_len - 1
 
         # Predictor: input states[:-1] → predict states[1:]
-        pred_input = w_states[:, :-1]              # (B, n_pred, ...)
-        w_actions = merged_actions[:, start:start + n_pred].long()
-        pred_z = model.predictor(pred_input, w_actions)  # (B, n_pred, C_lat, sH, sW)
+        pred_input = w_states[:, :-1]              # (B, n_pred, D_state)
+        w_actions = transition_actions[:, start:start + n_pred].long()
+        pred_z = model.predictor(pred_input, w_actions)  # (B, n_pred, D_state)
 
         # Decode predicted states and compare to GT frames
-        pred_decoded = model.decode(pred_z.reshape(B * n_pred, C_lat, sH, sW))
+        pred_decoded = model.decode(pred_z.reshape(B * n_pred, D_state))
         gt_start = K - 1 + start + 1
         gt_frames = images[:, gt_start:gt_start + n_pred].reshape(B * n_pred, C, H, W)
         recon_loss = recon_loss + ((pred_decoded - gt_frames) ** 2).mean() / num_windows
 
-        # Latent prediction loss: MSE between predicted and GT encoded states
-        # Detach targets so encoder doesn't collapse to ease prediction
-        target_states = w_states[:, 1:].detach()   # (B, n_pred, C_lat, sH, sW)
+        # Latent prediction loss
+        target_states = w_states[:, 1:].detach()
         latent_pred_loss = latent_pred_loss + ((pred_z - target_states) ** 2).mean() / num_windows
 
     # 3. KL loss (over all encoded states)
@@ -202,21 +178,20 @@ def hgn_eval_step(model, batch):
     ctx_len = model.context_length
     pred_len = model.pred_length
 
-    # Encode all overlapping K-frame windows → posterior mean states
-    mu_all, logvar_all = model.encode_sequence(images)  # (B, N_lat, C_lat, sH, sW)
+    mu_all, logvar_all = model.encode_sequence(images)  # each (B, N_lat, D_enc)
     N_lat = mu_all.shape[1]
-    C_lat, sH, sW = mu_all.shape[2], mu_all.shape[3], mu_all.shape[4]
+    D_enc = mu_all.shape[2]
 
-    mu_flat = mu_all.reshape(B * N_lat, C_lat, sH, sW)
-    logvar_flat = logvar_all.reshape(B * N_lat, C_lat, sH, sW)
-    all_states = model.to_state(mu_flat).reshape(B, N_lat, C_lat, sH, sW)
+    mu_flat = mu_all.reshape(B * N_lat, D_enc)
+    logvar_flat = logvar_all.reshape(B * N_lat, D_enc)
+    all_states = model.to_state(mu_flat)  # (B*N_lat, D_state)
+    D_state = all_states.shape[-1]
+    all_states = all_states.reshape(B, N_lat, D_state)
 
     kl_loss = model.kl_loss(mu_flat, logvar_flat).item()
 
-    # Merge actions into overlapping K-windows
-    merged_actions = _merge_actions(actions, K)
+    transition_actions = actions[:, K - 1:]
 
-    # Sliding window: predict → decode predicted states → recon loss
     window_size = ctx_len + pred_len
     step_size = pred_len
     num_windows = max(1, 1 + (N_lat - window_size) // step_size)
@@ -231,10 +206,10 @@ def hgn_eval_step(model, batch):
         n_pred = w_len - 1
 
         pred_input = w_states[:, :-1]
-        w_actions = merged_actions[:, start:start + n_pred].long()
+        w_actions = transition_actions[:, start:start + n_pred].long()
         pred_z = model.predictor(pred_input, w_actions)
 
-        pred_decoded = model.decode(pred_z.reshape(B * n_pred, C_lat, sH, sW))
+        pred_decoded = model.decode(pred_z.reshape(B * n_pred, D_state))
         gt_start = K - 1 + start + 1
         gt_frames = images[:, gt_start:gt_start + n_pred].reshape(B * n_pred, C, H, W)
         recon_loss += ((pred_decoded - gt_frames) ** 2).mean().item() / num_windows
@@ -261,16 +236,11 @@ def hgn_eval_step(model, batch):
 
 
 # ---------------------------------------------------------------------------
-# Detached training step (existing regime, for comparison)
+# Detached training step
 # ---------------------------------------------------------------------------
 
 def detached_train_step(model, batch, optimizers):
-    """Detached training: separate encoder recon + predictor losses.
-
-    Encodes all frames upfront, decodes for recon loss, then slides a window
-    of (context_length + pred_length) states for the predictor. Predictor
-    gradients are detached from the encoder.
-    """
+    """Detached training: separate encoder recon + predictor losses."""
     images = batch["images"]
     actions = batch["actions"]
 
@@ -282,14 +252,15 @@ def detached_train_step(model, batch, optimizers):
     for opt in optimizers.values():
         opt.zero_grad()
 
-    # 1. Encode all frames via overlapping K-frame windows
-    mu_all, logvar_all = model.encode_sequence(images)  # (B, N_lat, C_lat, sH, sW)
+    # 1. Encode all frames
+    mu_all, logvar_all = model.encode_sequence(images)  # each (B, N_lat, D_enc)
     N_lat = mu_all.shape[1]
-    C_lat, sH, sW = mu_all.shape[2], mu_all.shape[3], mu_all.shape[4]
+    D_enc = mu_all.shape[2]
 
-    mu_flat = mu_all.reshape(B * N_lat, C_lat, sH, sW)
-    logvar_flat = logvar_all.reshape(B * N_lat, C_lat, sH, sW)
-    z = model.reparameterize(mu_flat, logvar_flat)
+    mu_flat = mu_all.reshape(B * N_lat, D_enc)
+    logvar_flat = logvar_all.reshape(B * N_lat, D_enc)
+    z = model.reparameterize(mu_flat, logvar_flat)  # (B*N_lat, D_state)
+    D_state = z.shape[-1]
 
     # 2. Decode all encoded states for reconstruction loss
     recon_targets = images[:, K - 1:].reshape(B * N_lat, C, H, W)
@@ -298,8 +269,8 @@ def detached_train_step(model, batch, optimizers):
     kl_loss = model.kl_loss(mu_flat, logvar_flat)
 
     # 3. Sliding window predictor loss (detached from encoder)
-    all_states = z.detach().reshape(B, N_lat, C_lat, sH, sW)
-    merged_actions = _merge_actions(actions, K)
+    all_states = z.detach().reshape(B, N_lat, D_state)
+    transition_actions = actions[:, K - 1:]
     window_size = ctx_len + pred_len
     step_size = pred_len
     num_windows = max(1, 1 + (N_lat - window_size) // step_size)
@@ -313,7 +284,7 @@ def detached_train_step(model, batch, optimizers):
 
         pred_input = w_states[:, :-1]
         targets = w_states[:, 1:]
-        w_actions = merged_actions[:, start:start + n_pred].long()
+        w_actions = transition_actions[:, start:start + n_pred].long()
         pred_z = model.predictor(pred_input, w_actions)
         pred_loss = pred_loss + ((pred_z - targets) ** 2).mean() / num_windows
 
@@ -342,24 +313,22 @@ def detached_eval_step(model, batch):
     ctx_len = model.context_length
     pred_len = model.pred_length
 
-    # Encode all frames → posterior mean states
     mu_all, logvar_all = model.encode_sequence(images)
     N_lat = mu_all.shape[1]
-    C_lat, sH, sW = mu_all.shape[2], mu_all.shape[3], mu_all.shape[4]
+    D_enc = mu_all.shape[2]
 
-    mu_flat = mu_all.reshape(B * N_lat, C_lat, sH, sW)
-    logvar_flat = logvar_all.reshape(B * N_lat, C_lat, sH, sW)
+    mu_flat = mu_all.reshape(B * N_lat, D_enc)
+    logvar_flat = logvar_all.reshape(B * N_lat, D_enc)
     z = model.to_state(mu_flat)
+    D_state = z.shape[-1]
 
-    # Decode all for reconstruction loss
     recon_targets = images[:, K - 1:].reshape(B * N_lat, C, H, W)
     recon = model.decode(z)
     recon_loss = ((recon - recon_targets) ** 2).mean().item()
     kl_loss = model.kl_loss(mu_flat, logvar_flat).item()
 
-    # Sliding window predictor loss
-    all_states = z.reshape(B, N_lat, C_lat, sH, sW)
-    merged_actions = _merge_actions(actions, K)
+    all_states = z.reshape(B, N_lat, D_state)
+    transition_actions = actions[:, K - 1:]
     window_size = ctx_len + pred_len
     step_size = pred_len
     num_windows = max(1, 1 + (N_lat - window_size) // step_size)
@@ -373,7 +342,7 @@ def detached_eval_step(model, batch):
 
         pred_input = w_states[:, :-1]
         targets = w_states[:, 1:]
-        w_actions = merged_actions[:, start:start + n_pred].long()
+        w_actions = transition_actions[:, start:start + n_pred].long()
         pred_z = model.predictor(pred_input, w_actions)
         pred_loss += ((pred_z - targets) ** 2).mean().item() / num_windows
 
@@ -392,25 +361,19 @@ def detached_eval_step(model, batch):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def make_hgn_recon_grid(model, batch, n_samples=4):
-    """Build an encode→decode reconstruction grid.
-
-    Shows for each sample:
-      Row 1: ground truth frames (from K-1 onward)
-      Row 2: decoded frames from encoder posterior mean
-      Row 3: absolute error
-    """
+def make_recon_grid(model, batch, n_samples=4):
+    """Build an encode→decode reconstruction grid."""
     images = batch["images"]
     B, _, C, H, W = images.shape
     K = model.encoder_frames
     n = min(n_samples, B)
 
-    # Encode all overlapping K-frame windows → posterior mean states → decode
-    mu_all, _ = model.encode_sequence(images[:n])  # (n, N_lat, C_lat, sH, sW)
+    mu_all, _ = model.encode_sequence(images[:n])  # (n, N_lat, D_enc)
     N_lat = mu_all.shape[1]
-    C_lat, sH, sW = mu_all.shape[2], mu_all.shape[3], mu_all.shape[4]
+    D_enc = mu_all.shape[2]
 
-    all_states = model.to_state(mu_all.reshape(n * N_lat, C_lat, sH, sW))
+    all_states = model.to_state(mu_all.reshape(n * N_lat, D_enc))  # (n*N_lat, D_state)
+    D_state = all_states.shape[-1]
     recon = model.decode(all_states).reshape(n, N_lat, C, H, W)
 
     gt_frames = images[:n, K - 1:]  # (n, N_lat, C, H, W)
@@ -454,10 +417,9 @@ def compute_rollout_metrics(model, batch, n_samples=4):
     # Build rollout grid
     n_show = min(n_samples, B)
     ctx_images = images[:n_show, :ctx_len + K - 1]
-    ctx_mu, _ = model.encode_sequence(ctx_images)
-    # ctx_mu: (n_show, ctx_len, C_lat, sH, sW)
-    C_lat, sH, sW = ctx_mu.shape[2], ctx_mu.shape[3], ctx_mu.shape[4]
-    ctx_s = model.to_state(ctx_mu.reshape(n_show * ctx_len, C_lat, sH, sW))
+    ctx_mu, _ = model.encode_sequence(ctx_images)  # (n_show, ctx_len, D_enc)
+    D_enc = ctx_mu.shape[2]
+    ctx_s = model.to_state(ctx_mu.reshape(n_show * ctx_len, D_enc))
     ctx_recon = model.decode(ctx_s).reshape(n_show, ctx_len, C, H, W)
 
     rows = []
@@ -554,7 +516,6 @@ def main(cfg: DictConfig):
 
     # Optimizer setup
     if is_hgn:
-        # Single optimizer for all parameters (HGN-style)
         lr = cfg.training.get("lr", 1.5e-4)
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = optim.Adam(trainable_params, lr=lr)
@@ -563,7 +524,6 @@ def main(cfg: DictConfig):
         if _has_energy(model.predictor):
             loss_keys.extend(["energy_mean", "energy_std", "energy_time_var"])
     else:
-        # Separate optimizers for detached mode
         optimizer = None
         optimizers = {}
         if cfg.training.get("train_encoder", True):
@@ -651,9 +611,8 @@ def main(cfg: DictConfig):
                 wandb_log[f"train/{k}"] = train_avg[k]
                 wandb_log[f"val/{k}"] = val_avg[k]
 
-            # Both HGN and detached modes use spatial latents, so use make_hgn_recon_grid
-            recon_img = make_hgn_recon_grid(model, first_train_batch, n_log)
-            val_recon_img = make_hgn_recon_grid(model, batch, n_log)
+            recon_img = make_recon_grid(model, first_train_batch, n_log)
+            val_recon_img = make_recon_grid(model, batch, n_log)
 
             if recon_img is not None:
                 wandb_log["train/reconstructions"] = recon_img
@@ -707,8 +666,7 @@ def main(cfg: DictConfig):
             f"Latent MSE: {test_rollout['latent_mse']:.6f}"
         )
 
-    # Both HGN and detached modes use spatial latents, so use spatial-latent-aware visualization
-    test_img = make_hgn_recon_grid(model, batch, n_log)
+    test_img = make_recon_grid(model, batch, n_log)
 
     if cfg.wandb.enabled:
         wandb.log({"test/total_loss": avg_test})
