@@ -376,6 +376,9 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
     2. Gradients flow through encoder targets (no .detach())
     3. SIGReg prevents collapse instead of KL divergence
     4. Optionally deterministic encoding (no reparameterization)
+    5. Decoder trained as a detached probe (decodes encoded latents, not predicted)
+       so dynamics can be visually verified without affecting the JEPA objective.
+       In hybrid mode, recon grads flow into encoder (but never into predictor).
     """
     images = batch["images"]   # (B, T+1, C, H, W)
     actions = batch["actions"]  # (B, T)
@@ -414,7 +417,6 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
     num_windows = max(1, 1 + (N_lat - window_size) // step_size)
 
     latent_pred_loss = torch.tensor(0.0, device=images.device)
-    recon_loss = torch.tensor(0.0, device=images.device)
 
     for w in range(num_windows):
         start = w * step_size
@@ -430,24 +432,27 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
         target_states = w_states[:, 1:]
         latent_pred_loss = latent_pred_loss + ((pred_z - target_states) ** 2).mean() / num_windows
 
-        # Optional reconstruction for hybrid mode
-        if hybrid_recon_weight > 0:
-            pred_decoded = model.decode(pred_z.reshape(B * n_pred, D_state))
-            gt_start = K - 1 + start + 1
-            gt_frames = images[:, gt_start:gt_start + n_pred].reshape(B * n_pred, C, H, W)
-            recon_loss = recon_loss + ((pred_decoded - gt_frames) ** 2).mean() / num_windows
-
-    # 4. Total loss: prediction + SIGReg (+ optional reconstruction)
-    loss = latent_pred_loss + sigreg_lambda * sigreg_loss
+    # 4. Decoder probe: train decoder on encoded latents (detached) so it can
+    #    visualize the latent space without affecting the JEPA objective.
+    #    In hybrid mode, recon grads flow through encoder + decoder (non-detached).
+    recon_targets = images[:, K - 1:].reshape(B * N_lat, C, H, W)
     if hybrid_recon_weight > 0:
-        loss = loss + hybrid_recon_weight * recon_loss
+        # Hybrid: reconstruction loss flows into encoder + decoder
+        recon = model.decode(all_states.reshape(B * N_lat, D_state))
+        recon_loss = ((recon - recon_targets) ** 2).mean()
+        loss = latent_pred_loss + sigreg_lambda * sigreg_loss + hybrid_recon_weight * recon_loss
+    else:
+        # Pure JEPA: decoder is a probe only — detach so it doesn't affect encoder/predictor
+        recon = model.decode(all_states.detach().reshape(B * N_lat, D_state))
+        recon_loss = ((recon - recon_targets) ** 2).mean()
+        loss = latent_pred_loss + sigreg_lambda * sigreg_loss + recon_loss
 
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
     losses = {
-        "recon_loss": recon_loss.item() if hybrid_recon_weight > 0 else 0.0,
+        "recon_loss": recon_loss.item(),
         "kl_loss": 0.0,
         "latent_pred_loss": latent_pred_loss.item(),
         "sigreg_loss": sigreg_loss.item(),
