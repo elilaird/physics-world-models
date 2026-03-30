@@ -107,6 +107,11 @@ class VisualWorldModel(nn.Module):
     state_transform). Structured as z = [z_q, z_p] split on last dim.
     z_q (position, first latent_channels//2) drives decoding;
     z_p (momentum, remaining dims) carries dynamics information.
+
+    Supports three training modes:
+    - "hgn": Beta-VAE ELBO (reconstruction + KL + latent prediction)
+    - "jepa": LeWM-style JEPA (latent prediction + SIGReg, no reconstruction)
+    - "hybrid": JEPA core + lightweight reconstruction supervision
     """
 
     def __init__(
@@ -125,6 +130,7 @@ class VisualWorldModel(nn.Module):
         observation_dt=0.1,
         encoder_frames=1,
         fixed_logvar=False,
+        training_mode="hgn",
     ):
         super().__init__()
         assert (
@@ -143,6 +149,7 @@ class VisualWorldModel(nn.Module):
         self.observation_dt = observation_dt
         self.encoder_frames = encoder_frames
         self.channels = channels
+        self.training_mode = training_mode
 
         self.encoder = VisionEncoder(
             channels=channels,
@@ -163,6 +170,16 @@ class VisualWorldModel(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Linear(hidden_channels, latent_channels),
         )
+
+        # BatchNorm projector for JEPA/hybrid mode (prevents LayerNorm from
+        # fighting SIGReg's Gaussian objective — see LeWM paper Sec 3.1)
+        if training_mode in ("jepa", "hybrid"):
+            self.encoder_projector = nn.Sequential(
+                nn.Linear(latent_channels, latent_channels),
+                nn.BatchNorm1d(latent_channels),
+            )
+        else:
+            self.encoder_projector = nn.Identity()
 
     def encode(self, images):
         mu, logvar = self.encoder(images)
@@ -190,6 +207,11 @@ class VisualWorldModel(nn.Module):
         )
         catted = windows.reshape(B * n_out, K * C, H, W)
         mu, logvar = self.encode(catted)  # each (B*n_out, latent_channels)
+
+        # Apply BatchNorm projector in JEPA/hybrid mode
+        if self.training_mode in ("jepa", "hybrid"):
+            mu = self.encoder_projector(mu)
+
         D = mu.shape[-1]
         return mu.reshape(B, n_out, D), logvar.reshape(B, n_out, D)
 
@@ -213,6 +235,9 @@ class VisualWorldModel(nn.Module):
         return self.decoder(z[..., : self.latent_channels // 2])  # decode from z_q only
 
     def kl_loss(self, mu, logvar):
+        if self.training_mode in ("jepa", "hybrid"):
+            # No KL in JEPA mode — SIGReg handles regularization
+            return torch.tensor(0.0, device=mu.device)
         return kl_divergence_free_bits(mu, logvar, self.free_bits)
 
     def encoder_parameters(self):

@@ -171,6 +171,8 @@ HGN-inspired architecture using **spatial latents** — the encoder outputs `(B,
 **Training modes** (`train_visual.py`):
 - **HGN mode** (default, `training.training_mode=hgn`): Encode first K frames → single z₀ → autoregressive rollout → decode ALL frames → single ELBO. End-to-end gradients. Single optimizer.
 - **Detached mode** (`training.training_mode=detached`): Per-frame encoding with detached predictor loss. Separate encoder/decoder/predictor optimizers.
+- **JEPA mode** (`training.training_mode=jepa`): LeWorldModel-style JEPA. Loss = latent prediction + SIGReg (no reconstruction, no KL). Gradients flow through encoder targets (no `.detach()`). SIGReg prevents collapse. Single optimizer.
+- **Hybrid mode** (`training.training_mode=hybrid`): JEPA core + lightweight reconstruction supervision. Combines latent prediction + SIGReg + weighted reconstruction loss. Good for comparing against HGN on the same recon metric.
 
 **Reconstruction loss**: L2 (MSE), matching the HGN paper. Changed from L1 in the flat-latent version.
 
@@ -205,9 +207,51 @@ python train_visual.py \
 # Or fine-tune all components together from a pretrained checkpoint
 python train_visual.py pretrained_checkpoint=/path/to/best_model.pt
 
+# --- LeWorldModel / JEPA training ---
+
+# Train with pure JEPA mode (no reconstruction loss, SIGReg anti-collapse)
+python train_visual.py training.training_mode=jepa
+python train_visual.py training.training_mode=jepa predictor=hamiltonian_transformer
+
+# Train with hybrid mode (JEPA + lightweight reconstruction)
+python train_visual.py training.training_mode=hybrid training.hybrid_recon_weight=0.1
+
+# Tune SIGReg lambda (the key JEPA hyperparameter)
+python train_visual.py training.training_mode=jepa training.sigreg_lambda=0.05
+python train_visual.py --multirun training.training_mode=jepa training.sigreg_lambda=0.01,0.05,0.1,0.5,1.0
+
+# Deterministic encoder (skip reparameterization, use mu directly)
+python train_visual.py training.training_mode=jepa training.deterministic_encoder=true
+
+# Sweep predictors under JEPA mode
+python train_visual.py --multirun training.training_mode=jepa predictor=mlp,lstm,transformer,ode,newtonian,hamiltonian
+python train_visual.py --multirun training.training_mode=jepa predictor=hamiltonian,hamiltonian_lstm,hamiltonian_transformer
+
 # Evaluate a visual checkpoint
 python evaluate.py checkpoint=path/to/best_model.pt eval.n_rollouts=8
 ```
+
+### LeWorldModel / JEPA (`src/models/sigreg.py`, `train_visual.py`)
+
+Implements the LeWorldModel (Maes et al., 2026) approach: a Joint-Embedding Predictive Architecture (JEPA) that replaces the beta-VAE ELBO with latent prediction + SIGReg anti-collapse regularization.
+
+**Key idea**: Instead of training the encoder for reconstruction (beta-VAE), train it end-to-end with the predictor so the encoder learns representations that are *optimally predictable* by the physics-informed predictor. SIGReg provably prevents representation collapse without stop-gradient or EMA.
+
+**SIGReg** (`src/models/sigreg.py`): Sketched-Isotropic-Gaussian Regularizer based on the Cramer-Wold theorem. Projects embeddings onto M random unit-norm directions, applies the Epps-Pulley univariate normality test to each, and averages. Zero loss means the embeddings are perfectly isotropic Gaussian.
+
+**Key difference from HGN**: In HGN mode, prediction targets are `.detach()`ed — the encoder doesn't receive gradients from the predictor. In JEPA mode, targets are NOT detached: encoder and predictor co-adapt. SIGReg prevents the trivial collapse solution.
+
+**JEPA config parameters** (in `configs/config.yaml` under `training:`):
+- `training_mode: "jepa"` or `"hybrid"` — activates JEPA pipeline
+- `sigreg_lambda: 0.1` — SIGReg weight (THE key hyperparameter, sensitive to tuning)
+- `sigreg_projections: 1024` — random projection count (insensitive)
+- `sigreg_knots: 50` — Epps-Pulley quadrature points (insensitive)
+- `deterministic_encoder: false` — if true, skip reparameterization
+- `hybrid_recon_weight: 0.0` — reconstruction weight in hybrid mode
+
+**BatchNorm projector**: JEPA/hybrid modes add a `Linear + BatchNorm1d` projector after the encoder to prevent internal normalization from fighting SIGReg's Gaussian objective (LeWM paper Sec 3.1).
+
+**Reference paper**: `references/LeWorldModel- Stable End-to-End Joint-Embedding Predictive Architecture from Pixels.pdf`
 
 ### Legacy systems (kept for reference)
 - `models.py`, `envs.py`, `datasets.py` — original flat-file versions, superseded by `src/`

@@ -31,6 +31,7 @@ import wandb
 
 from src.envs import ENV_REGISTRY
 from src.models import MODEL_REGISTRY
+from src.models.sigreg import SIGReg
 from src.data.precomputed import PrecomputedDataset
 from src.eval.rollout import visual_open_loop_rollout, visual_dt_generalization_test
 from src.eval.metrics import compute_visual_metrics
@@ -41,6 +42,11 @@ log = logging.getLogger(__name__)
 def _has_energy(predictor):
     """Check if predictor supports energy monitoring."""
     return hasattr(predictor, 'energy') and callable(predictor.energy)
+
+
+def _has_nan(losses):
+    """Check if any loss value is NaN."""
+    return any(np.isnan(v) for v in losses.values() if isinstance(v, float))
 
 
 def batch_to_device(batch, device):
@@ -61,6 +67,7 @@ def build_predictor(cfg):
 def build_model(cfg):
     model_cls = MODEL_REGISTRY[cfg.model.name]
     predictor = build_predictor(cfg)
+    training_mode = cfg.training.get("training_mode", "hgn")
     return model_cls(
         predictor=predictor,
         latent_channels=cfg.model.latent_channels,
@@ -74,6 +81,7 @@ def build_model(cfg):
         velocity_weight=cfg.model.velocity_weight,
         observation_dt=cfg.model.observation_dt,
         encoder_frames=cfg.model.get("encoder_frames", 1),
+        training_mode=training_mode,
     )
 
 
@@ -357,6 +365,177 @@ def detached_eval_step(model, batch):
 
 
 # ---------------------------------------------------------------------------
+# JEPA training step (LeWorldModel)
+# ---------------------------------------------------------------------------
+
+def jepa_train_step(model, batch, optimizer, sigreg, cfg):
+    """LeWM-style JEPA training step.
+
+    Key differences from HGN:
+    1. Loss = latent_prediction + SIGReg (no reconstruction by default, no KL)
+    2. Gradients flow through encoder targets (no .detach())
+    3. SIGReg prevents collapse instead of KL divergence
+    4. Optionally deterministic encoding (no reparameterization)
+    """
+    images = batch["images"]   # (B, T+1, C, H, W)
+    actions = batch["actions"]  # (B, T)
+    B, _, C, H, W = images.shape
+    K = model.encoder_frames
+    ctx_len = model.context_length
+    pred_len = model.pred_length
+
+    deterministic = cfg.training.get("deterministic_encoder", False)
+    hybrid_recon_weight = cfg.training.get("hybrid_recon_weight", 0.0)
+    sigreg_lambda = cfg.training.get("sigreg_lambda", 0.1)
+
+    # 1. Encode all frames
+    mu_all, logvar_all = model.encode_sequence(images)  # each (B, N_lat, D_enc)
+    N_lat = mu_all.shape[1]
+    D_enc = mu_all.shape[2]
+
+    # Deterministic or stochastic encoding
+    mu_flat = mu_all.reshape(B * N_lat, D_enc)
+    if deterministic:
+        all_states = model.to_state(mu_flat)
+    else:
+        logvar_flat = logvar_all.reshape(B * N_lat, D_enc)
+        all_states = model.reparameterize(mu_flat, logvar_flat)
+
+    D_state = all_states.shape[-1]
+    all_states = all_states.reshape(B, N_lat, D_state)
+
+    # 2. SIGReg on encoded embeddings (prevents collapse)
+    sigreg_loss = sigreg(all_states.reshape(-1, D_state))
+
+    # 3. Sliding window prediction
+    transition_actions = actions[:, K - 1:]  # (B, N_lat - 1)
+    window_size = ctx_len + pred_len
+    step_size = pred_len
+    num_windows = max(1, 1 + (N_lat - window_size) // step_size)
+
+    latent_pred_loss = torch.tensor(0.0, device=images.device)
+    recon_loss = torch.tensor(0.0, device=images.device)
+
+    for w in range(num_windows):
+        start = w * step_size
+        end = min(start + window_size, N_lat)
+        w_states = all_states[:, start:end]
+        n_pred = w_states.shape[1] - 1
+
+        pred_input = w_states[:, :-1]
+        w_actions = transition_actions[:, start:start + n_pred].long()
+        pred_z = model.predictor(pred_input, w_actions)
+
+        # JEPA: NO .detach() on targets — gradients flow through encoder
+        target_states = w_states[:, 1:]
+        latent_pred_loss = latent_pred_loss + ((pred_z - target_states) ** 2).mean() / num_windows
+
+        # Optional reconstruction for hybrid mode
+        if hybrid_recon_weight > 0:
+            pred_decoded = model.decode(pred_z.reshape(B * n_pred, D_state))
+            gt_start = K - 1 + start + 1
+            gt_frames = images[:, gt_start:gt_start + n_pred].reshape(B * n_pred, C, H, W)
+            recon_loss = recon_loss + ((pred_decoded - gt_frames) ** 2).mean() / num_windows
+
+    # 4. Total loss: prediction + SIGReg (+ optional reconstruction)
+    loss = latent_pred_loss + sigreg_lambda * sigreg_loss
+    if hybrid_recon_weight > 0:
+        loss = loss + hybrid_recon_weight * recon_loss
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    losses = {
+        "recon_loss": recon_loss.item() if hybrid_recon_weight > 0 else 0.0,
+        "kl_loss": 0.0,
+        "latent_pred_loss": latent_pred_loss.item(),
+        "sigreg_loss": sigreg_loss.item(),
+        "total_loss": loss.item(),
+    }
+
+    # Energy monitoring for Hamiltonian predictors
+    if _has_energy(model.predictor):
+        with torch.no_grad():
+            H_vals = model.predictor.energy(all_states)
+            losses["energy_mean"] = H_vals.mean().item()
+            losses["energy_std"] = H_vals.std().item()
+            losses["energy_time_var"] = H_vals.squeeze(-1).var(dim=1).mean().item()
+
+    return losses
+
+
+@torch.no_grad()
+def jepa_eval_step(model, batch, cfg):
+    """JEPA eval step: latent prediction loss + SIGReg (no gradient, posterior mean)."""
+    images = batch["images"]
+    actions = batch["actions"]
+    B, _, C, H, W = images.shape
+    K = model.encoder_frames
+    ctx_len = model.context_length
+    pred_len = model.pred_length
+
+    deterministic = cfg.training.get("deterministic_encoder", False)
+    hybrid_recon_weight = cfg.training.get("hybrid_recon_weight", 0.0)
+
+    mu_all, logvar_all = model.encode_sequence(images)
+    N_lat = mu_all.shape[1]
+    D_enc = mu_all.shape[2]
+
+    mu_flat = mu_all.reshape(B * N_lat, D_enc)
+    # Always use posterior mean at eval time
+    all_states = model.to_state(mu_flat)
+    D_state = all_states.shape[-1]
+    all_states = all_states.reshape(B, N_lat, D_state)
+
+    transition_actions = actions[:, K - 1:]
+    window_size = ctx_len + pred_len
+    step_size = pred_len
+    num_windows = max(1, 1 + (N_lat - window_size) // step_size)
+
+    latent_pred_loss = 0.0
+    recon_loss = 0.0
+    for w in range(num_windows):
+        start = w * step_size
+        end = min(start + window_size, N_lat)
+        w_states = all_states[:, start:end]
+        n_pred = w_states.shape[1] - 1
+
+        pred_input = w_states[:, :-1]
+        w_actions = transition_actions[:, start:start + n_pred].long()
+        pred_z = model.predictor(pred_input, w_actions)
+
+        target_states = w_states[:, 1:]
+        latent_pred_loss += ((pred_z - target_states) ** 2).mean().item() / num_windows
+
+        # Reconstruction for monitoring / hybrid mode
+        pred_decoded = model.decode(pred_z.reshape(B * n_pred, D_state))
+        gt_start = K - 1 + start + 1
+        gt_frames = images[:, gt_start:gt_start + n_pred].reshape(B * n_pred, C, H, W)
+        recon_loss += ((pred_decoded - gt_frames) ** 2).mean().item() / num_windows
+
+    total_loss = latent_pred_loss
+    if hybrid_recon_weight > 0:
+        total_loss += hybrid_recon_weight * recon_loss
+
+    losses = {
+        "recon_loss": recon_loss,
+        "kl_loss": 0.0,
+        "latent_pred_loss": latent_pred_loss,
+        "sigreg_loss": 0.0,  # not computed at eval (expensive, not needed)
+        "total_loss": total_loss,
+    }
+
+    if _has_energy(model.predictor):
+        H_vals = model.predictor.energy(all_states)
+        losses["energy_mean"] = H_vals.mean().item()
+        losses["energy_std"] = H_vals.std().item()
+        losses["energy_time_var"] = H_vals.squeeze(-1).var(dim=1).mean().item()
+
+    return losses
+
+
+# ---------------------------------------------------------------------------
 # Visualization helpers
 # ---------------------------------------------------------------------------
 
@@ -462,6 +641,7 @@ def main(cfg: DictConfig):
 
     training_mode = cfg.training.get("training_mode", "hgn")
     is_hgn = training_mode == "hgn"
+    is_jepa = training_mode in ("jepa", "hybrid")
 
     if cfg.wandb.enabled:
         slurm_id = os.environ.get("SLURM_JOB_ID", "")
@@ -514,13 +694,32 @@ def main(cfg: DictConfig):
     val_loader = DataLoader(val_data, batch_size=cfg.training.batch_size, shuffle=False)
     test_loader = DataLoader(test_data, batch_size=cfg.training.batch_size, shuffle=False)
 
+    # Build SIGReg module for JEPA/hybrid modes
+    sigreg_module = None
+    if is_jepa:
+        sigreg_module = SIGReg(
+            embed_dim=cfg.model.latent_channels,
+            num_projections=cfg.training.get("sigreg_projections", 1024),
+            num_knots=cfg.training.get("sigreg_knots", 50),
+        ).to(device)
+        sigreg_lambda = cfg.training.get("sigreg_lambda", 0.1)
+        log.info(
+            f"JEPA mode: SIGReg lambda={sigreg_lambda}, "
+            f"projections={cfg.training.get('sigreg_projections', 1024)}, "
+            f"deterministic={cfg.training.get('deterministic_encoder', False)}"
+        )
+
     # Optimizer setup
-    if is_hgn:
+    if is_hgn or is_jepa:
+        # Both HGN and JEPA use a single end-to-end optimizer
         lr = cfg.training.get("lr", 1.5e-4)
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = optim.Adam(trainable_params, lr=lr)
         optimizers = None
-        loss_keys = ["total_loss", "recon_loss", "kl_loss", "latent_pred_loss"]
+        if is_jepa:
+            loss_keys = ["total_loss", "recon_loss", "kl_loss", "latent_pred_loss", "sigreg_loss"]
+        else:
+            loss_keys = ["total_loss", "recon_loss", "kl_loss", "latent_pred_loss"]
         if _has_energy(model.predictor):
             loss_keys.extend(["energy_mean", "energy_std", "energy_time_var"])
     else:
@@ -553,14 +752,24 @@ def main(cfg: DictConfig):
             if first_train_batch is None:
                 first_train_batch = batch
 
-            if is_hgn:
+            if is_jepa:
+                losses = jepa_train_step(model, batch, optimizer, sigreg_module, cfg)
+            elif is_hgn:
                 losses = hgn_train_step(model, batch, optimizer)
             else:
                 losses = detached_train_step(model, batch, optimizers)
 
+            if _has_nan(losses):
+                log.error(f"NaN detected in training losses at epoch {epoch}: {losses}")
+                break
+
             for k in loss_keys:
                 train_accum[k] += losses.get(k, 0.0)
             train_batches.set_postfix({k: f"{losses.get(k, 0.0):.4f}" for k in loss_keys[:3]})
+
+        if _has_nan(losses):
+            log.error("Stopping training due to NaN losses.")
+            break
 
         train_avg = {k: v / len(train_loader) for k, v in train_accum.items()}
 
@@ -571,7 +780,9 @@ def main(cfg: DictConfig):
         val_batches = tqdm(val_loader, desc=f"Epoch {epoch} [Val]", leave=False)
         for batch in val_batches:
             batch = batch_to_device(batch, device)
-            if is_hgn:
+            if is_jepa:
+                losses = jepa_eval_step(model, batch, cfg)
+            elif is_hgn:
                 losses = hgn_eval_step(model, batch)
             else:
                 losses = detached_eval_step(model, batch)
@@ -642,7 +853,9 @@ def main(cfg: DictConfig):
     test_accum = {k: 0.0 for k in loss_keys}
     for batch in test_loader:
         batch = batch_to_device(batch, device)
-        if is_hgn:
+        if is_jepa:
+            losses = jepa_eval_step(model, batch, cfg)
+        elif is_hgn:
             losses = hgn_eval_step(model, batch)
         else:
             losses = detached_eval_step(model, batch)

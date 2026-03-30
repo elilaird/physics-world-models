@@ -34,9 +34,23 @@ training:
   # End-to-end training: predictor loss in pixel space, gradients flow into encoder.
   # false = detached (latent-space predictor loss, compatible with JEPA etc.)
   end_to_end: true
-  # Training mode for train_visual.py: "hgn" (encode init → rollout → decode all)
-  # or "detached" (per-frame encoding with detached predictor loss)
+  # Training mode for train_visual.py:
+  #   "hgn"     — beta-VAE ELBO (reconstruction + KL + latent prediction)
+  #   "detached" — per-frame encoding with detached predictor loss
+  #   "jepa"    — LeWM-style JEPA (latent prediction + SIGReg, no reconstruction)
+  #   "hybrid"  — JEPA core + lightweight reconstruction supervision
   training_mode: hgn
+  # --- JEPA / LeWorldModel settings (only used when training_mode is "jepa" or "hybrid") ---
+  # SIGReg regularization weight (THE key LeWM hyperparameter; 0.01–1.0)
+  sigreg_lambda: 0.1
+  # Number of random projections for SIGReg (paper shows insensitive)
+  sigreg_projections: 1024
+  # Quadrature knots for Epps-Pulley normality test (paper shows insensitive)
+  sigreg_knots: 50
+  # If true, skip reparameterization and use encoder mean directly
+  deterministic_encoder: false
+  # Reconstruction loss weight in hybrid mode (0 = pure JEPA)
+  hybrid_recon_weight: 0.0
 
 ckpt_base_path: '/lustre/smuexa01/client/users/ejlaird/physics-world-models'
 data_root: ${ckpt_base_path}/datasets
