@@ -159,7 +159,7 @@ class VisualWorldModel(nn.Module):
         )
         self.decoder = VisionDecoder(
             channels=channels,
-            latent_channels=latent_channels // 2,
+            latent_channels=latent_channels,
             hidden_channels=hidden_channels,
         )
         self.predictor = predictor
@@ -232,7 +232,7 @@ class VisualWorldModel(nn.Module):
         return self.state_transform(z)
 
     def decode(self, z):
-        return self.decoder(z[..., : self.latent_channels // 2])  # decode from z_q only
+        return self.decoder(z)
 
     def kl_loss(self, mu, logvar):
         if self.training_mode in ("jepa", "hybrid"):

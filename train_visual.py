@@ -156,6 +156,7 @@ def hgn_train_step(model, batch, optimizer):
 
     optimizer.zero_grad()
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
 
     losses = {
@@ -298,6 +299,7 @@ def detached_train_step(model, batch, optimizers):
 
     loss = recon_loss + model.beta * kl_loss + model.predictor_weight * pred_loss
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
     for opt in optimizers.values():
         opt.step()
@@ -449,6 +451,7 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
 
     optimizer.zero_grad()
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
 
     losses = {

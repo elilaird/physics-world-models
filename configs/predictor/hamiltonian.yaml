@@ -5,5 +5,5 @@ action_dim: ${env.action_dim}
 action_embedding_dim: ${model.action_embedding_dim}
 hidden_dim: 256
 dt: ${dataset.dt}
-integration_method: rk4
+integration_method: euler
 damping_init: -1.0

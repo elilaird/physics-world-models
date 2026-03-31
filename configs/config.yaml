@@ -20,7 +20,7 @@ training:
   epochs: 100
   batch_size: 32
   # Single optimizer learning rate (used in HGN mode)
-  lr: 1.5e-4
+  lr: 5e-4
   # Separate optimizer learning rates (used in detached mode)
   encoder_lr: 1e-4
   decoder_lr: 1e-4
