@@ -31,9 +31,6 @@ training:
   train_encoder: true
   train_decoder: true
   train_predictor: true
-  # End-to-end training: predictor loss in pixel space, gradients flow into encoder.
-  # false = detached (latent-space predictor loss, compatible with JEPA etc.)
-  end_to_end: true
   # Training mode for train_visual.py:
   #   "hgn"     — beta-VAE ELBO (reconstruction + KL + latent prediction)
   #   "detached" — per-frame encoding with detached predictor loss
