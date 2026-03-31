@@ -51,6 +51,12 @@ training:
   deterministic_encoder: false
   # Reconstruction loss weight in hybrid mode (0 = pure JEPA)
   hybrid_recon_weight: 0.0
+  # Detach prediction targets in JEPA mode (prevents encoder overfitting to predictor)
+  detach_jepa_targets: false
+  # Split optimizer: AdamW (with weight decay) for encoder/decoder,
+  # Adam-equivalent (weight_decay=0) for predictor. Uses separate LRs.
+  split_optimizers: false
+  encoder_decoder_lr: 3e-4
 
 ckpt_base_path: '/lustre/smuexa01/client/users/ejlaird/physics-world-models'
 data_root: ${ckpt_base_path}/datasets

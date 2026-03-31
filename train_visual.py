@@ -392,6 +392,7 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
     deterministic = cfg.training.get("deterministic_encoder", False)
     hybrid_recon_weight = cfg.training.get("hybrid_recon_weight", 0.0)
     sigreg_lambda = cfg.training.get("sigreg_lambda", 0.1)
+    detach_targets = cfg.training.get("detach_jepa_targets", False)
 
     # 1. Encode all frames
     mu_all, logvar_all = model.encode_sequence(images)  # each (B, N_lat, D_enc)
@@ -430,8 +431,8 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
         w_actions = transition_actions[:, start:start + n_pred].long()
         pred_z = model.predictor(pred_input, w_actions)
 
-        # JEPA: NO .detach() on targets — gradients flow through encoder
-        target_states = w_states[:, 1:]
+        # Optionally detach targets (agent found this prevents overfitting)
+        target_states = w_states[:, 1:].detach() if detach_targets else w_states[:, 1:]
         latent_pred_loss = latent_pred_loss + ((pred_z - target_states) ** 2).mean() / num_windows
 
     # 4. Decoder probe: train decoder on encoded latents (detached) so it can
@@ -719,10 +720,24 @@ def main(cfg: DictConfig):
 
     # Optimizer setup
     if is_hgn or is_jepa:
-        # Both HGN and JEPA use a single end-to-end optimizer
+        split = cfg.training.get("split_optimizers", False)
         lr = cfg.training.get("lr", 1.5e-4)
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = optim.Adam(trainable_params, lr=lr)
+        if split:
+            enc_dec_lr = cfg.training.get("encoder_decoder_lr", 3e-4)
+            pred_lr = cfg.training.get("predictor_lr", 1e-3)
+            enc_dec_params = [p for p in list(model.encoder.parameters()) + list(model.decoder.parameters()) if p.requires_grad]
+            pred_params = [p for p in list(model.predictor.parameters()) + list(model.state_transform.parameters()) if p.requires_grad]
+            # JEPA projector params go with encoder/decoder
+            if hasattr(model, 'encoder_projector') and not isinstance(model.encoder_projector, torch.nn.Identity):
+                enc_dec_params += [p for p in model.encoder_projector.parameters() if p.requires_grad]
+            optimizer = optim.AdamW([
+                {'params': enc_dec_params, 'lr': enc_dec_lr, 'weight_decay': 0.01},
+                {'params': pred_params, 'lr': pred_lr, 'weight_decay': 0},
+            ])
+            log.info(f"Split optimizer: AdamW enc/dec @ {enc_dec_lr}, Adam-equiv predictor @ {pred_lr}")
+        else:
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            optimizer = optim.Adam(trainable_params, lr=lr)
         optimizers = None
         if is_jepa:
             loss_keys = ["total_loss", "recon_loss", "kl_loss", "latent_pred_loss", "sigreg_loss"]
