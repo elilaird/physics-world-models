@@ -78,7 +78,7 @@ def dt_generalization_test(model, env, init_state, actions, dt_values, variable_
 
 
 @torch.no_grad()
-def visual_open_loop_rollout(model, images, actions):
+def visual_open_loop_rollout(model, images, actions, dt=None):
     """Open-loop rollout for visual world models with flat latents.
 
     Encodes all frames with channel-concatenated overlapping windows, then
@@ -89,6 +89,8 @@ def visual_open_loop_rollout(model, images, actions):
         model: VisualWorldModel (encoder, decoder, predictor).
         images: (B, T+1, C, H, W) ground-truth image sequence.
         actions: (B, T) discrete action indices.
+        dt: optional timestep override for ODE-based predictors.
+            When None, uses the predictor's training dt (self.dt).
 
     Returns:
         dict with:
@@ -121,7 +123,7 @@ def visual_open_loop_rollout(model, images, actions):
     pred_latents = []
     for t in range(horizon):
         act = transition_actions[:, t:t + ctx_len].long()
-        pred = model.predictor(context, act)  # (B, ctx_len, D_state)
+        pred = model.predictor(context, act, dt=dt)  # (B, ctx_len, D_state)
         z_next = pred[:, -1]  # (B, D_state)
         pred_latents.append(z_next)
         context = torch.cat([context[:, 1:], z_next.unsqueeze(1)], dim=1)
@@ -241,9 +243,9 @@ def visual_dt_generalization_test(
         images_batch = torch.stack(all_images).to(device)
         actions_batch = torch.stack(all_actions).to(device)
 
-        # Run visual rollout
+        # Run visual rollout (pass dt so ODE-based predictors integrate correctly)
         K = model.encoder_frames
-        rollout = visual_open_loop_rollout(model, images_batch, actions_batch)
+        rollout = visual_open_loop_rollout(model, images_batch, actions_batch, dt=dt)
         pred_images = rollout["pred_images"]       # (n_seqs, horizon, C, H, W)
         true_latents = rollout["true_latents"]     # (n_seqs, N_latents, D_state)
         pred_latents = rollout["pred_latents"]     # (n_seqs, horizon, D_state)

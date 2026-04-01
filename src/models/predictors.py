@@ -1,11 +1,14 @@
 """Flat temporal predictors for the visual world model.
 
 All predictors share the same interface:
-    forward(context, actions) → predicted_next_states
+    forward(context, actions, dt=None) → predicted_next_states
 
     Args:
         context: (B, T, D) flat latent states
         actions: (B, T) discrete action indices
+        dt: optional override for the integration timestep.
+            ODE-based predictors use this instead of self.dt when provided.
+            Discrete predictors accept but ignore it (interface consistency).
 
     Returns:
         (B, T, D) predicted next states
@@ -73,7 +76,7 @@ class MLPPredictor(nn.Module):
             nn.Linear(hidden_dim, latent_dim),
         )
 
-    def forward(self, context, actions):
+    def forward(self, context, actions, dt=None):
         emb = self.act_emb(actions)  # (B, T, emb)
         x = torch.cat([context, emb], dim=-1)  # (B, T, D+emb)
         return context + self.net(x)  # (B, T, D)
@@ -107,7 +110,7 @@ class LSTMPredictor(nn.Module):
         )
         self.output = nn.Linear(hidden_dim, latent_dim)
 
-    def forward(self, context, actions):
+    def forward(self, context, actions, dt=None):
         emb = self.act_emb(actions)  # (B, T, emb)
         x = torch.cat([context, emb], dim=-1)  # (B, T, D+emb)
         out, _ = self.lstm(x)  # (B, T, hidden)
@@ -147,7 +150,7 @@ class TransformerPredictor(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.proj_out = nn.Linear(hidden_dim, latent_dim)
 
-    def forward(self, context, actions):
+    def forward(self, context, actions, dt=None):
         emb = self.act_emb(actions)  # (B, T, emb)
         x = self.proj_in(torch.cat([context, emb], dim=-1))  # (B, T, d_model)
         T = x.shape[1]
@@ -270,7 +273,7 @@ class ODEPredictor(nn.Module):
     def _dynamics(self, t, z):
         return self.net(torch.cat([z, self._conditioning_cache], dim=-1))
 
-    def forward(self, context, actions):
+    def forward(self, context, actions, dt=None):
         B, T, D = context.shape
         emb = self.act_emb(actions)  # (B, T, emb)
 
@@ -282,7 +285,8 @@ class ODEPredictor(nn.Module):
             self._conditioning_cache = emb.reshape(B * T, -1)
 
         z0 = context.reshape(B * T, D)
-        t_span = torch.tensor([0.0, self.dt], device=z0.device)
+        effective_dt = dt if dt is not None else self.dt
+        t_span = torch.tensor([0.0, effective_dt], device=z0.device)
         z1 = odeint(self._dynamics, z0, t_span, method=self.integration_method)[-1]
 
         self._conditioning_cache = None
@@ -354,7 +358,7 @@ class NewtonianPredictor(nn.Module):
         dp = accel - damping * p
         return torch.cat([dq, dp], dim=-1)
 
-    def forward(self, context, actions):
+    def forward(self, context, actions, dt=None):
         B, T, D = context.shape
         emb = self.act_emb(actions)
 
@@ -366,7 +370,8 @@ class NewtonianPredictor(nn.Module):
             self._conditioning_cache = emb.reshape(B * T, -1)
 
         z0 = context.reshape(B * T, D)
-        t_span = torch.tensor([0.0, self.dt], device=z0.device)
+        effective_dt = dt if dt is not None else self.dt
+        t_span = torch.tensor([0.0, effective_dt], device=z0.device)
         z1 = odeint(self._dynamics, z0, t_span, method=self.integration_method)[-1]
 
         self._conditioning_cache = None
@@ -459,7 +464,7 @@ class HamiltonianPredictor(nn.Module):
         """
         return self.H_net(z)
 
-    def forward(self, context, actions):
+    def forward(self, context, actions, dt=None):
         B, T, D = context.shape
         emb = self.act_emb(actions)
 
@@ -471,7 +476,8 @@ class HamiltonianPredictor(nn.Module):
             self._conditioning_cache = emb.reshape(B * T, -1)
 
         z0 = context.reshape(B * T, D)
-        t_span = torch.tensor([0.0, self.dt], device=z0.device)
+        effective_dt = dt if dt is not None else self.dt
+        t_span = torch.tensor([0.0, effective_dt], device=z0.device)
         z1 = odeint(self._dynamics, z0, t_span, method=self.integration_method)[-1]
 
         self._conditioning_cache = None

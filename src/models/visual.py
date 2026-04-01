@@ -246,13 +246,14 @@ class VisualWorldModel(nn.Module):
     def decoder_parameters(self):
         yield from self.decoder.parameters()
 
-    def autoregressive_rollout(self, z_init, actions, horizon):
+    def autoregressive_rollout(self, z_init, actions, horizon, dt=None):
         """Roll out from context_length state using the predictor.
 
         Args:
             z_init: (B, latent_channels) initial phase-space state.
             actions: (B, horizon) action indices.
             horizon: number of steps to predict.
+            dt: optional timestep override for ODE-based predictors.
 
         Returns:
             z_all: (B, horizon, latent_channels) predicted states.
@@ -260,7 +261,7 @@ class VisualWorldModel(nn.Module):
         states = []
         z_t = z_init.unsqueeze(1)  # (B, 1, latent_channels)
         for t in range(horizon):
-            z_next = self.predictor(z_t[:, -self.context_length:, :], actions[:, t : t + 1])
+            z_next = self.predictor(z_t[:, -self.context_length:, :], actions[:, t : t + 1], dt=dt)
             states.append(z_next.squeeze(1))
             z_t = torch.cat([z_t, z_next], dim=1)
         return torch.stack(states, dim=1)
