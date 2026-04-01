@@ -6,7 +6,7 @@ type: visual
 latent_channels: 64
 hidden_channels: 512
 beta: 0.003
-free_bits: 0.0
+free_bits: 0.05
 fixed_logvar: false
 action_embedding_dim: 8
 context_length: 3
