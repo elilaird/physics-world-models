@@ -248,6 +248,7 @@ class HamiltonianLeapfrogPredictor(nn.Module):
         p = z[..., self.half_dim:]
         return self.V_net(q) + self.T_net(p)
 
+    @torch.enable_grad()
     def forward(self, context, actions, dt=None):
         B, T, D = context.shape
         effective_dt = dt if dt is not None else self.dt
