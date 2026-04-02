@@ -1,5 +1,5 @@
-_target_: src.models.predictors.HamiltonianLeapfrogPredictor
-name: hamiltonian_leapfrog
+_target_: src.models.predictors.HamiltonianPredictor
+name: hamiltonian
 latent_dim: ${model.latent_channels}
 action_dim: ${env.action_dim}
 action_embedding_dim: ${model.action_embedding_dim}
@@ -7,5 +7,6 @@ hidden_dim: 256
 backbone_hidden: 128
 backbone_layers: 2
 dt: ${dataset.dt}
-n_leapfrog_steps: 3
+n_steps: 1
+integration_method: euler
 damping_init: -1.0

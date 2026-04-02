@@ -9,7 +9,7 @@ Implements LeWorldModel-style JEPA training:
 
 Usage:
     python train_visual.py
-    python train_visual.py predictor=hamiltonian_leapfrog
+    python train_visual.py predictor=hamiltonian
     python train_visual.py predictor=mlp
     python train_visual.py predictor=lstm training.lr=1.5e-4
 """

@@ -18,9 +18,10 @@ Predictors:
         - MLPPredictor: per-frame residual MLP (no temporal coupling)
         - LSTMPredictor: LSTM over context sequence
 
-    Physics-informed (symplectic leapfrog, dt-aware):
-        - HamiltonianLeapfrogPredictor: separable H(q,p) = V(q) + T(p),
-          hand-written leapfrog integrator with port-Hamiltonian dissipation
+    Physics-informed (port-Hamiltonian, dt-aware):
+        - HamiltonianPredictor: separable H(q,p) = V(q) + T(p),
+          configurable integrator (euler/semi_implicit/leapfrog),
+          port-Hamiltonian dissipation + action forcing
 """
 
 import torch
@@ -111,13 +112,13 @@ class LSTMPredictor(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Physics-informed predictor (symplectic leapfrog, dt-aware)
+# Physics-informed predictor (port-Hamiltonian, dt-aware)
 # ---------------------------------------------------------------------------
 
 
-@register_predictor("hamiltonian_leapfrog")
-class HamiltonianLeapfrogPredictor(nn.Module):
-    """Port-Hamiltonian predictor with LSTM temporal backbone + symplectic leapfrog.
+@register_predictor("hamiltonian")
+class HamiltonianPredictor(nn.Module):
+    """Port-Hamiltonian predictor with LSTM temporal backbone.
 
     Separable Hamiltonian: H(q, p) = V(q) + T(p)
       - V_net: potential energy (function of position q only)
@@ -133,12 +134,15 @@ class HamiltonianLeapfrogPredictor(nn.Module):
       dq/dt =  ∂T/∂p
       dp/dt = -∂V/∂q - γ·∂T/∂p + G(backbone_features)
 
-    Leapfrog integration (symplectic):
-      p_{1/2} = p_0 + (dt/2) · dp/dt(q_0, p_0)
-      q_1     = q_0 + dt · dq/dt(p_{1/2})
-      p_1     = p_{1/2} + (dt/2) · dp/dt(q_1, p_{1/2})
+    Integration methods (configurable via `integration_method`):
+      - euler: Forward Euler. Simplest, 2 autograd calls per step.
+      - semi_implicit: Symplectic Euler. Update p first, then q with
+        updated p. 3 autograd calls per step. Better stability.
+      - leapfrog: Störmer-Verlet. 5 autograd calls per step.
+        Symplectic for conservative systems, but overkill for
+        port-Hamiltonian (dissipation breaks symplecticity).
 
-    Subdivided into n_leapfrog_steps sub-steps per frame (sub_dt = dt / n_steps)
+    Subdivided into n_steps sub-steps per frame (sub_dt = dt / n_steps)
     for improved integration accuracy while keeping the total advance = dt.
     """
 
@@ -151,19 +155,21 @@ class HamiltonianLeapfrogPredictor(nn.Module):
         backbone_hidden=128,
         backbone_layers=2,
         dt=0.1,
-        n_leapfrog_steps=3,
+        n_steps=1,
+        integration_method="euler",
         damping_init=-1.0,
-        name="hamiltonian_leapfrog",
+        name="hamiltonian",
         **kwargs,
     ):
         super().__init__()
         self.half_dim = latent_dim // 2
         self.dt = dt
-        self.n_leapfrog_steps = n_leapfrog_steps
+        self.n_steps = n_steps
+        self.integration_method = integration_method
 
         # Separable energy networks with Softplus activations
         # (Softplus has nonzero 2nd derivatives everywhere, required for
-        # autograd-through-autograd in the leapfrog loop during training)
+        # autograd-through-autograd during training)
         self.V_net = nn.Sequential(
             nn.Linear(self.half_dim, hidden_dim),
             nn.Softplus(),
@@ -207,18 +213,29 @@ class HamiltonianLeapfrogPredictor(nn.Module):
         T = self.T_net(p).sum()
         return torch.autograd.grad(T, p, create_graph=self.training)[0]
 
+    def _euler_step(self, q, p, G_u, dt):
+        """Forward Euler step. 2 autograd calls."""
+        damping = F.softplus(self.log_damping)
+        dT_dp = self._dT_dp(p)
+        dV_dq = self._dV_dq(q)
+
+        q_new = q + dt * dT_dp
+        p_new = p + dt * (-dV_dq - damping * dT_dp + G_u)
+        return q_new, p_new
+
+    def _semi_implicit_step(self, q, p, G_u, dt):
+        """Semi-implicit (symplectic) Euler step. Update p first, then q
+        with the updated momentum. 3 autograd calls."""
+        damping = F.softplus(self.log_damping)
+        dT_dp = self._dT_dp(p)
+        dV_dq = self._dV_dq(q)
+
+        p_new = p + dt * (-dV_dq - damping * dT_dp + G_u)
+        q_new = q + dt * self._dT_dp(p_new)
+        return q_new, p_new
+
     def _leapfrog_step(self, q, p, G_u, dt):
-        """One leapfrog step with port-Hamiltonian dissipation + action force.
-
-        Args:
-            q: (N, half_dim) position
-            p: (N, half_dim) momentum
-            G_u: (N, half_dim) action force (from backbone)
-            dt: scalar timestep
-
-        Returns:
-            q_new, p_new: updated position and momentum
-        """
+        """Leapfrog (Störmer-Verlet) step. 5 autograd calls."""
         damping = F.softplus(self.log_damping)
 
         # Half-step momentum update
@@ -227,12 +244,11 @@ class HamiltonianLeapfrogPredictor(nn.Module):
         p_half = p + 0.5 * dt * dp_dt
 
         # Full-step position update
-        dT_dp_half = self._dT_dp(p_half)
-        q_new = q + dt * dT_dp_half
+        q_new = q + dt * self._dT_dp(p_half)
 
         # Half-step momentum update (at new position)
-        dT_dp_half2 = self._dT_dp(p_half)
-        dp_dt_new = -self._dV_dq(q_new) - damping * dT_dp_half2 + G_u
+        dT_dp_half = self._dT_dp(p_half)
+        dp_dt_new = -self._dV_dq(q_new) - damping * dT_dp_half + G_u
         p_new = p_half + 0.5 * dt * dp_dt_new
 
         return q_new, p_new
@@ -268,10 +284,17 @@ class HamiltonianLeapfrogPredictor(nn.Module):
         p = z[:, self.half_dim:]
         G_u_flat = G_u.reshape(B * T, self.half_dim)
 
-        # Subdivide timestep for accuracy: total integration = effective_dt
-        sub_dt = effective_dt / self.n_leapfrog_steps
-        for _ in range(self.n_leapfrog_steps):
-            q, p = self._leapfrog_step(q, p, G_u_flat, sub_dt)
+        # Select integration method
+        step_fn = {
+            "euler": self._euler_step,
+            "semi_implicit": self._semi_implicit_step,
+            "leapfrog": self._leapfrog_step,
+        }[self.integration_method]
+
+        # Subdivide timestep: total integration = effective_dt
+        sub_dt = effective_dt / self.n_steps
+        for _ in range(self.n_steps):
+            q, p = step_fn(q, p, G_u_flat, sub_dt)
 
         z_next = torch.cat([q, p], dim=-1)
         return z_next.reshape(B, T, D)

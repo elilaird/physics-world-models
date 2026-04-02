@@ -8,9 +8,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Research project testing whether a **port-Hamiltonian predictor with symplectic leapfrog integration + JEPA training** learns continuous-time dynamics from pixels with dt-generalization. Trains visual world models on simulated physics environments (oscillators, pendulums) and evaluates how well different inductive biases capture the true dynamics.
+Research project testing whether a **port-Hamiltonian predictor + JEPA training** learns continuous-time dynamics from pixels with dt-generalization. Trains visual world models on simulated physics environments (oscillators, pendulums) and evaluates how well different inductive biases capture the true dynamics.
 
-Core experiment: compare **HamiltonianLeapfrog** (physics-informed, dt-aware) against **MLP** and **LSTM** baselines (fixed-step, dt-agnostic) under JEPA training.
+Core experiment: compare **Hamiltonian** (physics-informed, dt-aware) against **MLP** and **LSTM** baselines (fixed-step, dt-agnostic) under JEPA training.
 
 ## Key Dependencies
 
@@ -27,24 +27,27 @@ python generate_dataset.py
 python generate_dataset.py dataset=oscillator_visual_60k
 
 # Train with each predictor (JEPA training, always)
-python train_visual.py predictor=hamiltonian_leapfrog
+python train_visual.py predictor=hamiltonian
 python train_visual.py predictor=mlp
 python train_visual.py predictor=lstm
 
 # Sweep all predictors
-python train_visual.py --multirun predictor=mlp,lstm,hamiltonian_leapfrog
+python train_visual.py --multirun predictor=mlp,lstm,hamiltonian
 
 # Override training params
 python train_visual.py training.lr=1e-4 training.sigreg_lambda=0.05
 
 # Train on pendulum
-python train_visual.py env=pendulum_visual predictor=hamiltonian_leapfrog
+python train_visual.py env=pendulum_visual predictor=hamiltonian
 
 # Override model hyperparams
 python train_visual.py model.latent_channels=64 model.context_length=3
 
 # Tune SIGReg lambda (the key JEPA hyperparameter)
 python train_visual.py --multirun training.sigreg_lambda=0.01,0.05,0.1,0.5,1.0
+
+# Hamiltonian integration method sweep
+python train_visual.py --multirun predictor.integration_method=euler,semi_implicit,leapfrog
 
 # Hybrid mode (JEPA + lightweight reconstruction)
 python train_visual.py training.hybrid_recon_weight=0.1
@@ -71,7 +74,7 @@ Hydra outputs (checkpoints, logs, plots) go to `outputs/<date>/<time>/<model_nam
 Hydra with composable groups. `configs/config.yaml` sets defaults and training params. Override with `env=<name>` and `predictor=<name>`.
 - **env configs**: `oscillator_visual`, `pendulum_visual` — each defines state_dim, action_dim, physics params, variable_params ranges, init_state_range, rendering settings
 - **model config**: `visual_world_model` — latent_channels, hidden_channels, context_length, pred_length, encoder_frames
-- **predictor configs**: `hamiltonian_leapfrog` (default), `mlp`, `lstm`
+- **predictor configs**: `hamiltonian` (default), `mlp`, `lstm`
 - **dataset configs**: `oscillator_visual_testing`, `oscillator_visual_60k`, etc.
 
 ### Predictors (`src/models/predictors.py`)
@@ -80,7 +83,7 @@ Three predictors registered in `PREDICTOR_REGISTRY`:
 
 - **MLPPredictor** (`mlp`): per-frame residual MLP, `z_{t+1} = z_t + f(z_t, a_t)`. Fixed-step, ignores dt.
 - **LSTMPredictor** (`lstm`): LSTM over context + residual output. Fixed-step, ignores dt.
-- **HamiltonianLeapfrogPredictor** (`hamiltonian_leapfrog`): separable `H(q,p) = V(q) + T(p)` with hand-written symplectic leapfrog integrator. Port-Hamiltonian extension with learned dissipation `γ` and action force `G(a)`. **dt-aware**: accepts dt parameter for temporal generalization. Uses `n_leapfrog_steps` integration steps per frame. `.energy(z)` method for monitoring.
+- **HamiltonianPredictor** (`hamiltonian`): separable `H(q,p) = V(q) + T(p)` with configurable integrator (euler/semi_implicit/leapfrog). Port-Hamiltonian extension with learned dissipation `γ` and LSTM backbone for temporal context conditioning the action force `G(a)`. **dt-aware**: accepts dt parameter for temporal generalization. `n_steps` integration sub-steps per frame. `.energy(z)` method for monitoring.
 
 ### Visual World Model (`src/models/visual.py`)
 
@@ -130,6 +133,6 @@ Sketched-Isotropic-Gaussian Regularizer from the LeWorldModel paper. Projects em
 - `rollout.py`: `visual_open_loop_rollout()`, `visual_dt_generalization_test()`
 
 Key metrics:
-- **dt generalization**: HamiltonianLeapfrog should adapt to different dt values; MLP/LSTM baselines should degrade
+- **dt generalization**: Hamiltonian should adapt to different dt values; MLP/LSTM baselines should degrade
 - **energy_monotone**: fraction of timesteps with non-increasing Hamiltonian (should be high for dissipative systems)
 - **SIGReg loss**: should converge to near-zero (embeddings are Gaussian)
