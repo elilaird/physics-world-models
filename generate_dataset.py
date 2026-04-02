@@ -1,15 +1,15 @@
 """
-Generate and save train/val/test datasets for physics world models.
+Generate and save train/val/test visual datasets for physics world models.
 
 Produces pre-stacked tensors in a directory, loadable by PrecomputedDataset.
 
 Usage:
     python generate_dataset.py
-    python generate_dataset.py env=pendulum dataset.n_seqs=1000 dataset.seq_len=200
-    python generate_dataset.py env=spaceship dataset.n_seqs=2000 dataset.val_split=0.1 dataset.test_split=0.1
-    python generate_dataset.py env=oscillator_visual dataset.n_seqs=500
+    python generate_dataset.py dataset=oscillator_visual_60k
+    python generate_dataset.py dataset=oscillator_visual_testing
 """
 
+import json
 import logging
 import os
 import shutil
@@ -21,14 +21,8 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from src.envs import ENV_REGISTRY
-from src.data.dataset import SequenceDataset
-from src.data.visual_dataset import VisualSequenceDataset
 
 log = logging.getLogger(__name__)
-
-
-def is_visual_env(cfg):
-    return getattr(cfg.dataset.env, "observation_mode", None) == "pixels"
 
 
 def build_env(cfg):
@@ -37,155 +31,73 @@ def build_env(cfg):
     return env_cls(**params)
 
 
-def generate_all_sequences(env, cfg):
-    """Generate the full pool of sequences using the appropriate dataset class."""
-    variable_params = OmegaConf.to_container(cfg.dataset.env.variable_params, resolve=True)
-    init_state_range = np.array(OmegaConf.to_container(cfg.dataset.env.init_state_range, resolve=True))
+def generate_chunk(env, variable_params, init_state_range, chunk_size, seq_len, dt, cfg):
+    """Generate a chunk of visual trajectories.
 
-    if is_visual_env(cfg):
-        ball_color = cfg.dataset.env.get("ball_color", None)
-        bg_color = cfg.dataset.env.get("bg_color", None)
-        if ball_color is not None:
-            ball_color = list(ball_color)
-        if bg_color is not None:
-            bg_color = list(bg_color)
-        dataset = VisualSequenceDataset(
-            env=env,
-            variable_params=variable_params,
-            init_state_range=init_state_range,
-            n_seqs=cfg.dataset.n_seqs,
-            seq_len=cfg.dataset.seq_len,
-            dt=cfg.dataset.dt,
-            img_size=cfg.dataset.env.get("img_size", 64),
-            color=cfg.dataset.env.get("color", True),
-            render_quality=cfg.dataset.env.get("render_quality", "medium"),
-            ball_color=ball_color,
-            bg_color=bg_color,
-            ball_radius=cfg.dataset.env.get("ball_radius", None),
-            observation_noise_std=cfg.dataset.env.get("observation_noise_std", 0.0),
-        )
-    else:
-        dataset = SequenceDataset(
-            env=env,
-            variable_params=variable_params,
-            init_state_range=init_state_range,
-            n_seqs=cfg.dataset.n_seqs,
-            seq_len=cfg.dataset.seq_len,
-            dt=cfg.dataset.dt,
-            observation_noise_std=cfg.dataset.env.get("observation_noise_std", 0.0),
-        )
+    Returns:
+        states: (chunk_size, seq_len+1, state_dim) float32
+        actions: (chunk_size, seq_len) int64
+        images: (chunk_size, seq_len+1, C, H, W) uint8
+    """
+    img_size = cfg.dataset.env.get("img_size", 64)
+    color = cfg.dataset.env.get("color", True)
+    render_quality = cfg.dataset.env.get("render_quality", "medium")
+    render_opts = {
+        "img_size": img_size,
+        "color": color,
+        "render_quality": render_quality,
+    }
+    for k in ("ball_color", "bg_color", "ball_radius"):
+        v = cfg.dataset.env.get(k, None)
+        if v is not None:
+            render_opts[k] = list(v) if hasattr(v, "__iter__") else v
 
-    return dataset
+    all_states = []
+    all_actions = []
+    all_images = []
 
+    for _ in range(chunk_size):
+        # Sample variable params for this sequence
+        sampled_params = {
+            k: np.random.uniform(v[0], v[1])
+            for k, v in variable_params.items()
+        }
 
-def generate_to_memmap(env, cfg, output_dir, visual, chunk_size=100):
-    """Generate dataset directly to memory-mapped files for incremental saving."""
-    n_seqs = cfg.dataset.n_seqs
-    seq_len = cfg.dataset.seq_len
-    state_dim = cfg.dataset.env.state_dim
-    action_dim = cfg.dataset.env.action_dim
-
-    # Determine shapes
-    if visual:
-        img_size = cfg.dataset.env.get("img_size", 64)
-        channels = cfg.dataset.env.get("channels", 3)
-        img_shape = (n_seqs, seq_len + 1, channels, img_size, img_size)
-        img_dtype = np.uint8
-    else:
-        img_shape = None
-
-    state_shape = (n_seqs, seq_len + 1, state_dim)
-    action_shape = (n_seqs, seq_len)
-
-    # Create memory-mapped arrays (writes to disk incrementally)
-    temp_dir = os.path.join(output_dir, "temp_mmap")
-    os.makedirs(temp_dir, exist_ok=True)
-
-    states_mmap = np.memmap(
-        os.path.join(temp_dir, "states.dat"),
-        dtype=np.float32,
-        mode="w+",
-        shape=state_shape,
-    )
-    actions_mmap = np.memmap(
-        os.path.join(temp_dir, "actions.dat"),
-        dtype=np.int64,
-        mode="w+",
-        shape=action_shape,
-    )
-
-    if visual:
-        images_mmap = np.memmap(
-            os.path.join(temp_dir, "images.dat"),
-            dtype=img_dtype,
-            mode="w+",
-            shape=img_shape,
-        )
-    else:
-        images_mmap = None
-
-    # Generate sequences and write directly to memmap
-    log.info(f"Generating {n_seqs} sequences in chunks of {chunk_size}...")
-
-    variable_params = OmegaConf.to_container(cfg.dataset.env.variable_params, resolve=True)
-    init_state_range = np.array(OmegaConf.to_container(cfg.dataset.env.init_state_range, resolve=True))
-
-    # Generate in chunks
-    n_chunks = (n_seqs + chunk_size - 1) // chunk_size  # Ceiling division
-    for chunk_idx in range(n_chunks):
-        start_idx = chunk_idx * chunk_size
-        end_idx = min(start_idx + chunk_size, n_seqs)
-        current_chunk_size = end_idx - start_idx
-
-        if chunk_idx % max(1, n_chunks // 10) == 0:
-            log.info(f"  Progress: {start_idx}/{n_seqs} ({100*start_idx//n_seqs}%)")
-
-        # Regenerate dataset with current chunk size
-        if visual:
-            temp_dataset = VisualSequenceDataset(
-                env=env,
-                variable_params=variable_params,
-                init_state_range=init_state_range,
-                n_seqs=current_chunk_size,
-                seq_len=cfg.dataset.seq_len,
-                dt=cfg.dataset.dt,
-                img_size=cfg.dataset.env.get("img_size", 64),
-                color=cfg.dataset.env.get("color", True),
-                render_quality=cfg.dataset.env.get("render_quality", "medium"),
-                ball_color=cfg.dataset.env.get("ball_color"),
-                bg_color=cfg.dataset.env.get("bg_color"),
-                ball_radius=cfg.dataset.env.get("ball_radius", None),
-                observation_noise_std=cfg.dataset.env.get("observation_noise_std", 0.0),
-            )
+        # Sample initial state
+        if init_state_range.ndim == 1:
+            state = torch.tensor(
+                [np.random.uniform(init_state_range[0], init_state_range[1])
+                 for _ in range(env.state_dim)]
+            ).float()
         else:
-            temp_dataset = SequenceDataset(
-                env=env,
-                variable_params=variable_params,
-                init_state_range=init_state_range,
-                n_seqs=current_chunk_size,
-                seq_len=cfg.dataset.seq_len,
-                dt=cfg.dataset.dt,
-                observation_noise_std=cfg.dataset.env.get("observation_noise_std", 0.0),
-            )
+            state = torch.tensor(
+                [np.random.uniform(r[0], r[1]) for r in init_state_range]
+            ).float()
 
-        # Stack chunk data and write to memmap
-        chunk_states = torch.stack([temp_dataset.data[i]["states"] for i in range(current_chunk_size)])
-        chunk_actions = torch.stack([temp_dataset.data[i]["actions"] for i in range(current_chunk_size)])
+        states = [state]
+        actions = []
+        for _ in range(seq_len):
+            a = env.sample_action()
+            state = env.step(state, a, dt, sampled_params)
+            states.append(state)
+            actions.append(a)
 
-        states_mmap[start_idx:end_idx] = chunk_states.numpy()
-        actions_mmap[start_idx:end_idx] = chunk_actions.numpy()[:, :, 0]
+        # Render images
+        images = []
+        for s in states:
+            img = env.render_state(s, **render_opts)  # (H, W, C) in [0, 1]
+            images.append(img.permute(2, 0, 1))  # (C, H, W)
 
-        if visual:
-            chunk_images = torch.stack([temp_dataset.data[i]["images"] for i in range(current_chunk_size)])
-            images_mmap[start_idx:end_idx] = chunk_images.numpy()  # Already uint8
+        all_states.append(torch.stack(states).float())
+        all_actions.append(torch.tensor([a.item() if isinstance(a, torch.Tensor) else a for a in actions], dtype=torch.int64))
+        all_images.append((torch.stack(images) * 255).to(torch.uint8))
 
-    # Flush to disk
-    states_mmap.flush()
-    actions_mmap.flush()
-    if visual:
-        images_mmap.flush()
+    return (
+        torch.stack(all_states).numpy(),
+        torch.stack(all_actions).numpy(),
+        torch.stack(all_images).numpy(),
+    )
 
-    return states_mmap, actions_mmap, images_mmap
 
 @hydra.main(version_base=None, config_path="configs", config_name="gen_data_config")
 def main(cfg: DictConfig):
@@ -195,7 +107,6 @@ def main(cfg: DictConfig):
     np.random.seed(cfg.seed)
 
     env = build_env(cfg)
-    visual = is_visual_env(cfg)
 
     # Setup output directory
     root = cfg.get("data_root", "datasets")
@@ -209,20 +120,71 @@ def main(cfg: DictConfig):
     os.makedirs(output_dir, exist_ok=True)
 
     # Generate directly to memory-mapped files
+    n_seqs = cfg.dataset.n_seqs
+    seq_len = cfg.dataset.seq_len
+    state_dim = cfg.dataset.env.state_dim
+    img_size = cfg.dataset.env.get("img_size", 64)
+    channels = cfg.dataset.env.get("channels", 3)
+    chunk_size = cfg.dataset.chunk_size
+
+    variable_params = OmegaConf.to_container(cfg.dataset.env.variable_params, resolve=True)
+    init_state_range = np.array(OmegaConf.to_container(cfg.dataset.env.init_state_range, resolve=True))
+
+    # Create memory-mapped arrays
+    temp_dir = os.path.join(output_dir, "temp_mmap")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    states_mmap = np.memmap(
+        os.path.join(temp_dir, "states.dat"),
+        dtype=np.float32, mode="w+",
+        shape=(n_seqs, seq_len + 1, state_dim),
+    )
+    actions_mmap = np.memmap(
+        os.path.join(temp_dir, "actions.dat"),
+        dtype=np.int64, mode="w+",
+        shape=(n_seqs, seq_len),
+    )
+    images_mmap = np.memmap(
+        os.path.join(temp_dir, "images.dat"),
+        dtype=np.uint8, mode="w+",
+        shape=(n_seqs, seq_len + 1, channels, img_size, img_size),
+    )
+
     t0 = time.time()
-    states_mmap, actions_mmap, images_mmap = generate_to_memmap(env, cfg, output_dir, visual, chunk_size=cfg.dataset.chunk_size)
+    log.info(f"Generating {n_seqs} visual sequences in chunks of {chunk_size}...")
+
+    n_chunks = (n_seqs + chunk_size - 1) // chunk_size
+    for chunk_idx in range(n_chunks):
+        start_idx = chunk_idx * chunk_size
+        end_idx = min(start_idx + chunk_size, n_seqs)
+        current_chunk_size = end_idx - start_idx
+
+        if chunk_idx % max(1, n_chunks // 10) == 0:
+            log.info(f"  Progress: {start_idx}/{n_seqs} ({100*start_idx//n_seqs}%)")
+
+        chunk_states, chunk_actions, chunk_images = generate_chunk(
+            env, variable_params, init_state_range,
+            current_chunk_size, seq_len, cfg.dataset.dt, cfg,
+        )
+
+        states_mmap[start_idx:end_idx] = chunk_states
+        actions_mmap[start_idx:end_idx] = chunk_actions
+        images_mmap[start_idx:end_idx] = chunk_images
+
+    states_mmap.flush()
+    actions_mmap.flush()
+    images_mmap.flush()
+
     gen_time = time.time() - t0
-    log.info(f"Generated {cfg.dataset.name} ({cfg.dataset.n_seqs} sequences) in {gen_time:.1f}s")
+    log.info(f"Generated {cfg.dataset.name} ({n_seqs} sequences) in {gen_time:.1f}s")
 
-    # Deterministic split (shuffle indices, not data)
-    n = cfg.dataset.n_seqs
-    perm = np.random.permutation(n)
-
+    # Deterministic split
+    perm = np.random.permutation(n_seqs)
     val_split = cfg.dataset.get("val_split", 0.1)
     test_split = cfg.dataset.get("test_split", 0.1)
-    n_test = int(n * test_split)
-    n_val = int(n * val_split)
-    n_train = n - n_val - n_test
+    n_test = int(n_seqs * test_split)
+    n_val = int(n_seqs * val_split)
+    n_train = n_seqs - n_val - n_test
 
     train_idx = perm[:n_train]
     val_idx = perm[n_train:n_train + n_val]
@@ -230,21 +192,12 @@ def main(cfg: DictConfig):
 
     log.info(f"Split: train={n_train}, val={n_val}, test={n_test}")
 
-    # Save splits by indexing into memmap
-    splits_idx = {
-        "train": train_idx,
-        "val": val_idx,
-        "test": test_idx,
-    }
-
-    for split_name, indices in splits_idx.items():
+    for split_name, indices in [("train", train_idx), ("val", val_idx), ("test", test_idx)]:
         data = {
             "states": states_mmap[indices],
             "actions": actions_mmap[indices],
+            "images": images_mmap[indices],
         }
-        if visual:
-            data["images"] = images_mmap[indices]
-
         path = os.path.join(output_dir, f"{split_name}.npz")
         np.savez_compressed(path, **data)
         size_mb = os.path.getsize(path) / (1024 * 1024)
@@ -252,14 +205,11 @@ def main(cfg: DictConfig):
         log.info(f"Saved {split_name}.npz — {shapes} ({size_mb:.2f} MB)")
 
     # Clean up temporary memmap files
-    import shutil
-    temp_dir = os.path.join(output_dir, "temp_mmap")
     if os.path.exists(temp_dir):
         shutil.rmtree(temp_dir)
         log.info("Cleaned up temporary files")
 
-    # Save metadata as JSON for easier inspection
-    import json
+    # Save metadata
     train_data = np.load(os.path.join(output_dir, "train.npz"))
     sample_shapes = {k: list(v.shape) for k in train_data.files for v in [train_data[k]]}
 
@@ -267,7 +217,7 @@ def main(cfg: DictConfig):
         "env": cfg.dataset.env.name,
         "state_dim": cfg.dataset.env.state_dim,
         "action_dim": cfg.dataset.env.action_dim,
-        "observation_mode": "pixels" if visual else "vector",
+        "observation_mode": "pixels",
         "seed": cfg.seed,
         "dataset_name": cfg.dataset.name,
         "dt": cfg.dataset.dt,
@@ -277,11 +227,9 @@ def main(cfg: DictConfig):
         "shapes": sample_shapes,
         "generation_time_s": round(gen_time, 1),
         "env_params": OmegaConf.to_container(cfg.dataset.env.params, resolve=True),
-        "variable_params": OmegaConf.to_container(cfg.dataset.env.variable_params, resolve=True),
+        "variable_params": variable_params,
+        "visual": {k: cfg.dataset.env[k] for k in ("img_size", "channels", "color", "render_quality", "ball_color", "bg_color", "ball_radius") if k in cfg.dataset.env},
     }
-    if visual:
-        visual_keys = ("img_size", "channels", "color", "render_quality", "ball_color", "bg_color", "ball_radius")
-        metadata["visual"] = {k: cfg.dataset.env[k] for k in visual_keys if k in cfg.dataset.env}
 
     with open(os.path.join(output_dir, "metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)

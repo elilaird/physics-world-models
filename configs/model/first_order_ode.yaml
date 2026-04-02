@@ -1,5 +1,0 @@
-name: first_order_ode
-type: ode
-hidden_dim: 64
-action_embedding_dim: 8
-integration_method: rk4

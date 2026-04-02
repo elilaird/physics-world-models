@@ -13,26 +13,19 @@ All predictors share the same interface:
     Returns:
         (B, T, D) predicted next states
 
-Predictors for comparison:
-    Learned dynamics (residual):
+Predictors:
+    Learned dynamics (residual, fixed-step):
         - MLPPredictor: per-frame residual MLP (no temporal coupling)
         - LSTMPredictor: LSTM over context sequence
-        - TransformerPredictor: causal Transformer over context sequence
 
-    Physics-informed (ODE integration, no residual):
-        - ODEPredictor: dz/dt = f(z, a), first-order neural ODE
-        - NewtonianPredictor: dq/dt = p, dp/dt = f(q, p, a) - γp
-        - HamiltonianPredictor: H(q, p) with symplectic dynamics via autograd
-
-    Each physics-informed predictor supports an optional backbone parameter
-    ("lstm" or "transformer") for temporal context enrichment. The backbone
-    processes the full sequence before per-frame ODE integration.
+    Physics-informed (symplectic leapfrog, dt-aware):
+        - HamiltonianLeapfrogPredictor: separable H(q,p) = V(q) + T(p),
+          hand-written leapfrog integrator with port-Hamiltonian dissipation
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchdiffeq import odeint
 
 
 PREDICTOR_REGISTRY = {}
@@ -46,7 +39,7 @@ def register_predictor(name):
 
 
 # ---------------------------------------------------------------------------
-# Learned dynamics predictors (residual)
+# Learned dynamics predictors (residual, fixed-step)
 # ---------------------------------------------------------------------------
 
 
@@ -117,12 +110,35 @@ class LSTMPredictor(nn.Module):
         return context + self.output(out)  # (B, T, D)
 
 
-@register_predictor("transformer")
-class TransformerPredictor(nn.Module):
-    """Causal Transformer over context sequence with residual output.
+# ---------------------------------------------------------------------------
+# Physics-informed predictor (symplectic leapfrog, dt-aware)
+# ---------------------------------------------------------------------------
 
-    Projects input to d_model, applies causal self-attention layers,
-    then projects back to latent dim as a residual update.
+
+@register_predictor("hamiltonian_leapfrog")
+class HamiltonianLeapfrogPredictor(nn.Module):
+    """Port-Hamiltonian predictor with LSTM temporal backbone + symplectic leapfrog.
+
+    Separable Hamiltonian: H(q, p) = V(q) + T(p)
+      - V_net: potential energy (function of position q only)
+      - T_net: kinetic energy (function of momentum p only)
+
+    An LSTM backbone processes the full (state, action) sequence to produce
+    temporally-enriched features. These condition the action force G — so G
+    has access to the history of states and actions, not just the current
+    action embedding. V and T remain purely state-dependent (they define the
+    energy landscape, which shouldn't depend on history).
+
+    Dynamics derived via autograd:
+      dq/dt =  ∂T/∂p
+      dp/dt = -∂V/∂q - γ·∂T/∂p + G(backbone_features)
+
+    Leapfrog integration (symplectic):
+      p_{1/2} = p_0 + (dt/2) · dp/dt(q_0, p_0)
+      q_1     = q_0 + dt · dq/dt(p_{1/2})
+      p_1     = p_{1/2} + (dt/2) · dp/dt(q_1, p_{1/2})
+
+    Repeated n_leapfrog_steps times per frame for longer effective horizons.
     """
 
     def __init__(
@@ -131,354 +147,128 @@ class TransformerPredictor(nn.Module):
         action_dim=3,
         action_embedding_dim=8,
         hidden_dim=256,
-        num_layers=2,
-        nhead=4,
-        name="transformer",
-        **kwargs,
-    ):
-        super().__init__()
-        self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
-        self.proj_in = nn.Linear(latent_dim + action_embedding_dim, hidden_dim)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=nhead,
-            dim_feedforward=hidden_dim * 4,
-            dropout=0.0,
-            batch_first=True,
-            activation="gelu",
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.proj_out = nn.Linear(hidden_dim, latent_dim)
-
-    def forward(self, context, actions, dt=None):
-        emb = self.act_emb(actions)  # (B, T, emb)
-        x = self.proj_in(torch.cat([context, emb], dim=-1))  # (B, T, d_model)
-        T = x.shape[1]
-        # Causal mask: float additive mask (-inf for blocked positions)
-        mask = torch.triu(
-            torch.full((T, T), float("-inf"), device=x.device), diagonal=1
-        )
-        x = self.transformer(x, mask=mask)  # (B, T, d_model)
-        return context + self.proj_out(x)  # (B, T, D)
-
-
-# ---------------------------------------------------------------------------
-# Temporal backbone for physics-informed predictors
-# ---------------------------------------------------------------------------
-
-
-class TemporalBackbone(nn.Module):
-    """Sequence model backbone (LSTM or Transformer) for temporal context.
-
-    Processes (B, T, input_dim) → (B, T, hidden_dim) features that enrich
-    per-frame ODE dynamics with cross-frame context.
-    """
-
-    def __init__(self, input_dim, hidden_dim, backbone_type="lstm", num_layers=2, nhead=4):
-        super().__init__()
-        self.backbone_type = backbone_type
-        if backbone_type == "lstm":
-            self.net = nn.LSTM(
-                input_size=input_dim,
-                hidden_size=hidden_dim,
-                num_layers=num_layers,
-                batch_first=True,
-            )
-        elif backbone_type == "transformer":
-            self.proj_in = nn.Linear(input_dim, hidden_dim)
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=hidden_dim,
-                nhead=nhead,
-                dim_feedforward=hidden_dim * 4,
-                dropout=0.0,
-                batch_first=True,
-                activation="gelu",
-            )
-            self.net = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        else:
-            raise ValueError(f"Unknown backbone type: {backbone_type}")
-
-    def forward(self, x):
-        if self.backbone_type == "lstm":
-            out, _ = self.net(x)
-            return out
-        else:  # transformer
-            x = self.proj_in(x)
-            T = x.shape[1]
-            # Float additive causal mask (required for autograd compatibility)
-            mask = torch.triu(
-                torch.full((T, T), float("-inf"), device=x.device), diagonal=1
-            )
-            return self.net(x, mask=mask)
-
-
-# ---------------------------------------------------------------------------
-# Physics-informed predictors (ODE integration, no residual)
-# ---------------------------------------------------------------------------
-
-
-@register_predictor("ode")
-class ODEPredictor(nn.Module):
-    """First-order neural ODE: dz/dt = f(z, a).
-
-    Per-frame ODE integration — each (z_t, a_t) pair is independently
-    integrated from t=0 to t=dt to produce z_{t+1}.
-
-    Optional backbone ("lstm" or "transformer") processes the full context
-    sequence first, providing temporally-enriched features to condition
-    the ODE dynamics instead of raw action embeddings.
-    """
-
-    def __init__(
-        self,
-        latent_dim=32,
-        action_dim=3,
-        action_embedding_dim=8,
-        hidden_dim=256,
-        dt=0.1,
-        integration_method="rk4",
-        backbone=None,
+        backbone_hidden=128,
         backbone_layers=2,
-        backbone_nhead=4,
-        name="ode",
-        **kwargs,
-    ):
-        super().__init__()
-        self.dt = dt
-        self.integration_method = integration_method
-        self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
-
-        if backbone is not None:
-            self.backbone = TemporalBackbone(
-                input_dim=latent_dim + action_embedding_dim,
-                hidden_dim=hidden_dim,
-                backbone_type=backbone,
-                num_layers=backbone_layers,
-                nhead=backbone_nhead,
-            )
-            conditioning_dim = hidden_dim
-        else:
-            self.backbone = None
-            conditioning_dim = action_embedding_dim
-
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim + conditioning_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, latent_dim),
-        )
-        self._conditioning_cache = None
-
-    def _dynamics(self, t, z):
-        return self.net(torch.cat([z, self._conditioning_cache], dim=-1))
-
-    def forward(self, context, actions, dt=None):
-        B, T, D = context.shape
-        emb = self.act_emb(actions)  # (B, T, emb)
-
-        if self.backbone is not None:
-            inp = torch.cat([context, emb], dim=-1)  # (B, T, D+emb)
-            features = self.backbone(inp)  # (B, T, hidden)
-            self._conditioning_cache = features.reshape(B * T, -1)
-        else:
-            self._conditioning_cache = emb.reshape(B * T, -1)
-
-        z0 = context.reshape(B * T, D)
-        effective_dt = dt if dt is not None else self.dt
-        t_span = torch.tensor([0.0, effective_dt], device=z0.device)
-        z1 = odeint(self._dynamics, z0, t_span, method=self.integration_method)[-1]
-
-        self._conditioning_cache = None
-        return z1.reshape(B, T, D)
-
-
-@register_predictor("newtonian")
-class NewtonianPredictor(nn.Module):
-    """Newtonian dynamics: dq/dt = p, dp/dt = f(q, p, a) - γp.
-
-    Splits latent into position q and momentum p halves.
-    Acceleration is learned, damping is a learned scalar.
-    Integrated via torchdiffeq.
-
-    Optional backbone ("lstm" or "transformer") processes the full context
-    sequence first, providing temporally-enriched features to condition
-    the acceleration network instead of raw action embeddings.
-    """
-
-    def __init__(
-        self,
-        latent_dim=32,
-        action_dim=3,
-        action_embedding_dim=8,
-        hidden_dim=256,
         dt=0.1,
-        integration_method="rk4",
+        n_leapfrog_steps=3,
         damping_init=-1.0,
-        backbone=None,
-        backbone_layers=2,
-        backbone_nhead=4,
-        name="newtonian",
+        name="hamiltonian_leapfrog",
         **kwargs,
     ):
         super().__init__()
-        self.dt = dt
-        self.integration_method = integration_method
         self.half_dim = latent_dim // 2
-        self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
-
-        if backbone is not None:
-            self.backbone = TemporalBackbone(
-                input_dim=latent_dim + action_embedding_dim,
-                hidden_dim=hidden_dim,
-                backbone_type=backbone,
-                num_layers=backbone_layers,
-                nhead=backbone_nhead,
-            )
-            conditioning_dim = hidden_dim
-        else:
-            self.backbone = None
-            conditioning_dim = action_embedding_dim
-
-        self.accel_net = nn.Sequential(
-            nn.Linear(latent_dim + conditioning_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, self.half_dim),
-        )
-        self.log_damping = nn.Parameter(torch.tensor(damping_init))
-        self._conditioning_cache = None
-
-    def _dynamics(self, t, z):
-        q, p = z[..., : self.half_dim], z[..., self.half_dim :]
-        damping = F.softplus(self.log_damping)
-        accel = self.accel_net(torch.cat([z, self._conditioning_cache], dim=-1))
-        dq = p
-        dp = accel - damping * p
-        return torch.cat([dq, dp], dim=-1)
-
-    def forward(self, context, actions, dt=None):
-        B, T, D = context.shape
-        emb = self.act_emb(actions)
-
-        if self.backbone is not None:
-            inp = torch.cat([context, emb], dim=-1)
-            features = self.backbone(inp)  # (B, T, hidden)
-            self._conditioning_cache = features.reshape(B * T, -1)
-        else:
-            self._conditioning_cache = emb.reshape(B * T, -1)
-
-        z0 = context.reshape(B * T, D)
-        effective_dt = dt if dt is not None else self.dt
-        t_span = torch.tensor([0.0, effective_dt], device=z0.device)
-        z1 = odeint(self._dynamics, z0, t_span, method=self.integration_method)[-1]
-
-        self._conditioning_cache = None
-        return z1.reshape(B, T, D)
-
-
-@register_predictor("hamiltonian")
-class HamiltonianPredictor(nn.Module):
-    """Port-Hamiltonian predictor: learns H(q, p), derives dynamics via autograd.
-
-    Symplectic structure: dq/dt = ∂H/∂p, dp/dt = -∂H/∂q.
-    Includes dissipation (learned damping γ) and input port G(a) for actions.
-    Full dynamics: dq/dt = ∂H/∂p, dp/dt = -∂H/∂q - γ·∂H/∂p + G(a).
-
-    Optional backbone ("lstm" or "transformer") processes the full context
-    sequence first, providing temporally-enriched features to condition
-    the action input port G instead of raw action embeddings.
-    """
-
-    def __init__(
-        self,
-        latent_dim=32,
-        action_dim=3,
-        action_embedding_dim=8,
-        hidden_dim=256,
-        dt=0.1,
-        integration_method="rk4",
-        damping_init=-1.0,
-        backbone=None,
-        backbone_layers=2,
-        backbone_nhead=4,
-        name="hamiltonian",
-        **kwargs,
-    ):
-        super().__init__()
         self.dt = dt
-        self.integration_method = integration_method
-        self.half_dim = latent_dim // 2
-        self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
+        self.n_leapfrog_steps = n_leapfrog_steps
 
-        if backbone is not None:
-            self.backbone = TemporalBackbone(
-                input_dim=latent_dim + action_embedding_dim,
-                hidden_dim=hidden_dim,
-                backbone_type=backbone,
-                num_layers=backbone_layers,
-                nhead=backbone_nhead,
-            )
-            conditioning_dim = hidden_dim
-        else:
-            self.backbone = None
-            conditioning_dim = action_embedding_dim
-
-        self.H_net = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
+        # Separable energy networks with Softplus activations
+        # (Softplus has nonzero 2nd derivatives everywhere, required for
+        # autograd-through-autograd in the leapfrog loop during training)
+        self.V_net = nn.Sequential(
+            nn.Linear(self.half_dim, hidden_dim),
             nn.Softplus(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.Softplus(),
             nn.Linear(hidden_dim, 1),
         )
+        self.T_net = nn.Sequential(
+            nn.Linear(self.half_dim, hidden_dim),
+            nn.Softplus(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Softplus(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        # Learned dissipation coefficient (softplus ensures γ ≥ 0)
         self.log_damping = nn.Parameter(torch.tensor(damping_init))
-        self.G_net = nn.Linear(conditioning_dim, self.half_dim)
-        self._conditioning_cache = None
 
-    def _dynamics(self, t, z):
-        if not z.requires_grad:
-            z = z.detach().requires_grad_(True)
+        # LSTM temporal backbone: processes (state, action) sequence to produce
+        # per-frame features that condition the action force G
+        self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
+        self.backbone = nn.LSTM(
+            input_size=latent_dim + action_embedding_dim,
+            hidden_size=backbone_hidden,
+            num_layers=backbone_layers,
+            batch_first=True,
+        )
 
-        with torch.enable_grad():
-            H = self.H_net(z).sum()
-            dH = torch.autograd.grad(H, z, create_graph=True)[0]
+        # Action force port: maps backbone features → force on momentum
+        self.G_net = nn.Linear(backbone_hidden, self.half_dim)
 
-        dH_dq = dH[..., : self.half_dim]
-        dH_dp = dH[..., self.half_dim :]
+    def _dV_dq(self, q):
+        """Compute ∂V/∂q via autograd (create_graph only during training)."""
+        q = q.detach().requires_grad_(True) if not q.requires_grad else q
+        V = self.V_net(q).sum()
+        return torch.autograd.grad(V, q, create_graph=self.training)[0]
 
+    def _dT_dp(self, p):
+        """Compute ∂T/∂p via autograd (create_graph only during training)."""
+        p = p.detach().requires_grad_(True) if not p.requires_grad else p
+        T = self.T_net(p).sum()
+        return torch.autograd.grad(T, p, create_graph=self.training)[0]
+
+    def _leapfrog_step(self, q, p, G_u, dt):
+        """One leapfrog step with port-Hamiltonian dissipation + action force.
+
+        Args:
+            q: (N, half_dim) position
+            p: (N, half_dim) momentum
+            G_u: (N, half_dim) action force (from backbone)
+            dt: scalar timestep
+
+        Returns:
+            q_new, p_new: updated position and momentum
+        """
         damping = F.softplus(self.log_damping)
-        G_u = self.G_net(self._conditioning_cache)
 
-        dq = dH_dp
-        dp = -dH_dq - damping * dH_dp + G_u
-        return torch.cat([dq, dp], dim=-1)
+        # Half-step momentum update
+        dT_dp = self._dT_dp(p)
+        dp_dt = -self._dV_dq(q) - damping * dT_dp + G_u
+        p_half = p + 0.5 * dt * dp_dt
+
+        # Full-step position update
+        dT_dp_half = self._dT_dp(p_half)
+        q_new = q + dt * dT_dp_half
+
+        # Half-step momentum update (at new position)
+        dT_dp_half2 = self._dT_dp(p_half)
+        dp_dt_new = -self._dV_dq(q_new) - damping * dT_dp_half2 + G_u
+        p_new = p_half + 0.5 * dt * dp_dt_new
+
+        return q_new, p_new
 
     def energy(self, z):
-        """Compute Hamiltonian energy for monitoring.
+        """Compute Hamiltonian energy H(q, p) = V(q) + T(p) for monitoring.
 
         Args:
             z: (B, T, D) or (B, D) latent states.
         Returns:
             H: same leading dims + (1,) scalar energy per state.
         """
-        return self.H_net(z)
+        q = z[..., :self.half_dim]
+        p = z[..., self.half_dim:]
+        return self.V_net(q) + self.T_net(p)
 
     def forward(self, context, actions, dt=None):
         B, T, D = context.shape
-        emb = self.act_emb(actions)
-
-        if self.backbone is not None:
-            inp = torch.cat([context, emb], dim=-1)
-            features = self.backbone(inp)  # (B, T, hidden)
-            self._conditioning_cache = features.reshape(B * T, -1)
-        else:
-            self._conditioning_cache = emb.reshape(B * T, -1)
-
-        z0 = context.reshape(B * T, D)
         effective_dt = dt if dt is not None else self.dt
-        t_span = torch.tensor([0.0, effective_dt], device=z0.device)
-        z1 = odeint(self._dynamics, z0, t_span, method=self.integration_method)[-1]
 
-        self._conditioning_cache = None
-        return z1.reshape(B, T, D)
+        # Temporal backbone: (state, action) sequence → per-frame features
+        emb = self.act_emb(actions)  # (B, T, emb)
+        backbone_input = torch.cat([context, emb], dim=-1)  # (B, T, D+emb)
+        backbone_out, _ = self.backbone(backbone_input)  # (B, T, backbone_hidden)
+
+        # Action force conditioned on temporal context
+        G_u = self.G_net(backbone_out)  # (B, T, half_dim)
+
+        # Reshape for per-frame integration
+        z = context.reshape(B * T, D)
+        q = z[:, :self.half_dim]
+        p = z[:, self.half_dim:]
+        G_u_flat = G_u.reshape(B * T, self.half_dim)
+
+        # Integrate n_leapfrog_steps
+        for _ in range(self.n_leapfrog_steps):
+            q, p = self._leapfrog_step(q, p, G_u_flat, effective_dt)
+
+        z_next = torch.cat([q, p], dim=-1)
+        return z_next.reshape(B, T, D)
