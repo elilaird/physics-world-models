@@ -138,7 +138,8 @@ class HamiltonianLeapfrogPredictor(nn.Module):
       q_1     = q_0 + dt · dq/dt(p_{1/2})
       p_1     = p_{1/2} + (dt/2) · dp/dt(q_1, p_{1/2})
 
-    Repeated n_leapfrog_steps times per frame for longer effective horizons.
+    Subdivided into n_leapfrog_steps sub-steps per frame (sub_dt = dt / n_steps)
+    for improved integration accuracy while keeping the total advance = dt.
     """
 
     def __init__(
@@ -267,9 +268,10 @@ class HamiltonianLeapfrogPredictor(nn.Module):
         p = z[:, self.half_dim:]
         G_u_flat = G_u.reshape(B * T, self.half_dim)
 
-        # Integrate n_leapfrog_steps
+        # Subdivide timestep for accuracy: total integration = effective_dt
+        sub_dt = effective_dt / self.n_leapfrog_steps
         for _ in range(self.n_leapfrog_steps):
-            q, p = self._leapfrog_step(q, p, G_u_flat, effective_dt)
+            q, p = self._leapfrog_step(q, p, G_u_flat, sub_dt)
 
         z_next = torch.cat([q, p], dim=-1)
         return z_next.reshape(B, T, D)
