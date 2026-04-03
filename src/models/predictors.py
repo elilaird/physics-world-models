@@ -118,21 +118,19 @@ class LSTMPredictor(nn.Module):
 
 @register_predictor("hamiltonian")
 class HamiltonianPredictor(nn.Module):
-    """Port-Hamiltonian predictor with LSTM temporal backbone.
+    """Port-Hamiltonian predictor with per-frame action forcing.
 
     Separable Hamiltonian: H(q, p) = V(q) + T(p)
       - V_net: potential energy (function of position q only)
       - T_net: kinetic energy (function of momentum p only)
 
-    An LSTM backbone processes the full (state, action) sequence to produce
-    temporally-enriched features. These condition the action force G — so G
-    has access to the history of states and actions, not just the current
-    action embedding. V and T remain purely state-dependent (they define the
-    energy landscape, which shouldn't depend on history).
-
     Dynamics derived via autograd:
       dq/dt =  ∂T/∂p
-      dp/dt = -∂V/∂q - γ·∂T/∂p + G(backbone_features)
+      dp/dt = -∂V/∂q - γ·∂T/∂p + G(a)
+
+    Action conditioning is deliberately simple (per-frame embedding → linear)
+    to ensure the Hamiltonian energy networks carry the dynamics rather than
+    being bypassed by a powerful action pathway.
 
     Integration methods (configurable via `integration_method`):
       - euler: Forward Euler. Simplest, 2 autograd calls per step.
@@ -152,8 +150,6 @@ class HamiltonianPredictor(nn.Module):
         action_dim=3,
         action_embedding_dim=8,
         hidden_dim=256,
-        backbone_hidden=128,
-        backbone_layers=2,
         dt=0.1,
         n_steps=1,
         integration_method="euler",
@@ -188,18 +184,11 @@ class HamiltonianPredictor(nn.Module):
         # Learned dissipation coefficient (softplus ensures γ ≥ 0)
         self.log_damping = nn.Parameter(torch.tensor(damping_init))
 
-        # LSTM temporal backbone: processes (state, action) sequence to produce
-        # per-frame features that condition the action force G
+        # Per-frame action conditioning: embedding → force on momentum.
+        # Deliberately simple (no temporal backbone) so the Hamiltonian
+        # must carry the dynamics — see takeaways/01.
         self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
-        self.backbone = nn.LSTM(
-            input_size=latent_dim + action_embedding_dim,
-            hidden_size=backbone_hidden,
-            num_layers=backbone_layers,
-            batch_first=True,
-        )
-
-        # Action force port: maps backbone features → force on momentum
-        self.G_net = nn.Linear(backbone_hidden, self.half_dim)
+        self.G_net = nn.Linear(action_embedding_dim, self.half_dim)
 
     def _dV_dq(self, q):
         """Compute ∂V/∂q via autograd (create_graph only during training)."""
@@ -270,13 +259,9 @@ class HamiltonianPredictor(nn.Module):
         B, T, D = context.shape
         effective_dt = dt if dt is not None else self.dt
 
-        # Temporal backbone: (state, action) sequence → per-frame features
+        # Per-frame action force: embedding → G_net → force on momentum
         emb = self.act_emb(actions)  # (B, T, emb)
-        backbone_input = torch.cat([context, emb], dim=-1)  # (B, T, D+emb)
-        backbone_out, _ = self.backbone(backbone_input)  # (B, T, backbone_hidden)
-
-        # Action force conditioned on temporal context
-        G_u = self.G_net(backbone_out)  # (B, T, half_dim)
+        G_u = self.G_net(emb)  # (B, T, half_dim)
 
         # Reshape for per-frame integration
         z = context.reshape(B * T, D)
