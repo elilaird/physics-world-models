@@ -25,8 +25,12 @@ training:
   sigreg_projections: 1024
   # Quadrature knots for Epps-Pulley normality test (paper shows insensitive)
   sigreg_knots: 50
-  # Reconstruction loss weight (0 = pure JEPA; >0 = hybrid JEPA+recon)
+  # Reconstruction loss weight on predicted states (0 = pure JEPA; >0 = hybrid)
   hybrid_recon_weight: 0.0
+  # Autoregressive rollout steps (0 = teacher-forced only; >0 = AR loss added)
+  ar_steps: 0
+  # Weight on the autoregressive rollout loss term
+  ar_weight: 1.0
   # Detach prediction targets in JEPA mode (prevents encoder overfitting to predictor)
   detach_jepa_targets: false
 
