@@ -88,9 +88,11 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
     1. Loss = latent_prediction + SIGReg (no KL)
     2. Gradients flow through encoder targets (encoder and predictor co-adapt)
     3. SIGReg prevents collapse instead of KL divergence
-    4. Decoder trained as detached probe (decodes encoded latents, not predicted)
-       so dynamics can be visually verified without affecting the JEPA objective.
-       In hybrid mode, recon grads flow into encoder (but never into predictor).
+    4. Decoder probe on encoded latents (always detached) for monitoring
+    5. When hybrid_recon_weight > 0: decode PREDICTED states and compare to GT
+       frames. Gradients flow through predictor + decoder, forcing the predictor's
+       q output to be visually correct — the key signal that activates the
+       Hamiltonian's dq/dt = ∂T/∂p pathway. See takeaways/02.
     """
     images = batch["images"]   # (B, T+1, C, H, W)
     actions = batch["actions"]  # (B, T)
@@ -120,6 +122,7 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
     num_windows = max(1, 1 + (N_lat - window_size) // step_size)
 
     latent_pred_loss = torch.tensor(0.0, device=images.device)
+    pred_recon_loss = torch.tensor(0.0, device=images.device)
 
     for w in range(num_windows):
         start = w * step_size
@@ -135,20 +138,24 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
         target_states = w_states[:, 1:].detach() if detach_targets else w_states[:, 1:]
         latent_pred_loss = latent_pred_loss + ((pred_z - target_states) ** 2).mean() / num_windows
 
-    # 4. Decoder probe: train decoder on encoded latents (detached) so it can
-    #    visualize the latent space without affecting the JEPA objective.
-    #    In hybrid mode, recon grads flow through encoder + decoder (non-detached).
+        # Decode PREDICTED states → compare to GT frames.
+        # Gradient flows through predictor + decoder, forcing the predictor's
+        # q output to be visually correct (activates dq/dt = ∂T/∂p).
+        if hybrid_recon_weight > 0:
+            pred_decoded = model.decode(pred_z.reshape(B * n_pred, D))
+            gt_start = K - 1 + start + 1
+            gt_frames = images[:, gt_start:gt_start + n_pred].reshape(B * n_pred, C, H, W)
+            pred_recon_loss = pred_recon_loss + ((pred_decoded - gt_frames) ** 2).mean() / num_windows
+
+    # 4. Decoder probe on encoded latents (always detached — for monitoring only)
     recon_targets = images[:, K - 1:].reshape(B * N_lat, C, H, W)
+    recon = model.decode(all_states.detach().reshape(B * N_lat, D))
+    recon_loss = ((recon - recon_targets) ** 2).mean()
+
+    # Total: JEPA core + decoder probe + optional predicted-state reconstruction
+    loss = latent_pred_loss + sigreg_lambda * sigreg_loss + recon_loss
     if hybrid_recon_weight > 0:
-        # Hybrid: reconstruction loss flows into encoder + decoder
-        recon = model.decode(all_states.reshape(B * N_lat, D))
-        recon_loss = ((recon - recon_targets) ** 2).mean()
-        loss = latent_pred_loss + sigreg_lambda * sigreg_loss + hybrid_recon_weight * recon_loss
-    else:
-        # Pure JEPA: decoder is a probe only — detach so it doesn't affect encoder/predictor
-        recon = model.decode(all_states.detach().reshape(B * N_lat, D))
-        recon_loss = ((recon - recon_targets) ** 2).mean()
-        loss = latent_pred_loss + sigreg_lambda * sigreg_loss + recon_loss
+        loss = loss + hybrid_recon_weight * pred_recon_loss
 
     optimizer.zero_grad()
     loss.backward()
@@ -157,6 +164,7 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
 
     losses = {
         "recon_loss": recon_loss.item(),
+        "pred_recon_loss": pred_recon_loss.item() if hybrid_recon_weight > 0 else 0.0,
         "latent_pred_loss": latent_pred_loss.item(),
         "sigreg_loss": sigreg_loss.item(),
         "total_loss": loss.item(),
@@ -198,7 +206,7 @@ def jepa_eval_step(model, batch, cfg):
     num_windows = max(1, 1 + (N_lat - window_size) // step_size)
 
     latent_pred_loss = 0.0
-    recon_loss = 0.0
+    pred_recon_loss = 0.0
     for w in range(num_windows):
         start = w * step_size
         end = min(start + window_size, N_lat)
@@ -212,18 +220,25 @@ def jepa_eval_step(model, batch, cfg):
         target_states = w_states[:, 1:]
         latent_pred_loss += ((pred_z - target_states) ** 2).mean().item() / num_windows
 
-        # Reconstruction for monitoring
-        pred_decoded = model.decode(pred_z.reshape(B * n_pred, D))
-        gt_start = K - 1 + start + 1
-        gt_frames = images[:, gt_start:gt_start + n_pred].reshape(B * n_pred, C, H, W)
-        recon_loss += ((pred_decoded - gt_frames) ** 2).mean().item() / num_windows
+        # Decode predicted states (matches train step's pred_recon_loss)
+        if hybrid_recon_weight > 0:
+            pred_decoded = model.decode(pred_z.reshape(B * n_pred, D))
+            gt_start = K - 1 + start + 1
+            gt_frames = images[:, gt_start:gt_start + n_pred].reshape(B * n_pred, C, H, W)
+            pred_recon_loss += ((pred_decoded - gt_frames) ** 2).mean().item() / num_windows
 
-    total_loss = latent_pred_loss
+    # Decoder probe on encoded latents (matches train step's recon_loss)
+    recon_targets = images[:, K - 1:].reshape(B * N_lat, C, H, W)
+    recon = model.decode(all_states.reshape(B * N_lat, D))
+    recon_loss = ((recon - recon_targets) ** 2).mean().item()
+
+    total_loss = latent_pred_loss + recon_loss
     if hybrid_recon_weight > 0:
-        total_loss += hybrid_recon_weight * recon_loss
+        total_loss += hybrid_recon_weight * pred_recon_loss
 
     losses = {
         "recon_loss": recon_loss,
+        "pred_recon_loss": pred_recon_loss if hybrid_recon_weight > 0 else 0.0,
         "latent_pred_loss": latent_pred_loss,
         "sigreg_loss": 0.0,  # not computed at eval (expensive, not needed)
         "total_loss": total_loss,
@@ -405,7 +420,7 @@ def main(cfg: DictConfig):
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.Adam(trainable_params, lr=lr)
 
-    loss_keys = ["total_loss", "recon_loss", "latent_pred_loss", "sigreg_loss"]
+    loss_keys = ["total_loss", "recon_loss", "pred_recon_loss", "latent_pred_loss", "sigreg_loss"]
     if _has_energy(model.predictor):
         loss_keys.extend(["energy_mean", "energy_std", "energy_time_var", "energy_monotone"])
 
