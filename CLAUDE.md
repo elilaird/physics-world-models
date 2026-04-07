@@ -46,9 +46,6 @@ python train_visual.py model.latent_channels=64 model.context_length=3
 # Tune SIGReg lambda (the key JEPA hyperparameter)
 python train_visual.py --multirun training.sigreg_lambda=0.01,0.05,0.1,0.5,1.0
 
-# Hamiltonian integration method sweep
-python train_visual.py --multirun predictor.integration_method=euler,semi_implicit,leapfrog
-
 # Hybrid mode (JEPA + lightweight reconstruction)
 python train_visual.py training.hybrid_recon_weight=0.1
 
@@ -83,7 +80,7 @@ Three predictors registered in `PREDICTOR_REGISTRY`:
 
 - **MLPPredictor** (`mlp`): per-frame residual MLP, `z_{t+1} = z_t + f(z_t, a_t)`. Fixed-step, ignores dt.
 - **LSTMPredictor** (`lstm`): LSTM over context + residual output. Fixed-step, ignores dt.
-- **HamiltonianPredictor** (`hamiltonian`): separable `H(q,p) = V(q) + T(p)` with configurable integrator (euler/semi_implicit/leapfrog). Port-Hamiltonian extension with learned dissipation `γ` and LSTM backbone for temporal context conditioning the action force `G(a)`. **dt-aware**: accepts dt parameter for temporal generalization. `n_steps` integration sub-steps per frame. `.energy(z)` method for monitoring.
+- **HamiltonianPredictor** (`hamiltonian`): non-separable `H(z)` — a single scalar energy network over the full latent. Hamilton's equations derived via one autograd call (∂H/∂z) sliced into ∂H/∂q and ∂H/∂p, with port-Hamiltonian dissipation `γ·∂H/∂p` and per-frame action force `G(a)` on momentum. Forward Euler integration. **dt-aware**: accepts dt parameter for temporal generalization. `.energy(z)` method for monitoring.
 
 ### Visual World Model (`src/models/visual.py`)
 

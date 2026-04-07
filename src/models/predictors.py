@@ -19,9 +19,8 @@ Predictors:
         - LSTMPredictor: LSTM over context sequence
 
     Physics-informed (port-Hamiltonian, dt-aware):
-        - HamiltonianPredictor: separable H(q,p) = V(q) + T(p),
-          configurable integrator (euler/semi_implicit/leapfrog),
-          port-Hamiltonian dissipation + action forcing
+        - HamiltonianPredictor: non-separable H(z) with forward-Euler step
+          on Hamilton's equations, port-Hamiltonian dissipation + action forcing
 """
 
 import torch
@@ -118,30 +117,28 @@ class LSTMPredictor(nn.Module):
 
 @register_predictor("hamiltonian")
 class HamiltonianPredictor(nn.Module):
-    """Port-Hamiltonian predictor with per-frame action forcing.
+    """Non-separable Hamiltonian with port-Hamiltonian extensions.
 
-    Separable Hamiltonian: H(q, p) = V(q) + T(p)
-      - V_net: potential energy (function of position q only)
-      - T_net: kinetic energy (function of momentum p only)
+    Single scalar energy network H(z) over the full latent, with a
+    symplectic partition z = [q, p] where q = z[..., :D/2] and
+    p = z[..., D/2:] defines which half gets position-like vs
+    momentum-like dynamics.
 
-    Dynamics derived via autograd:
-      dq/dt =  ∂T/∂p
-      dp/dt = -∂V/∂q - γ·∂T/∂p + G(a)
+    Dynamics (forward Euler on Hamilton's equations + dissipation + forcing):
+      dq/dt =  ∂H/∂p
+      dp/dt = -∂H/∂q - γ·∂H/∂p + G(a)
 
-    Action conditioning is deliberately simple (per-frame embedding → linear)
-    to ensure the Hamiltonian energy networks carry the dynamics rather than
-    being bypassed by a powerful action pathway.
+    One autograd call over the full latent gives ∂H/∂z; we slice to get
+    ∂H/∂q and ∂H/∂p. This is strictly more expressive than separable
+    V(q) + T(p) (it can represent coupling terms like q·p), and strictly
+    cheaper (one autograd call instead of two).
 
-    Integration methods (configurable via `integration_method`):
-      - euler: Forward Euler. Simplest, 2 autograd calls per step.
-      - semi_implicit: Symplectic Euler. Update p first, then q with
-        updated p. 3 autograd calls per step. Better stability.
-      - leapfrog: Störmer-Verlet. 5 autograd calls per step.
-        Symplectic for conservative systems, but overkill for
-        port-Hamiltonian (dissipation breaks symplecticity).
+    Action conditioning is deliberately simple (per-frame embedding →
+    linear) so the Hamiltonian carries the dynamics rather than being
+    bypassed by a powerful action pathway (see takeaways/01).
 
-    Subdivided into n_steps sub-steps per frame (sub_dt = dt / n_steps)
-    for improved integration accuracy while keeping the total advance = dt.
+    Softplus activations are required on H_net because autograd-through-
+    autograd during training needs nonzero second derivatives everywhere.
     """
 
     def __init__(
@@ -151,8 +148,6 @@ class HamiltonianPredictor(nn.Module):
         action_embedding_dim=8,
         hidden_dim=256,
         dt=0.1,
-        n_steps=1,
-        integration_method="euler",
         damping_init=-1.0,
         name="hamiltonian",
         **kwargs,
@@ -160,21 +155,9 @@ class HamiltonianPredictor(nn.Module):
         super().__init__()
         self.half_dim = latent_dim // 2
         self.dt = dt
-        self.n_steps = n_steps
-        self.integration_method = integration_method
 
-        # Separable energy networks with Softplus activations
-        # (Softplus has nonzero 2nd derivatives everywhere, required for
-        # autograd-through-autograd during training)
-        self.V_net = nn.Sequential(
-            nn.Linear(self.half_dim, hidden_dim),
-            nn.Softplus(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Softplus(),
-            nn.Linear(hidden_dim, 1),
-        )
-        self.T_net = nn.Sequential(
-            nn.Linear(self.half_dim, hidden_dim),
+        self.H_net = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
             nn.Softplus(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.Softplus(),
@@ -185,74 +168,18 @@ class HamiltonianPredictor(nn.Module):
         self.log_damping = nn.Parameter(torch.tensor(damping_init))
 
         # Per-frame action conditioning: embedding → force on momentum.
-        # Deliberately simple (no temporal backbone) so the Hamiltonian
-        # must carry the dynamics — see takeaways/01.
         self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
         self.G_net = nn.Linear(action_embedding_dim, self.half_dim)
 
-    def _dV_dq(self, q):
-        """Compute ∂V/∂q via autograd (create_graph only during training)."""
-        q = q.detach().requires_grad_(True) if not q.requires_grad else q
-        V = self.V_net(q).sum()
-        return torch.autograd.grad(V, q, create_graph=self.training)[0]
-
-    def _dT_dp(self, p):
-        """Compute ∂T/∂p via autograd (create_graph only during training)."""
-        p = p.detach().requires_grad_(True) if not p.requires_grad else p
-        T = self.T_net(p).sum()
-        return torch.autograd.grad(T, p, create_graph=self.training)[0]
-
-    def _euler_step(self, q, p, G_u, dt):
-        """Forward Euler step. 2 autograd calls."""
-        damping = F.softplus(self.log_damping)
-        dT_dp = self._dT_dp(p)
-        dV_dq = self._dV_dq(q)
-
-        q_new = q + dt * dT_dp
-        p_new = p + dt * (-dV_dq - damping * dT_dp + G_u)
-        return q_new, p_new
-
-    def _semi_implicit_step(self, q, p, G_u, dt):
-        """Semi-implicit (symplectic) Euler step. Update p first, then q
-        with the updated momentum. 3 autograd calls."""
-        damping = F.softplus(self.log_damping)
-        dT_dp = self._dT_dp(p)
-        dV_dq = self._dV_dq(q)
-
-        p_new = p + dt * (-dV_dq - damping * dT_dp + G_u)
-        q_new = q + dt * self._dT_dp(p_new)
-        return q_new, p_new
-
-    def _leapfrog_step(self, q, p, G_u, dt):
-        """Leapfrog (Störmer-Verlet) step. 5 autograd calls."""
-        damping = F.softplus(self.log_damping)
-
-        # Half-step momentum update
-        dT_dp = self._dT_dp(p)
-        dp_dt = -self._dV_dq(q) - damping * dT_dp + G_u
-        p_half = p + 0.5 * dt * dp_dt
-
-        # Full-step position update
-        q_new = q + dt * self._dT_dp(p_half)
-
-        # Half-step momentum update (at new position)
-        dT_dp_half = self._dT_dp(p_half)
-        dp_dt_new = -self._dV_dq(q_new) - damping * dT_dp_half + G_u
-        p_new = p_half + 0.5 * dt * dp_dt_new
-
-        return q_new, p_new
-
     def energy(self, z):
-        """Compute Hamiltonian energy H(q, p) = V(q) + T(p) for monitoring.
+        """Compute Hamiltonian energy H(z) for monitoring.
 
         Args:
             z: (B, T, D) or (B, D) latent states.
         Returns:
             H: same leading dims + (1,) scalar energy per state.
         """
-        q = z[..., :self.half_dim]
-        p = z[..., self.half_dim:]
-        return self.V_net(q) + self.T_net(p)
+        return self.H_net(z)
 
     @torch.enable_grad()
     def forward(self, context, actions, dt=None):
@@ -261,25 +188,25 @@ class HamiltonianPredictor(nn.Module):
 
         # Per-frame action force: embedding → G_net → force on momentum
         emb = self.act_emb(actions)  # (B, T, emb)
-        G_u = self.G_net(emb)  # (B, T, half_dim)
+        G_u = self.G_net(emb).reshape(B * T, self.half_dim)
 
-        # Reshape for per-frame integration
+        # Flatten batch/time for per-frame integration
         z = context.reshape(B * T, D)
+        if not z.requires_grad:
+            z = z.detach().requires_grad_(True)
+
+        # Single autograd call: ∂H/∂z over the full latent
+        H = self.H_net(z).sum()
+        dH_dz = torch.autograd.grad(H, z, create_graph=self.training)[0]
+        dH_dq = dH_dz[:, :self.half_dim]
+        dH_dp = dH_dz[:, self.half_dim:]
+
+        # Forward Euler step on Hamilton's equations + dissipation + forcing
+        damping = F.softplus(self.log_damping)
         q = z[:, :self.half_dim]
         p = z[:, self.half_dim:]
-        G_u_flat = G_u.reshape(B * T, self.half_dim)
+        q_new = q + effective_dt * dH_dp
+        p_new = p + effective_dt * (-dH_dq - damping * dH_dp + G_u)
 
-        # Select integration method
-        step_fn = {
-            "euler": self._euler_step,
-            "semi_implicit": self._semi_implicit_step,
-            "leapfrog": self._leapfrog_step,
-        }[self.integration_method]
-
-        # Subdivide timestep: total integration = effective_dt
-        sub_dt = effective_dt / self.n_steps
-        for _ in range(self.n_steps):
-            q, p = step_fn(q, p, G_u_flat, sub_dt)
-
-        z_next = torch.cat([q, p], dim=-1)
+        z_next = torch.cat([q_new, p_new], dim=-1)
         return z_next.reshape(B, T, D)
