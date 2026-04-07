@@ -89,11 +89,11 @@ Three predictors registered in `PREDICTOR_REGISTRY`:
 
 JEPA-only architecture with flat latent space:
 - **VisionEncoder**: 8-layer ConvNet → MLP → flat latent `z ∈ (B, D)`. BatchNorm projector for SIGReg compatibility.
-- **VisionDecoder**: MLP → spatial → ConvNet upsample. Receives **position half only** (first `D//2` dims).
-- **VisualWorldModel**: encoder + decoder + swappable predictor. No state_transform (encoder output IS the state). Latent split: `z = [q, p]` where q drives decoding, p carries dynamics info.
+- **VisionDecoder**: MLP → spatial → ConvNet upsample. Receives the **full latent** `z ∈ (B, D)` — symmetric in q and p.
+- **VisualWorldModel**: encoder + decoder + swappable predictor. No state_transform (encoder output IS the state). The Hamiltonian predictor splits `z = [q, p]` internally for its dynamics, but the decoder is blind to the split — this removes the q/p misalignment problem documented in `takeaways/02`.
 
 **Key config parameters** (`configs/model/visual_world_model.yaml`):
-- `latent_channels: 64` — total latent dims (split into 32 position + 32 momentum)
+- `latent_channels: 64` — total latent dims (predictor splits into 32 q + 32 p internally; decoder sees all 64)
 - `hidden_channels: 512` — hidden dim in encoder/decoder MLPs
 - `encoder_frames: 2` — number of frames channel-concatenated for velocity estimation
 - `context_length: 3` — number of latent frames the predictor sees

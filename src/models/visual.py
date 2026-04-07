@@ -51,10 +51,11 @@ class _ResBlock(nn.Module):
 
 
 class VisionDecoder(nn.Module):
-    """Decodes flat (B, D_q) latents to (B, C, 64, 64) images.
+    """Decodes flat (B, D) latents to (B, C, 64, 64) images.
 
     Projects flat latent to (B, 64, 8, 8) spatial, then ResBlock+Upsample ×3 → 64×64.
-    Input is position-half of the latent (latent_channels // 2 dims).
+    Input is the full latent (latent_channels dims). The decoder is symmetric
+    with respect to q and p — any structural split lives in the predictor.
     """
 
     def __init__(self, channels=3, latent_channels=16, hidden_channels=512):
@@ -84,9 +85,11 @@ class VisualWorldModel(nn.Module):
     """Encoder/decoder + swappable flat latent-space predictor.
 
     JEPA-only: encoder output IS the state (no state_transform).
-    Latent z = [q, p] split on last dim (position + momentum).
-    Decoder only receives the position half (first latent_channels // 2 dims).
-    SIGReg prevents collapse; BatchNorm projector after encoder.
+    Latent z ∈ R^D; the Hamiltonian predictor may split it internally into
+    q = z[..., :D//2] and p = z[..., D//2:], but the decoder sees the full z.
+    This removes the asymmetric "q = observable" pressure on the encoder while
+    preserving the Hamiltonian's structural dynamics. SIGReg prevents collapse;
+    BatchNorm projector after encoder.
     """
 
     def __init__(
@@ -119,10 +122,11 @@ class VisualWorldModel(nn.Module):
             encoder_frames=encoder_frames,
             hidden_channels=hidden_channels,
         )
-        # Decoder receives position half only
+        # Decoder receives the full latent (Option A: no q/p asymmetry on the
+        # decoder side). The Hamiltonian predictor still splits internally.
         self.decoder = VisionDecoder(
             channels=channels,
-            latent_channels=latent_channels // 2,
+            latent_channels=latent_channels,
             hidden_channels=hidden_channels,
         )
         self.predictor = predictor
@@ -165,15 +169,15 @@ class VisualWorldModel(nn.Module):
         return mu.reshape(B, n_out, D)
 
     def decode(self, z):
-        """Decode position-half of latent to images.
+        """Decode the full latent to images.
 
         Args:
-            z: (B, D) or (B*T, D) full latent state [q, p]
+            z: (B, D) or (B*T, D) full latent state (concatenation of q and p
+               from the predictor's perspective, but opaque to the decoder).
         Returns:
             images: (B, C, H, W)
         """
-        q = z[..., :self.latent_channels // 2]
-        return self.decoder(q)
+        return self.decoder(z)
 
     def encoder_parameters(self):
         yield from self.encoder.parameters()
