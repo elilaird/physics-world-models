@@ -105,6 +105,7 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
     pred_len = model.pred_length
 
     hybrid_recon_weight = cfg.training.get("hybrid_recon_weight", 0.0)
+    recon_weight = cfg.training.get("recon_weight", 1.0)
     sigreg_lambda = cfg.training.get("sigreg_lambda", 0.1)
     detach_targets = cfg.training.get("detach_jepa_targets", False)
     ar_steps = cfg.training.get("ar_steps", 0)
@@ -138,7 +139,7 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
 
         pred_input = w_states[:, :-1]
         w_actions = transition_actions[:, start:start + n_pred].long()
-        pred_z = model.predictor(pred_input, w_actions)
+        pred_z = model.predict(pred_input, w_actions)
 
         # Optionally detach targets
         target_states = w_states[:, 1:].detach() if detach_targets else w_states[:, 1:]
@@ -160,7 +161,7 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
             z_prev = w_states[:, 0:1]  # (B, 1, D) — seed from encoder
             ar_preds = []
             for t in range(n_ar):
-                ar_pred = model.predictor(z_prev, w_actions[:, t:t + 1])
+                ar_pred = model.predict(z_prev, w_actions[:, t:t + 1])
                 z_next = ar_pred[:, -1:]  # (B, 1, D)
                 ar_preds.append(z_next)
                 z_prev = z_next
@@ -168,13 +169,17 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
             ar_target = target_states[:, :n_ar]
             ar_loss = ar_loss + ((ar_pred_z - ar_target) ** 2).mean() / num_windows
 
-    # 4. Decoder probe on encoded latents (always detached — for monitoring only)
+    # 4. Decoder reconstruction on encoded latents.
+    # Un-detached: gradients flow through encoder → decoder. Because the decoder
+    # sees only q (first D//2 dims of the latent), this term directly pressures
+    # the encoder to place decodable visual content in q, which is the q/p
+    # alignment signal that pure JEPA is missing. See takeaways/02.
     recon_targets = images[:, K - 1:].reshape(B * N_lat, C, H, W)
-    recon = model.decode(all_states.detach().reshape(B * N_lat, D))
+    recon = model.decode(all_states.reshape(B * N_lat, D))
     recon_loss = ((recon - recon_targets) ** 2).mean()
 
-    # Total: JEPA core + decoder probe + optional extras
-    loss = latent_pred_loss + sigreg_lambda * sigreg_loss + recon_loss
+    # Total: JEPA core + weighted decoder recon + optional extras
+    loss = latent_pred_loss + sigreg_lambda * sigreg_loss + recon_weight * recon_loss
     if hybrid_recon_weight > 0:
         loss = loss + hybrid_recon_weight * pred_recon_loss
     if ar_steps > 0:
@@ -217,6 +222,7 @@ def jepa_eval_step(model, batch, cfg):
     pred_len = model.pred_length
 
     hybrid_recon_weight = cfg.training.get("hybrid_recon_weight", 0.0)
+    recon_weight = cfg.training.get("recon_weight", 1.0)
     ar_steps = cfg.training.get("ar_steps", 0)
     ar_weight = cfg.training.get("ar_weight", 1.0)
 
@@ -242,7 +248,7 @@ def jepa_eval_step(model, batch, cfg):
 
         pred_input = w_states[:, :-1]
         w_actions = transition_actions[:, start:start + n_pred].long()
-        pred_z = model.predictor(pred_input, w_actions)
+        pred_z = model.predict(pred_input, w_actions)
 
         target_states = w_states[:, 1:]
         latent_pred_loss += ((pred_z - target_states) ** 2).mean().item() / num_windows
@@ -260,7 +266,7 @@ def jepa_eval_step(model, batch, cfg):
             z_prev = w_states[:, 0:1]
             ar_preds = []
             for t in range(n_ar):
-                ar_pred = model.predictor(z_prev, w_actions[:, t:t + 1])
+                ar_pred = model.predict(z_prev, w_actions[:, t:t + 1])
                 z_next = ar_pred[:, -1:]
                 ar_preds.append(z_next)
                 z_prev = z_next
@@ -272,7 +278,7 @@ def jepa_eval_step(model, batch, cfg):
     recon = model.decode(all_states.reshape(B * N_lat, D))
     recon_loss = ((recon - recon_targets) ** 2).mean().item()
 
-    total_loss = latent_pred_loss + recon_loss
+    total_loss = latent_pred_loss + recon_weight * recon_loss
     if hybrid_recon_weight > 0:
         total_loss += hybrid_recon_weight * pred_recon_loss
     if ar_steps > 0:

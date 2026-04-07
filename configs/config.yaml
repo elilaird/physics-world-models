@@ -25,6 +25,10 @@ training:
   sigreg_projections: 1024
   # Quadrature knots for Epps-Pulley normality test (paper shows insensitive)
   sigreg_knots: 50
+  # Decoder reconstruction weight on encoded latents (un-detached — flows through
+  # encoder to align q with decodable visual content). Was implicitly 1.0 and
+  # detached historically; now a trainable signal. Set to 0 for a pure JEPA test.
+  recon_weight: 1.0
   # Reconstruction loss weight on predicted states (0 = pure JEPA; >0 = hybrid)
   hybrid_recon_weight: 0.0
   # Autoregressive rollout steps (0 = teacher-forced only; >0 = AR loss added)

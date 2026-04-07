@@ -184,6 +184,25 @@ class VisualWorldModel(nn.Module):
     def predictor_parameters(self):
         yield from self.predictor.parameters()
 
+    def predict(self, context, actions, dt=None):
+        """Thin pass-through to the predictor.
+
+        The predictor is expected to output latents in the same distribution
+        as the encoder (that's what the JEPA latent_pred_loss trains it to do).
+        Applying any extra normalization here was found to hurt — see the
+        405240 experiment where a BatchNorm wrap caused train/eval statistics
+        mismatch and degraded every downstream metric.
+
+        Args:
+            context: (B, T_ctx, D) latent context window.
+            actions: (B, T_act) action indices.
+            dt: optional timestep override for dt-aware predictors.
+
+        Returns:
+            z_next: (B, T_out, D) predicted latent states.
+        """
+        return self.predictor(context, actions, dt=dt)
+
     def autoregressive_rollout(self, z_init, actions, horizon, dt=None):
         """Roll out from context_length state using the predictor.
 
@@ -199,7 +218,7 @@ class VisualWorldModel(nn.Module):
         states = []
         z_t = z_init.unsqueeze(1)  # (B, 1, latent_channels)
         for t in range(horizon):
-            z_next = self.predictor(z_t[:, -self.context_length:, :], actions[:, t : t + 1], dt=dt)
+            z_next = self.predict(z_t[:, -self.context_length:, :], actions[:, t : t + 1], dt=dt)
             states.append(z_next.squeeze(1))
             z_t = torch.cat([z_t, z_next], dim=1)
         return torch.stack(states, dim=1)

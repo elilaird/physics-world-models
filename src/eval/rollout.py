@@ -45,7 +45,7 @@ def visual_open_loop_rollout(model, images, actions, dt=None):
     pred_latents = []
     for t in range(horizon):
         act = transition_actions[:, t:t + ctx_len].long()
-        pred = model.predictor(context, act, dt=dt)  # (B, ctx_len, D)
+        pred = model.predict(context, act, dt=dt)  # (B, ctx_len, D)
         z_next = pred[:, -1]  # (B, D)
         pred_latents.append(z_next)
         context = torch.cat([context[:, 1:], z_next.unsqueeze(1)], dim=1)
