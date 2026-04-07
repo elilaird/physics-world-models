@@ -74,6 +74,9 @@ def build_model(cfg):
         pred_length=cfg.model.get("pred_length", 1),
         observation_dt=cfg.model.observation_dt,
         encoder_frames=cfg.model.get("encoder_frames", 1),
+        infer_context_length=cfg.model.get(
+            "infer_context_length", cfg.model.context_length
+        ),
     )
 
 
@@ -81,34 +84,53 @@ def build_model(cfg):
 # JEPA training step
 # ---------------------------------------------------------------------------
 
+def _reseed_window(predictor, window_ctx, shared_state):
+    """Re-seed dynamical variables from window_ctx, reuse shared static keys.
+
+    The predictor's ``infer`` is called on the window context to get fresh
+    (z, q, p) seeded at the last frame of the window, then any static keys
+    from ``shared_state`` — ``theta`` (Latent-*), ``h``/``c`` (LSTM) — are
+    copied over so they are not re-inferred per window.
+    """
+    new_state = predictor.infer(window_ctx)
+    for key in ("theta", "h", "c"):
+        if key in shared_state:
+            new_state[key] = shared_state[key]
+    return new_state
+
+
 def jepa_train_step(model, batch, optimizer, sigreg, cfg):
-    """LeWM-style JEPA training step.
+    """LeWM-style JEPA training step with infer-once-per-sequence unroll.
 
     Key design:
-    1. Loss = latent_prediction + SIGReg (no KL)
-    2. Gradients flow through encoder targets (encoder and predictor co-adapt)
-    3. SIGReg prevents collapse instead of KL divergence
-    4. Decoder probe on encoded latents (always detached) for monitoring
-    5. When hybrid_recon_weight > 0: decode PREDICTED states and compare to GT
-       frames. Gradients flow through predictor + decoder, forcing the predictor's
-       q output to be visually correct — the key signal that activates the
-       Hamiltonian's dq/dt = ∂T/∂p pathway. See takeaways/02.
-    6. When ar_steps > 0: autoregressive rollout in latent space. Errors compound
-       over steps, penalizing identity shortcuts that work for one step but drift
-       over time. See ideas/forcing-physics-inductive-bias.md.
+    1. Loss = latent_prediction + SIGReg (no KL).
+    2. ``predictor.infer`` is called ONCE per sequence on the first
+       ``infer_context_length`` latents, producing a ``shared_state`` whose
+       static keys (``theta`` for Latent-*, ``h``/``c`` for LSTM) are reused
+       across all sliding windows in the sequence. This is the system-
+       identification discipline from Latent-ODE (Rubanova et al. 2019) and
+       keeps the GRU out of the per-step dynamics loop (takeaways/01).
+    3. Each sliding window re-seeds (z, q, p) via ``_reseed_window`` from
+       the window's last context frame, then unrolls for ``pred_len`` steps.
+       The unroll is NOT teacher-forced — pure BPTT through multiple steps,
+       which requires the BPTT-safe ``_require_grad`` pattern inside the
+       Hamiltonian ``step``.
+    4. SIGReg prevents collapse instead of KL divergence.
+    5. Decoder probe on encoded latents (detached) for monitoring.
+    6. When ``hybrid_recon_weight > 0``: decode the rolled-out latents and
+       compare to GT frames. Gradients flow through predictor + decoder,
+       forcing pixel-level supervision on rolled-out trajectories.
     """
     images = batch["images"]   # (B, T+1, C, H, W)
     actions = batch["actions"]  # (B, T)
     B, _, C, H, W = images.shape
     K = model.encoder_frames
-    ctx_len = model.context_length
+    ctx_len = model.infer_context_length
     pred_len = model.pred_length
 
     hybrid_recon_weight = cfg.training.get("hybrid_recon_weight", 0.0)
     sigreg_lambda = cfg.training.get("sigreg_lambda", 0.1)
     detach_targets = cfg.training.get("detach_jepa_targets", False)
-    ar_steps = cfg.training.get("ar_steps", 0)
-    ar_weight = cfg.training.get("ar_weight", 1.0)
 
     # 1. Encode all frames → flat latents (encoder output IS the state)
     mu_all = model.encode_sequence(images)  # (B, N_lat, D)
@@ -120,65 +142,62 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
     # 2. SIGReg on encoded embeddings (prevents collapse)
     sigreg_loss = sigreg(all_states.reshape(-1, D))
 
-    # 3. Sliding window prediction
+    # 3. Infer shared static state ONCE per sequence from the first ctx_len
+    #    latents. For Latent-* predictors this computes theta; for LSTM it
+    #    warms up (h, c); for MLP/Hamiltonian it just returns {'z': ...}
+    #    and contributes nothing static.
     transition_actions = actions[:, K - 1:]  # (B, N_lat - 1)
+    full_ctx_actions = transition_actions[:, : max(ctx_len - 1, 0)].long()
+    shared_state = model.predictor.infer(
+        all_states[:, :ctx_len], context_actions=full_ctx_actions
+    )
+
+    # 4. Sliding window unroll. Each window re-seeds (q, p) from its own
+    #    starting frame but reuses shared_state's static keys.
     window_size = ctx_len + pred_len
     step_size = pred_len
     num_windows = max(1, 1 + (N_lat - window_size) // step_size)
 
     latent_pred_loss = torch.tensor(0.0, device=images.device)
     pred_recon_loss = torch.tensor(0.0, device=images.device)
-    ar_loss = torch.tensor(0.0, device=images.device)
 
     for w in range(num_windows):
         start = w * step_size
         end = min(start + window_size, N_lat)
-        w_states = all_states[:, start:end]
-        n_pred = w_states.shape[1] - 1
+        window_ctx = all_states[:, start:start + ctx_len]
+        n_pred = end - start - ctx_len
+        if n_pred <= 0:
+            continue
 
-        pred_input = w_states[:, :-1]
-        w_actions = transition_actions[:, start:start + n_pred].long()
-        pred_z = model.predictor(pred_input, w_actions)
+        target_states = all_states[:, start + ctx_len : start + ctx_len + n_pred]
+        if detach_targets:
+            target_states = target_states.detach()
 
-        # Optionally detach targets
-        target_states = w_states[:, 1:].detach() if detach_targets else w_states[:, 1:]
+        unroll_actions = transition_actions[
+            :, start + ctx_len - 1 : start + ctx_len - 1 + n_pred
+        ].long()
+
+        window_state = _reseed_window(model.predictor, window_ctx, shared_state)
+        pred_z = model.predictor.unroll(window_state, unroll_actions, n_pred)
+
         latent_pred_loss = latent_pred_loss + ((pred_z - target_states) ** 2).mean() / num_windows
 
-        # Decode PREDICTED states → compare to GT frames.
-        # Gradient flows through predictor + decoder, forcing the predictor's
-        # q output to be visually correct (activates dq/dt = ∂T/∂p).
+        # Decode PREDICTED (rolled-out) states → compare to GT frames.
         if hybrid_recon_weight > 0:
             pred_decoded = model.decode(pred_z.reshape(B * n_pred, D))
-            gt_start = K - 1 + start + 1
+            gt_start = K - 1 + start + ctx_len
             gt_frames = images[:, gt_start:gt_start + n_pred].reshape(B * n_pred, C, H, W)
             pred_recon_loss = pred_recon_loss + ((pred_decoded - gt_frames) ** 2).mean() / num_windows
 
-        # Autoregressive rollout: errors compound over steps, penalizing
-        # identity shortcuts that work for one step but drift over time.
-        if ar_steps > 0:
-            n_ar = min(ar_steps, n_pred)
-            z_prev = w_states[:, 0:1]  # (B, 1, D) — seed from encoder
-            ar_preds = []
-            for t in range(n_ar):
-                ar_pred = model.predictor(z_prev, w_actions[:, t:t + 1])
-                z_next = ar_pred[:, -1:]  # (B, 1, D)
-                ar_preds.append(z_next)
-                z_prev = z_next
-            ar_pred_z = torch.cat(ar_preds, dim=1)  # (B, n_ar, D)
-            ar_target = target_states[:, :n_ar]
-            ar_loss = ar_loss + ((ar_pred_z - ar_target) ** 2).mean() / num_windows
-
-    # 4. Decoder probe on encoded latents (always detached — for monitoring only)
+    # 5. Decoder probe on encoded latents (always detached — for monitoring only)
     recon_targets = images[:, K - 1:].reshape(B * N_lat, C, H, W)
     recon = model.decode(all_states.detach().reshape(B * N_lat, D))
     recon_loss = ((recon - recon_targets) ** 2).mean()
 
-    # Total: JEPA core + decoder probe + optional extras
+    # Total: JEPA core + decoder probe + optional hybrid recon
     loss = latent_pred_loss + sigreg_lambda * sigreg_loss + recon_loss
     if hybrid_recon_weight > 0:
         loss = loss + hybrid_recon_weight * pred_recon_loss
-    if ar_steps > 0:
-        loss = loss + ar_weight * ar_loss
 
     optimizer.zero_grad()
     loss.backward()
@@ -188,16 +207,17 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
     losses = {
         "recon_loss": recon_loss.item(),
         "pred_recon_loss": pred_recon_loss.item() if hybrid_recon_weight > 0 else 0.0,
-        "ar_loss": ar_loss.item() if ar_steps > 0 else 0.0,
         "latent_pred_loss": latent_pred_loss.item(),
         "sigreg_loss": sigreg_loss.item(),
         "total_loss": loss.item(),
     }
 
-    # Energy monitoring for Hamiltonian predictors
+    # Energy monitoring for Hamiltonian predictors.
+    # LatentHamiltonianPredictor.energy needs state['theta']; the old
+    # HamiltonianPredictor.energy ignores state for backward compatibility.
     if _has_energy(model.predictor):
         with torch.no_grad():
-            H_vals = model.predictor.energy(all_states)
+            H_vals = model.predictor.energy(all_states, state=shared_state)
             losses["energy_mean"] = H_vals.mean().item()
             losses["energy_std"] = H_vals.std().item()
             losses["energy_time_var"] = H_vals.squeeze(-1).var(dim=1).mean().item()
@@ -208,17 +228,25 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
 
 @torch.no_grad()
 def jepa_eval_step(model, batch, cfg):
-    """JEPA eval step: latent prediction loss (no gradient, posterior mean)."""
+    """JEPA eval step: mirrors jepa_train_step with no gradient flow.
+
+    Uses the same infer-once-per-sequence + reseed-per-window discipline as
+    the training step so that metrics reflect the true unrolled behavior.
+
+    Note: the Hamiltonian predictors need autograd inside ``step`` to compute
+    ∂H/∂z, even at eval time. Their ``step`` methods are decorated with
+    ``@torch.enable_grad()`` so they still work under this ``@torch.no_grad()``
+    wrapper — but the computed gradients are not propagated back (no .backward
+    is called).
+    """
     images = batch["images"]
     actions = batch["actions"]
     B, _, C, H, W = images.shape
     K = model.encoder_frames
-    ctx_len = model.context_length
+    ctx_len = model.infer_context_length
     pred_len = model.pred_length
 
     hybrid_recon_weight = cfg.training.get("hybrid_recon_weight", 0.0)
-    ar_steps = cfg.training.get("ar_steps", 0)
-    ar_weight = cfg.training.get("ar_weight", 1.0)
 
     mu_all = model.encode_sequence(images)  # (B, N_lat, D)
     N_lat = mu_all.shape[1]
@@ -227,45 +255,40 @@ def jepa_eval_step(model, batch, cfg):
     all_states = mu_all  # Encoder output IS the state
 
     transition_actions = actions[:, K - 1:]
+    full_ctx_actions = transition_actions[:, : max(ctx_len - 1, 0)].long()
+    shared_state = model.predictor.infer(
+        all_states[:, :ctx_len], context_actions=full_ctx_actions
+    )
+
     window_size = ctx_len + pred_len
     step_size = pred_len
     num_windows = max(1, 1 + (N_lat - window_size) // step_size)
 
     latent_pred_loss = 0.0
     pred_recon_loss = 0.0
-    ar_loss_val = 0.0
     for w in range(num_windows):
         start = w * step_size
         end = min(start + window_size, N_lat)
-        w_states = all_states[:, start:end]
-        n_pred = w_states.shape[1] - 1
+        window_ctx = all_states[:, start:start + ctx_len]
+        n_pred = end - start - ctx_len
+        if n_pred <= 0:
+            continue
 
-        pred_input = w_states[:, :-1]
-        w_actions = transition_actions[:, start:start + n_pred].long()
-        pred_z = model.predictor(pred_input, w_actions)
+        target_states = all_states[:, start + ctx_len : start + ctx_len + n_pred]
+        unroll_actions = transition_actions[
+            :, start + ctx_len - 1 : start + ctx_len - 1 + n_pred
+        ].long()
 
-        target_states = w_states[:, 1:]
+        window_state = _reseed_window(model.predictor, window_ctx, shared_state)
+        pred_z = model.predictor.unroll(window_state, unroll_actions, n_pred)
+
         latent_pred_loss += ((pred_z - target_states) ** 2).mean().item() / num_windows
 
-        # Decode predicted states (matches train step's pred_recon_loss)
         if hybrid_recon_weight > 0:
             pred_decoded = model.decode(pred_z.reshape(B * n_pred, D))
-            gt_start = K - 1 + start + 1
+            gt_start = K - 1 + start + ctx_len
             gt_frames = images[:, gt_start:gt_start + n_pred].reshape(B * n_pred, C, H, W)
             pred_recon_loss += ((pred_decoded - gt_frames) ** 2).mean().item() / num_windows
-
-        # Autoregressive rollout (matches train step's ar_loss)
-        if ar_steps > 0:
-            n_ar = min(ar_steps, n_pred)
-            z_prev = w_states[:, 0:1]
-            ar_preds = []
-            for t in range(n_ar):
-                ar_pred = model.predictor(z_prev, w_actions[:, t:t + 1])
-                z_next = ar_pred[:, -1:]
-                ar_preds.append(z_next)
-                z_prev = z_next
-            ar_pred_z = torch.cat(ar_preds, dim=1)
-            ar_loss_val += ((ar_pred_z - target_states[:, :n_ar]) ** 2).mean().item() / num_windows
 
     # Decoder probe on encoded latents (matches train step's recon_loss)
     recon_targets = images[:, K - 1:].reshape(B * N_lat, C, H, W)
@@ -275,20 +298,17 @@ def jepa_eval_step(model, batch, cfg):
     total_loss = latent_pred_loss + recon_loss
     if hybrid_recon_weight > 0:
         total_loss += hybrid_recon_weight * pred_recon_loss
-    if ar_steps > 0:
-        total_loss += ar_weight * ar_loss_val
 
     losses = {
         "recon_loss": recon_loss,
         "pred_recon_loss": pred_recon_loss if hybrid_recon_weight > 0 else 0.0,
-        "ar_loss": ar_loss_val if ar_steps > 0 else 0.0,
         "latent_pred_loss": latent_pred_loss,
         "sigreg_loss": 0.0,  # not computed at eval (expensive, not needed)
         "total_loss": total_loss,
     }
 
     if _has_energy(model.predictor):
-        H_vals = model.predictor.energy(all_states)
+        H_vals = model.predictor.energy(all_states, state=shared_state)
         losses["energy_mean"] = H_vals.mean().item()
         losses["energy_std"] = H_vals.std().item()
         losses["energy_time_var"] = H_vals.squeeze(-1).var(dim=1).mean().item()
@@ -330,11 +350,16 @@ def make_recon_grid(model, batch, n_samples=4):
 
 @torch.no_grad()
 def compute_rollout_metrics(model, batch, n_samples=4):
-    """Run open-loop rollout and compute visual metrics."""
+    """Run open-loop rollout and compute visual metrics.
+
+    Grid layout uses ``infer_context_length`` because that is how many frames
+    ``visual_open_loop_rollout`` consumes as context before starting to
+    predict. Misalignment here would break the ERROR row in the wandb grid.
+    """
     images = batch["images"]
     actions = batch["actions"]
     B, N, C, H, W = images.shape
-    ctx_len = model.context_length
+    ctx_len = model.infer_context_length
     K = model.encoder_frames
     N_latents = N - K + 1
     horizon = N_latents - ctx_len
@@ -463,7 +488,7 @@ def main(cfg: DictConfig):
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.Adam(trainable_params, lr=lr)
 
-    loss_keys = ["total_loss", "recon_loss", "pred_recon_loss", "ar_loss", "latent_pred_loss", "sigreg_loss"]
+    loss_keys = ["total_loss", "recon_loss", "pred_recon_loss", "latent_pred_loss", "sigreg_loss"]
     if _has_energy(model.predictor):
         loss_keys.extend(["energy_mean", "energy_std", "energy_time_var", "energy_monotone"])
 

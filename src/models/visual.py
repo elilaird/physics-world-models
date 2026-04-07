@@ -102,6 +102,7 @@ class VisualWorldModel(nn.Module):
         channels=3,
         observation_dt=0.1,
         encoder_frames=1,
+        infer_context_length=None,
         **kwargs,
     ):
         super().__init__()
@@ -112,6 +113,15 @@ class VisualWorldModel(nn.Module):
         self.hidden_channels = hidden_channels
         self.context_length = context_length
         self.pred_length = pred_length
+        # infer_context_length controls how many latent frames the Latent-*
+        # predictors' GRU inferrer sees when producing (z_0, theta). Decoupled
+        # from context_length so the old HamiltonianPredictor can keep its
+        # short Markov window while Latent-* predictors get a longer
+        # system-identification window. Defaults to context_length for
+        # predictors that don't do state inference.
+        self.infer_context_length = (
+            infer_context_length if infer_context_length is not None else context_length
+        )
         self.observation_dt = observation_dt
         self.encoder_frames = encoder_frames
         self.channels = channels
@@ -187,23 +197,3 @@ class VisualWorldModel(nn.Module):
 
     def predictor_parameters(self):
         yield from self.predictor.parameters()
-
-    def autoregressive_rollout(self, z_init, actions, horizon, dt=None):
-        """Roll out from context_length state using the predictor.
-
-        Args:
-            z_init: (B, latent_channels) initial state.
-            actions: (B, horizon) action indices.
-            horizon: number of steps to predict.
-            dt: optional timestep override for ODE-based predictors.
-
-        Returns:
-            z_all: (B, horizon, latent_channels) predicted states.
-        """
-        states = []
-        z_t = z_init.unsqueeze(1)  # (B, 1, latent_channels)
-        for t in range(horizon):
-            z_next = self.predictor(z_t[:, -self.context_length:, :], actions[:, t : t + 1], dt=dt)
-            states.append(z_next.squeeze(1))
-            z_t = torch.cat([z_t, z_next], dim=1)
-        return torch.stack(states, dim=1)

@@ -7,6 +7,11 @@ latent_channels: 64
 hidden_channels: 512
 action_embedding_dim: 8
 context_length: 3
+# Number of latent frames the Latent-* predictors' GRU inferrer sees when
+# producing (z_0, theta). Decoupled from context_length so the old
+# HamiltonianPredictor (no state inference) can keep its short Markov window
+# while Latent-Hamiltonian / Latent-NeuralODE get a longer system-ID window.
+infer_context_length: 8
 pred_length: 5
 observation_dt: ${dataset.dt}
 encoder_frames: 2

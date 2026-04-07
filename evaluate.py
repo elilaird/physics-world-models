@@ -60,7 +60,10 @@ def main(cfg: DictConfig):
     images = batch["images"]  # (B, T+1, C, H, W)
     actions = batch["actions"]  # (B, T)
     B, N, C, H, W = images.shape
-    ctx_len = model.context_length
+    # Use infer_context_length because visual_open_loop_rollout seeds its
+    # infer() call from the first infer_ctx latents. Grid alignment depends
+    # on matching this constant throughout the script.
+    ctx_len = getattr(model, "infer_context_length", model.context_length)
     K = model.encoder_frames
     N_latents = N - K + 1
     horizon = N_latents - ctx_len
