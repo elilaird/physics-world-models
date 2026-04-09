@@ -6,6 +6,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - Do NOT run any Python commands. The user will test everything themselves.
 
+## Epistemic Standards
+
+### Never make strong causal claims without proof
+- Do NOT say "the problem IS X" or "this IS caused by Y" unless you have directly verified it (e.g., ran the code, read the traceback, checked the value).
+- Instead, say "this is LIKELY caused by X because [reasoning]" and then propose a verification step.
+
+### Diagnosis workflow
+When debugging or diagnosing issues:
+1. **State hypotheses ranked by likelihood** — "Most likely: ..., Less likely: ..., Unlikely but possible: ..."
+2. **Propose concrete verification steps** for each hypothesis — a command to run, a value to print, a file to check.
+3. **Run the check yourself when possible** before claiming a root cause.
+4. **After verification, state what you confirmed** — "Confirmed: the tensor shape at line 42 is [3,64] not [3,128] as expected."
+
+### Language rules
+- ✅ "Based on the traceback, this is caused by X" (you have evidence)
+- ✅ "This is likely X because [reason]. To confirm, try: `print(tensor.shape)`"
+- ❌ "The problem is X" (without having checked)
+- ❌ "This happens because Y" (without evidence)
+
+### When you don't know
+- Say so. "I'm not sure what's causing this. Here are three things I'd check: ..."
+- Never fabricate explanations to sound confident.
+
 ## Project Overview
 
 Research project testing whether a **port-Hamiltonian predictor + JEPA training** learns continuous-time dynamics from pixels with dt-generalization. Trains visual world models on simulated physics environments (oscillators, pendulums) and evaluates how well different inductive biases capture the true dynamics.

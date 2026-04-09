@@ -38,6 +38,15 @@ def main(cfg: DictConfig):
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
+    # Disable autograd globally for the eval script. The rollout helpers
+    # (visual_open_loop_rollout, visual_dt_generalization_test) already use
+    # @torch.no_grad() decorators internally, but direct encoder/decoder
+    # calls in main() below (e.g., for the context-reconstruction grid) run
+    # in the ambient main() scope where autograd would otherwise be on,
+    # producing grad-tracking tensors that then fail `.numpy()` at plot time.
+    # An eval script never needs gradients, so turn them off at the top.
+    torch.set_grad_enabled(False)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 

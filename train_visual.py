@@ -199,9 +199,31 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
     if hybrid_recon_weight > 0:
         loss = loss + hybrid_recon_weight * pred_recon_loss
 
+    # NaN/Inf guard: stiff second-order autograd in Hamiltonian predictors
+    # can produce non-finite losses on rare pathological batches. Skip the
+    # optimizer step for those batches instead of killing the whole run.
     optimizer.zero_grad()
+    if not torch.isfinite(loss):
+        return {
+            "skipped": True,
+            "recon_loss": 0.0,
+            "pred_recon_loss": 0.0,
+            "latent_pred_loss": 0.0,
+            "sigreg_loss": 0.0,
+            "total_loss": 0.0,
+        }
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    if not torch.isfinite(grad_norm):
+        optimizer.zero_grad()
+        return {
+            "skipped": True,
+            "recon_loss": 0.0,
+            "pred_recon_loss": 0.0,
+            "latent_pred_loss": 0.0,
+            "sigreg_loss": 0.0,
+            "total_loss": 0.0,
+        }
     optimizer.step()
 
     losses = {
@@ -500,9 +522,12 @@ def main(cfg: DictConfig):
     best_val_loss = float("inf")
     pbar = tqdm(range(1, cfg.training.epochs + 1), desc="Training")
 
+    training_aborted = False
     for epoch in pbar:
         model.train()
         train_accum = {k: 0.0 for k in loss_keys}
+        n_skipped = 0
+        n_steps = 0
 
         train_batches = tqdm(train_loader, desc=f"Epoch {epoch} [Train]", leave=False)
         first_train_batch = None
@@ -513,19 +538,39 @@ def main(cfg: DictConfig):
 
             losses = jepa_train_step(model, batch, optimizer, sigreg_module, cfg)
 
+            # Skip non-finite batches (stiff second-order autograd in
+            # Hamiltonian predictors can produce rare NaN losses that would
+            # otherwise poison the model weights via optimizer.step()).
+            if losses.get("skipped", False):
+                n_skipped += 1
+                if n_skipped <= 5 or n_skipped % 10 == 0:
+                    log.warning(
+                        f"Skipped non-finite batch at epoch {epoch} "
+                        f"(total skipped this epoch: {n_skipped})"
+                    )
+                continue
+
             if _has_nan(losses):
                 log.error(f"NaN detected in training losses at epoch {epoch}: {losses}")
+                training_aborted = True
                 break
 
+            n_steps += 1
             for k in loss_keys:
                 train_accum[k] += losses.get(k, 0.0)
             train_batches.set_postfix({k: f"{losses.get(k, 0.0):.4f}" for k in loss_keys[:3]})
 
-        if _has_nan(losses):
+        if training_aborted:
             log.error("Stopping training due to NaN losses.")
             break
 
-        train_avg = {k: v / len(train_loader) for k, v in train_accum.items()}
+        if n_skipped > 0:
+            log.info(f"Epoch {epoch}: skipped {n_skipped}/{len(train_loader)} non-finite batches")
+
+        # Average over batches that actually contributed (avoid divide-by-zero
+        # if every batch was skipped).
+        denom = max(n_steps, 1)
+        train_avg = {k: v / denom for k, v in train_accum.items()}
 
         # Validation
         model.eval()
@@ -597,6 +642,19 @@ def main(cfg: DictConfig):
                 },
                 ckpt_path,
             )
+
+    # If training aborted due to NaN, the in-memory model weights are poisoned.
+    # Reload the best checkpoint (last known good weights) before running test
+    # eval and dt-generalization so those metrics reflect the model's actual
+    # capability rather than cascading NaN from the corrupted state.
+    if training_aborted and os.path.exists(ckpt_path):
+        log.warning(
+            f"Training aborted on NaN — reloading best checkpoint "
+            f"from {ckpt_path} for test evaluation."
+        )
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        model.eval()
 
     # Test loop
     test_accum = {k: 0.0 for k in loss_keys}
