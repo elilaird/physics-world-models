@@ -27,6 +27,9 @@ def rebuild_model(cfg):
         observation_dt=cfg.model.get("observation_dt", 0.1),
         encoder_frames=cfg.model.get("encoder_frames", 1),
         channels=cfg.env.get("channels", 3),
+        infer_context_length=cfg.model.get(
+            "infer_context_length", cfg.model.context_length
+        ),
     )
 
 

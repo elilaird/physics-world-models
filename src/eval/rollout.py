@@ -7,8 +7,13 @@ def visual_open_loop_rollout(model, images, actions, dt=None):
     """Open-loop rollout for visual world models with flat latents.
 
     Encodes all frames with channel-concatenated overlapping windows, then
-    autoregressively predicts remaining latents. Each step the predictor sees
-    context_length latents, produces one next-latent, and the window shifts.
+    calls ``predictor.infer`` ONCE on the first ``infer_context_length``
+    latents to produce an initial state dict (carrying z, optional q/p, and
+    optional static theta), and then ``predictor.unroll`` to roll out over
+    the remaining horizon.
+
+    Infer-once-per-rollout is the architectural discipline that keeps GRU
+    state inference out of the per-step dynamics loop (takeaways/01).
 
     Args:
         model: VisualWorldModel (encoder, decoder, predictor).
@@ -22,10 +27,10 @@ def visual_open_loop_rollout(model, images, actions, dt=None):
             pred_latents: (B, horizon, D) predicted latents
             true_latents: (B, N_latents, D) encoded ground-truth latents
             pred_images: (B, horizon, C, H, W) decoded predicted frames
-        where N_latents = N - encoder_frames + 1, horizon = N_latents - ctx_len
+        where N_latents = N - encoder_frames + 1, horizon = N_latents - infer_ctx
     """
     B, N, C, H, W = images.shape
-    ctx_len = model.context_length
+    infer_ctx = getattr(model, "infer_context_length", model.context_length)
     K = model.encoder_frames
 
     # Encode all ground-truth frames → latent states (encoder output IS the state)
@@ -34,23 +39,29 @@ def visual_open_loop_rollout(model, images, actions, dt=None):
     D = mu_all.shape[2]
 
     true_latents = mu_all
-    horizon = N_latents - ctx_len
+    horizon = N_latents - infer_ctx
 
-    # Transition actions: action[K-1+i] drives latent i → i+1
+    # Transition actions: action[K-1+i] drives latent i → i+1, so the actions
+    # aligned with the latent sequence start at index K-1.
     transition_actions = actions[:, K - 1:]  # (B, N_latents - 1)
 
-    # Seed context with the first ctx_len encoded latents
-    context = true_latents[:, :ctx_len].clone()  # (B, ctx_len, D)
+    # Context = first infer_ctx latents. Context-internal actions drive those
+    # first latents forward and are consumed by the GRU to infer theta.
+    context = true_latents[:, :infer_ctx]
+    context_actions = transition_actions[:, : infer_ctx - 1].long()
 
-    pred_latents = []
-    for t in range(horizon):
-        act = transition_actions[:, t:t + ctx_len].long()
-        pred = model.predictor(context, act, dt=dt)  # (B, ctx_len, D)
-        z_next = pred[:, -1]  # (B, D)
-        pred_latents.append(z_next)
-        context = torch.cat([context[:, 1:], z_next.unsqueeze(1)], dim=1)
+    # Unroll actions: the (infer_ctx - 1)-th transition bridges context to
+    # the first predicted step; then we need `horizon` more actions.
+    unroll_actions = transition_actions[
+        :, infer_ctx - 1 : infer_ctx - 1 + horizon
+    ].long()
 
-    pred_latents = torch.stack(pred_latents, dim=1)  # (B, horizon, D)
+    # Infer initial state (runs GRU once for Latent-* predictors). The
+    # @torch.no_grad() decorator on this function disables grad globally,
+    # but LatentHamiltonianPredictor.step has @torch.enable_grad() locally
+    # so its autograd-based ∂H/∂z computation still works at eval time.
+    state = model.predictor.infer(context, context_actions=context_actions)
+    pred_latents = model.predictor.unroll(state, unroll_actions, horizon, dt=dt)
 
     pred_images = model.decode(
         pred_latents.reshape(B * horizon, D)
@@ -121,7 +132,9 @@ def visual_dt_generalization_test(
     from omegaconf import OmegaConf
     from src.eval.metrics import compute_visual_metrics
 
-    ctx_len = model.context_length
+    # Grid layout and horizon bookkeeping use infer_context_length because
+    # visual_open_loop_rollout seeds from the first infer_ctx latents.
+    ctx_len = getattr(model, "infer_context_length", model.context_length)
     if seq_len is None:
         seq_len = ctx_len + 10
 

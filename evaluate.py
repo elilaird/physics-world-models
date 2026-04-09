@@ -38,6 +38,15 @@ def main(cfg: DictConfig):
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
+    # Disable autograd globally for the eval script. The rollout helpers
+    # (visual_open_loop_rollout, visual_dt_generalization_test) already use
+    # @torch.no_grad() decorators internally, but direct encoder/decoder
+    # calls in main() below (e.g., for the context-reconstruction grid) run
+    # in the ambient main() scope where autograd would otherwise be on,
+    # producing grad-tracking tensors that then fail `.numpy()` at plot time.
+    # An eval script never needs gradients, so turn them off at the top.
+    torch.set_grad_enabled(False)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
@@ -60,7 +69,10 @@ def main(cfg: DictConfig):
     images = batch["images"]  # (B, T+1, C, H, W)
     actions = batch["actions"]  # (B, T)
     B, N, C, H, W = images.shape
-    ctx_len = model.context_length
+    # Use infer_context_length because visual_open_loop_rollout seeds its
+    # infer() call from the first infer_ctx latents. Grid alignment depends
+    # on matching this constant throughout the script.
+    ctx_len = getattr(model, "infer_context_length", model.context_length)
     K = model.encoder_frames
     N_latents = N - K + 1
     horizon = N_latents - ctx_len

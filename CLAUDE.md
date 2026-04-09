@@ -6,6 +6,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - Do NOT run any Python commands. The user will test everything themselves.
 
+## Epistemic Standards
+
+### Never make strong causal claims without proof
+- Do NOT say "the problem IS X" or "this IS caused by Y" unless you have directly verified it (e.g., ran the code, read the traceback, checked the value).
+- Instead, say "this is LIKELY caused by X because [reasoning]" and then propose a verification step.
+
+### Diagnosis workflow
+When debugging or diagnosing issues:
+1. **State hypotheses ranked by likelihood** — "Most likely: ..., Less likely: ..., Unlikely but possible: ..."
+2. **Propose concrete verification steps** for each hypothesis — a command to run, a value to print, a file to check.
+3. **Run the check yourself when possible** before claiming a root cause.
+4. **After verification, state what you confirmed** — "Confirmed: the tensor shape at line 42 is [3,64] not [3,128] as expected."
+
+### Language rules
+- ✅ "Based on the traceback, this is caused by X" (you have evidence)
+- ✅ "This is likely X because [reason]. To confirm, try: `print(tensor.shape)`"
+- ❌ "The problem is X" (without having checked)
+- ❌ "This happens because Y" (without evidence)
+
+### When you don't know
+- Say so. "I'm not sure what's causing this. Here are three things I'd check: ..."
+- Never fabricate explanations to sound confident.
+
 ## Project Overview
 
 Research project testing whether a **port-Hamiltonian predictor + JEPA training** learns continuous-time dynamics from pixels with dt-generalization. Trains visual world models on simulated physics environments (oscillators, pendulums) and evaluates how well different inductive biases capture the true dynamics.
@@ -46,9 +69,6 @@ python train_visual.py model.latent_channels=64 model.context_length=3
 # Tune SIGReg lambda (the key JEPA hyperparameter)
 python train_visual.py --multirun training.sigreg_lambda=0.01,0.05,0.1,0.5,1.0
 
-# Hamiltonian integration method sweep
-python train_visual.py --multirun predictor.integration_method=euler,semi_implicit,leapfrog
-
 # Hybrid mode (JEPA + lightweight reconstruction)
 python train_visual.py training.hybrid_recon_weight=0.1
 
@@ -83,17 +103,17 @@ Three predictors registered in `PREDICTOR_REGISTRY`:
 
 - **MLPPredictor** (`mlp`): per-frame residual MLP, `z_{t+1} = z_t + f(z_t, a_t)`. Fixed-step, ignores dt.
 - **LSTMPredictor** (`lstm`): LSTM over context + residual output. Fixed-step, ignores dt.
-- **HamiltonianPredictor** (`hamiltonian`): separable `H(q,p) = V(q) + T(p)` with configurable integrator (euler/semi_implicit/leapfrog). Port-Hamiltonian extension with learned dissipation `γ` and LSTM backbone for temporal context conditioning the action force `G(a)`. **dt-aware**: accepts dt parameter for temporal generalization. `n_steps` integration sub-steps per frame. `.energy(z)` method for monitoring.
+- **HamiltonianPredictor** (`hamiltonian`): non-separable `H(z)` — a single scalar energy network over the full latent. Hamilton's equations derived via one autograd call (∂H/∂z) sliced into ∂H/∂q and ∂H/∂p, with port-Hamiltonian dissipation `γ·∂H/∂p` and per-frame action force `G(a)` on momentum. Forward Euler integration. **dt-aware**: accepts dt parameter for temporal generalization. `.energy(z)` method for monitoring.
 
 ### Visual World Model (`src/models/visual.py`)
 
 JEPA-only architecture with flat latent space:
 - **VisionEncoder**: 8-layer ConvNet → MLP → flat latent `z ∈ (B, D)`. BatchNorm projector for SIGReg compatibility.
-- **VisionDecoder**: MLP → spatial → ConvNet upsample. Receives **position half only** (first `D//2` dims).
-- **VisualWorldModel**: encoder + decoder + swappable predictor. No state_transform (encoder output IS the state). Latent split: `z = [q, p]` where q drives decoding, p carries dynamics info.
+- **VisionDecoder**: MLP → spatial → ConvNet upsample. Receives the **full latent** `z ∈ (B, D)` — symmetric in q and p.
+- **VisualWorldModel**: encoder + decoder + swappable predictor. No state_transform (encoder output IS the state). The Hamiltonian predictor splits `z = [q, p]` internally for its dynamics, but the decoder is blind to the split — this removes the q/p misalignment problem documented in `takeaways/02`.
 
 **Key config parameters** (`configs/model/visual_world_model.yaml`):
-- `latent_channels: 64` — total latent dims (split into 32 position + 32 momentum)
+- `latent_channels: 64` — total latent dims (predictor splits into 32 q + 32 p internally; decoder sees all 64)
 - `hidden_channels: 512` — hidden dim in encoder/decoder MLPs
 - `encoder_frames: 2` — number of frames channel-concatenated for velocity estimation
 - `context_length: 3` — number of latent frames the predictor sees

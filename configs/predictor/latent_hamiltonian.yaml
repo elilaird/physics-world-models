@@ -1,8 +1,9 @@
-_target_: src.models.predictors.HamiltonianPredictor
-name: hamiltonian
+_target_: src.models.predictors.LatentHamiltonianPredictor
+name: latent_hamiltonian
 latent_dim: ${model.latent_channels}
 action_dim: ${env.action_dim}
 action_embedding_dim: ${model.action_embedding_dim}
 hidden_dim: 256
+gru_hidden: 128
+theta_dim: 8
 dt: ${dataset.dt}
-damping_init: -1.0
