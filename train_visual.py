@@ -515,10 +515,14 @@ def main(cfg: DictConfig):
         f"projections={cfg.training.get('sigreg_projections', 1024)}"
     )
 
-    # Single optimizer
+    # Single optimizer + cosine LR decay
     lr = cfg.training.get("lr", 5e-4)
+    eta_min = cfg.training.get("lr_min", 1e-6)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.Adam(trainable_params, lr=lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cfg.training.epochs, eta_min=eta_min,
+    )
 
     loss_keys = ["total_loss", "recon_loss", "pred_recon_loss", "latent_pred_loss", "sigreg_loss"]
     if _has_energy(model.predictor):
@@ -604,8 +608,9 @@ def main(cfg: DictConfig):
             )
 
         # wandb logging
+        current_lr = optimizer.param_groups[0]["lr"]
         if cfg.wandb.enabled:
-            wandb_log = {"epoch": epoch}
+            wandb_log = {"epoch": epoch, "train/lr": current_lr}
             for k in loss_keys:
                 wandb_log[f"train/{k}"] = train_avg[k]
                 wandb_log[f"val/{k}"] = val_avg[k]
@@ -636,6 +641,8 @@ def main(cfg: DictConfig):
                 },
                 ckpt_path,
             )
+
+        scheduler.step()
 
     # If training aborted due to NaN, the in-memory model weights are poisoned.
     # Reload the best checkpoint (last known good weights) before running test
