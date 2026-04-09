@@ -2,9 +2,9 @@
 
 Universal two-stage interface:
 
-    state = predictor.infer(context, context_actions=None)   # once per rollout
-    state, z = predictor.step(state, action, dt=None)        # per step
-    z_seq = predictor.unroll(state, actions, horizon, dt)    # default loops step
+    state = predictor.infer(context, context_actions=None, dt=None)  # once per rollout
+    state, z = predictor.step(state, action, dt=None)                # per step
+    z_seq = predictor.unroll(state, actions, horizon, dt)            # default loops step
 
 All state dicts carry a required key ``'z'`` of shape ``(B, D)`` — the
 decoder-visible latent. Predictor-private keys (``'q'``, ``'p'``, ``'theta'``,
@@ -22,9 +22,13 @@ Predictors:
     Physics-informed (no state inference, dt-aware):
         - HamiltonianPredictor   (per-frame H(z), semi-implicit Euler)
 
-    State inference + dynamics (GRU infers a static per-trajectory theta, dt-aware):
-        - LatentNeuralODEPredictor   (state inference + generic neural vector field)
-        - LatentHamiltonianPredictor (state inference + Hamilton's equations)
+    State inference + dynamics (velocity-input GRU, dt-aware):
+        - LatentNeuralODEPredictor   (velocity GRU + generic neural vector field)
+        - LatentHamiltonianPredictor (velocity GRU + Hamilton's equations)
+
+    The Latent-* predictors use dt-normalized latent finite differences
+    v_t = (q_{t+1} - q_t) / dt as GRU input. This makes the velocity
+    estimate dt-independent by construction (Approach 6).
 """
 
 import warnings
@@ -59,7 +63,7 @@ class BasePredictor(nn.Module):
 
     _warned_legacy = False
 
-    def infer(self, context, context_actions=None):
+    def infer(self, context, context_actions=None, dt=None):
         raise NotImplementedError
 
     def step(self, state, action, dt=None):
@@ -107,7 +111,7 @@ class BasePredictor(nn.Module):
                 stacklevel=2,
             )
             type(self)._warned_legacy = True
-        state = self.infer(context)
+        state = self.infer(context, dt=dt)
         horizon = actions.shape[1]
         return self.unroll(state, actions, horizon, dt=dt)
 
@@ -156,7 +160,7 @@ class MLPPredictor(BasePredictor):
             nn.Linear(hidden_dim, latent_dim),
         )
 
-    def infer(self, context, context_actions=None):
+    def infer(self, context, context_actions=None, dt=None):
         return {"z": context[:, -1]}
 
     def step(self, state, action, dt=None):
@@ -198,7 +202,7 @@ class LSTMPredictor(BasePredictor):
         )
         self.output = nn.Linear(hidden_dim, latent_dim)
 
-    def infer(self, context, context_actions=None):
+    def infer(self, context, context_actions=None, dt=None):
         B, T, _ = context.shape
         if context_actions is None:
             ctx_acts = torch.zeros(B, T, dtype=torch.long, device=context.device)
@@ -282,7 +286,7 @@ class HamiltonianPredictor(BasePredictor):
         """
         return self.H_net(z)
 
-    def infer(self, context, context_actions=None):
+    def infer(self, context, context_actions=None, dt=None):
         return {"z": context[:, -1]}
 
     @torch.enable_grad()
@@ -319,55 +323,21 @@ class HamiltonianPredictor(BasePredictor):
 
 
 # ---------------------------------------------------------------------------
-# State-inference predictors (GRU infers static theta, dt-aware)
+# State-inference predictors (velocity-input GRU, dt-aware)
 # ---------------------------------------------------------------------------
 
 
-class _LatentInferrerMixin:
-    """Shared GRU-based state inferrer for Latent-* predictors.
-
-    Runs a GRU over (context, context_actions) and returns (theta, h_final).
-    The calling predictor decides what else to put into the initial state.
-    """
-
-    def _build_inferrer(self, latent_dim, action_embedding_dim, gru_hidden):
-        self._gru_input_dim = latent_dim + action_embedding_dim
-        self.gru = nn.GRU(
-            input_size=self._gru_input_dim,
-            hidden_size=gru_hidden,
-            num_layers=1,
-            batch_first=True,
-        )
-
-    def _run_gru(self, context, context_actions, act_emb):
-        B, T, _ = context.shape
-        if context_actions is None:
-            ctx_acts = torch.zeros(B, T, dtype=torch.long, device=context.device)
-        else:
-            pad = T - context_actions.shape[1]
-            if pad > 0:
-                pad_zeros = torch.zeros(B, pad, dtype=torch.long, device=context.device)
-                ctx_acts = torch.cat([context_actions, pad_zeros], dim=1)
-            elif pad < 0:
-                ctx_acts = context_actions[:, :T]
-            else:
-                ctx_acts = context_actions
-        emb = act_emb(ctx_acts)  # (B, T, emb)
-        x = torch.cat([context, emb], dim=-1)
-        _, h = self.gru(x)  # h: (1, B, gru_hidden)
-        return h[-1]  # (B, gru_hidden)
-
-
 @register_predictor("latent_neural_ode")
-class LatentNeuralODEPredictor(BasePredictor, _LatentInferrerMixin):
+class LatentNeuralODEPredictor(BasePredictor):
     """State-inference + generic dt-aware neural vector field.
 
-    infer(): GRU over context → (z_0 = last frame, theta).
+    infer(): GRU over (q, v, a) transitions → (z_0 = last frame, theta).
+             v_t = (q_{t+1} - q_t) / dt is dt-normalized by construction.
     step():  z_{t+1} = z_t + dt · f(z_t, theta, a_t).
 
-    This is the ablation for LatentHamiltonianPredictor: same state inference,
-    same dt-awareness, but an unstructured vector field instead of Hamilton's
-    equations.
+    This is the ablation for LatentHamiltonianPredictor: same velocity-based
+    state inference, same dt-awareness, but an unstructured vector field
+    instead of Hamilton's equations.
     """
 
     def __init__(
@@ -388,7 +358,15 @@ class LatentNeuralODEPredictor(BasePredictor, _LatentInferrerMixin):
         self.dt = dt
 
         self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
-        self._build_inferrer(latent_dim, action_embedding_dim, gru_hidden)
+
+        # GRU input: position (D) + dt-normalized velocity (D) + action embedding
+        gru_input_dim = 2 * latent_dim + action_embedding_dim
+        self.gru = nn.GRU(
+            input_size=gru_input_dim,
+            hidden_size=gru_hidden,
+            num_layers=1,
+            batch_first=True,
+        )
         self.theta_head = nn.Linear(gru_hidden, theta_dim)
 
         self.f_net = nn.Sequential(
@@ -399,8 +377,33 @@ class LatentNeuralODEPredictor(BasePredictor, _LatentInferrerMixin):
             nn.Linear(hidden_dim, latent_dim),
         )
 
-    def infer(self, context, context_actions=None):
-        h_final = self._run_gru(context, context_actions, self.act_emb)
+    def infer(self, context, context_actions=None, dt=None):
+        B, T, D = context.shape
+        dt_eff = dt if dt is not None else self.dt
+
+        # Compute dt-normalized latent velocity: v_t = (q_{t+1} - q_t) / dt
+        velocities = (context[:, 1:] - context[:, :-1]) / dt_eff  # (B, T-1, D)
+
+        # GRU processes T-1 transition steps: (q_t, v_t, a_t)
+        q_seq = context[:, :-1]  # (B, T-1, D)
+
+        if context_actions is None:
+            ctx_acts = torch.zeros(B, T - 1, dtype=torch.long, device=context.device)
+        else:
+            n_acts = context_actions.shape[1]
+            if n_acts < T - 1:
+                pad = torch.zeros(
+                    B, T - 1 - n_acts, dtype=torch.long, device=context.device
+                )
+                ctx_acts = torch.cat([context_actions, pad], dim=1)
+            else:
+                ctx_acts = context_actions[:, : T - 1]
+
+        act_emb = self.act_emb(ctx_acts)  # (B, T-1, emb_dim)
+        gru_input = torch.cat([q_seq, velocities, act_emb], dim=-1)
+        _, h = self.gru(gru_input)
+        h_final = h[-1]  # (B, gru_hidden)
+
         theta = self.theta_head(h_final)
         return {"z": context[:, -1], "theta": theta}
 
@@ -415,16 +418,26 @@ class LatentNeuralODEPredictor(BasePredictor, _LatentInferrerMixin):
 
 
 @register_predictor("latent_hamiltonian")
-class LatentHamiltonianPredictor(BasePredictor, _LatentInferrerMixin):
-    """State-inference + Hamilton's equations (target model).
+class LatentHamiltonianPredictor(BasePredictor):
+    """State-inference + Hamilton's equations with velocity-based GRU (target model).
 
-    infer(): GRU over context → (q_0, p_0 from last frame, static theta).
+    **Approach 6 architecture**: the encoder produces position-only latents
+    q ∈ R^D from single frames.  Momentum p ∈ R^D is inferred by a GRU that
+    sees dt-normalized latent velocities v_t = (q_{t+1} - q_t) / dt, making
+    the velocity estimate dt-independent by construction.
+
+    infer(): GRU over (q, v, a) transitions → (q_0, p_0, static theta).
+             v_t = (q_{t+1} - q_t) / dt is dt-normalized by construction.
     step():  Hamilton's equations with theta-conditioned damping and action
-             force, semi-implicit Euler.
+             force, semi-implicit Euler.  Returns z = q (position only) for
+             the decoder.
 
-    Dynamics:
+    Dynamics (semi-implicit Euler on full phase space):
         p_{t+1} = p_t + dt * (-∂H/∂q(q_t, p_t, θ) - γ(θ)·∂H/∂p + G(a_t, θ))
         q_{t+1} = q_t + dt * ∂H/∂p(q_t, p_{t+1}, θ)
+
+    H_net input: cat(q, p, θ) ∈ R^{2D + theta_dim}.  Full non-separable
+    energy over the complete phase space + system ID.
 
     θ is STATIC over the unroll — it represents per-trajectory system
     parameters (damping, etc.) that do not evolve in time. This is the
@@ -448,17 +461,27 @@ class LatentHamiltonianPredictor(BasePredictor, _LatentInferrerMixin):
     ):
         super().__init__()
         self.latent_dim = latent_dim
-        self.half_dim = latent_dim // 2
+        self.q_dim = latent_dim
+        self.p_dim = latent_dim
         self.theta_dim = theta_dim
         self.dt = dt
 
         self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
-        self._build_inferrer(latent_dim, action_embedding_dim, gru_hidden)
-        self.theta_head = nn.Linear(gru_hidden, theta_dim)
 
-        # H(z, theta): scalar energy conditioned on static per-trajectory params
+        # GRU input: position (D) + dt-normalized velocity (D) + action embedding
+        gru_input_dim = 2 * latent_dim + action_embedding_dim
+        self.gru = nn.GRU(
+            input_size=gru_input_dim,
+            hidden_size=gru_hidden,
+            num_layers=1,
+            batch_first=True,
+        )
+        self.theta_head = nn.Linear(gru_hidden, theta_dim)
+        self.p_head = nn.Linear(gru_hidden, latent_dim)  # momentum inference
+
+        # H(q, p, theta): scalar energy over full phase space + system ID
         self.H_net = nn.Sequential(
-            nn.Linear(latent_dim + theta_dim, hidden_dim),
+            nn.Linear(2 * latent_dim + theta_dim, hidden_dim),
             nn.Softplus(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.Softplus(),
@@ -466,19 +489,22 @@ class LatentHamiltonianPredictor(BasePredictor, _LatentInferrerMixin):
         )
         # Per-trajectory scalar damping γ(θ) ≥ 0
         self.damping_net = nn.Linear(theta_dim, 1)
-        # Per-trajectory action force G(a, θ) on momentum
+        # Per-trajectory action force G(a, θ) on momentum — full D dims
         self.G_net = nn.Sequential(
             nn.Linear(action_embedding_dim + theta_dim, hidden_dim // 2),
             nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim // 2, self.half_dim),
+            nn.Linear(hidden_dim // 2, latent_dim),
         )
 
     def energy(self, z, state=None):
-        """Scalar energy H(z, θ). Requires ``state['theta']``.
+        """Scalar energy H(q, p, θ).
+
+        For monitoring: z is position-only from the encoder. If state contains
+        'p', uses it; otherwise approximates p=0 (energy at zero momentum).
 
         Args:
-            z: (B, D) or (B, T, D) latents.
-            state: dict containing 'theta' of shape (B, theta_dim).
+            z: (B, D) or (B, T, D) position-only latents from encoder.
+            state: dict containing 'theta' (required) and optionally 'p'.
         Returns:
             Same leading dims as z + trailing (1,).
         """
@@ -488,22 +514,60 @@ class LatentHamiltonianPredictor(BasePredictor, _LatentInferrerMixin):
                 "from a prior infer() call."
             )
         theta = state["theta"]
+        p = state.get("p", None)
+
         if z.ndim == 3:
             B, T, D = z.shape
-            theta_bcast = theta.unsqueeze(1).expand(-1, T, -1)
-            inp = torch.cat([z, theta_bcast], dim=-1)
+            theta_bc = theta.unsqueeze(1).expand(-1, T, -1)
+            if p is not None and p.ndim == 2:
+                # p is (B, D) — single momentum; broadcast across time
+                p_bc = p.unsqueeze(1).expand(-1, T, -1)
+            elif p is not None:
+                p_bc = p
+            else:
+                p_bc = torch.zeros_like(z)
+            phase = torch.cat([z, p_bc], dim=-1)
+            inp = torch.cat([phase, theta_bc], dim=-1)
             return self.H_net(inp.reshape(B * T, -1)).reshape(B, T, 1)
         else:
-            inp = torch.cat([z, theta], dim=-1)
+            if p is None:
+                p = torch.zeros_like(z)
+            phase = torch.cat([z, p], dim=-1)
+            inp = torch.cat([phase, theta], dim=-1)
             return self.H_net(inp)
 
-    def infer(self, context, context_actions=None):
-        h_final = self._run_gru(context, context_actions, self.act_emb)
+    def infer(self, context, context_actions=None, dt=None):
+        B, T, D = context.shape
+        dt_eff = dt if dt is not None else self.dt
+
+        # Compute dt-normalized latent velocity: v_t = (q_{t+1} - q_t) / dt
+        velocities = (context[:, 1:] - context[:, :-1]) / dt_eff  # (B, T-1, D)
+
+        # GRU processes T-1 transition steps: (q_t, v_t, a_t)
+        q_seq = context[:, :-1]  # (B, T-1, D)
+
+        if context_actions is None:
+            ctx_acts = torch.zeros(B, T - 1, dtype=torch.long, device=context.device)
+        else:
+            n_acts = context_actions.shape[1]
+            if n_acts < T - 1:
+                pad = torch.zeros(
+                    B, T - 1 - n_acts, dtype=torch.long, device=context.device
+                )
+                ctx_acts = torch.cat([context_actions, pad], dim=1)
+            else:
+                ctx_acts = context_actions[:, : T - 1]
+
+        act_emb = self.act_emb(ctx_acts)  # (B, T-1, emb_dim)
+        gru_input = torch.cat([q_seq, velocities, act_emb], dim=-1)
+        _, h = self.gru(gru_input)
+        h_final = h[-1]  # (B, gru_hidden)
+
         theta = self.theta_head(h_final)
-        z_last = context[:, -1]
-        q = z_last[:, :self.half_dim]
-        p = z_last[:, self.half_dim:]
-        return {"z": z_last, "q": q, "p": p, "theta": theta}
+        p = self.p_head(h_final)  # GRU-smoothed, dt-normalized momentum
+        q = context[:, -1]        # position from last context frame
+
+        return {"z": q, "q": q, "p": p, "theta": theta}
 
     @torch.enable_grad()
     def step(self, state, action, dt=None):
@@ -514,17 +578,17 @@ class LatentHamiltonianPredictor(BasePredictor, _LatentInferrerMixin):
         q = _require_grad(q)
         p = _require_grad(p)
 
-        # First autograd pass: ∂H/∂z at (q, p, θ)
-        z_cat = torch.cat([q, p], dim=-1)
-        inp = torch.cat([z_cat, theta], dim=-1)
+        # Full phase-space concatenation for H_net
+        z_phase = torch.cat([q, p], dim=-1)  # (B, 2D)
+        inp = torch.cat([z_phase, theta], dim=-1)  # (B, 2D + theta_dim)
         H = self.H_net(inp).sum()
-        dH_dz = torch.autograd.grad(H, z_cat, create_graph=self.training)[0]
-        dH_dq = dH_dz[:, :self.half_dim]
-        dH_dp = dH_dz[:, self.half_dim:]
+        dH_dz = torch.autograd.grad(H, z_phase, create_graph=self.training)[0]
+        dH_dq = dH_dz[:, :self.q_dim]   # (B, D)
+        dH_dp = dH_dz[:, self.q_dim:]   # (B, D)
 
         # Per-trajectory damping and action force
         gamma = F.softplus(self.damping_net(theta))  # (B, 1)
-        G_u = self.G_net(torch.cat([self.act_emb(action), theta], dim=-1))  # (B, half_dim)
+        G_u = self.G_net(torch.cat([self.act_emb(action), theta], dim=-1))  # (B, D)
 
         # Semi-implicit Euler: update p first
         p_new = p + dt_eff * (-dH_dq - gamma * dH_dp + G_u)
@@ -534,9 +598,9 @@ class LatentHamiltonianPredictor(BasePredictor, _LatentInferrerMixin):
         inp_mid = torch.cat([z_mid, theta], dim=-1)
         H_mid = self.H_net(inp_mid).sum()
         dH_dz_mid = torch.autograd.grad(H_mid, z_mid, create_graph=self.training)[0]
-        dH_dp_new = dH_dz_mid[:, self.half_dim:]
+        dH_dp_new = dH_dz_mid[:, self.q_dim:]
 
         q_new = q + dt_eff * dH_dp_new
 
-        z_new = torch.cat([q_new, p_new], dim=-1)
-        return {"z": z_new, "q": q_new, "p": p_new, "theta": theta}, z_new
+        # Decoder-visible state is position only
+        return {"z": q_new, "q": q_new, "p": p_new, "theta": theta}, q_new

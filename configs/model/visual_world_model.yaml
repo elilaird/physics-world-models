@@ -14,4 +14,4 @@ context_length: 3
 infer_context_length: 8
 pred_length: 5
 observation_dt: ${dataset.dt}
-encoder_frames: 2
+encoder_frames: 1  # single-frame encoding; velocity inferred in predictor

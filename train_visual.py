@@ -84,15 +84,23 @@ def build_model(cfg):
 # JEPA training step
 # ---------------------------------------------------------------------------
 
-def _reseed_window(predictor, window_ctx, shared_state):
+def _reseed_window(predictor, window_ctx, shared_state, dt=None):
     """Re-seed dynamical variables from window_ctx, reuse shared static keys.
 
-    The predictor's ``infer`` is called on the window context to get fresh
-    (z, q, p) seeded at the last frame of the window, then any static keys
-    from ``shared_state`` — ``theta`` (Latent-*), ``h``/``c`` (LSTM) — are
-    copied over so they are not re-inferred per window.
+    For predictors with velocity-based inference (LatentHamiltonianPredictor),
+    computes momentum from the last two context frames' finite difference
+    rather than re-running the full GRU. This is cheaper and avoids
+    re-inferring theta per window.
+
+    For other predictors, falls back to ``predictor.infer(window_ctx)``.
     """
-    new_state = predictor.infer(window_ctx)
+    if hasattr(predictor, "p_head") and dt is not None and window_ctx.shape[1] >= 2:
+        # Velocity-based predictor: compute p from finite difference
+        q = window_ctx[:, -1]
+        p = (window_ctx[:, -1] - window_ctx[:, -2]) / dt
+        new_state = {"z": q, "q": q, "p": p}
+    else:
+        new_state = predictor.infer(window_ctx, dt=dt)
     for key in ("theta", "h", "c"):
         if key in shared_state:
             new_state[key] = shared_state[key]
@@ -149,7 +157,8 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
     transition_actions = actions[:, K - 1:]  # (B, N_lat - 1)
     full_ctx_actions = transition_actions[:, : max(ctx_len - 1, 0)].long()
     shared_state = model.predictor.infer(
-        all_states[:, :ctx_len], context_actions=full_ctx_actions
+        all_states[:, :ctx_len], context_actions=full_ctx_actions,
+        dt=model.observation_dt,
     )
 
     # 4. Sliding window unroll. Each window re-seeds (q, p) from its own
@@ -177,7 +186,7 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
             :, start + ctx_len - 1 : start + ctx_len - 1 + n_pred
         ].long()
 
-        window_state = _reseed_window(model.predictor, window_ctx, shared_state)
+        window_state = _reseed_window(model.predictor, window_ctx, shared_state, dt=model.observation_dt)
         pred_z = model.predictor.unroll(window_state, unroll_actions, n_pred)
 
         latent_pred_loss = latent_pred_loss + ((pred_z - target_states) ** 2).mean() / num_windows
@@ -279,7 +288,8 @@ def jepa_eval_step(model, batch, cfg):
     transition_actions = actions[:, K - 1:]
     full_ctx_actions = transition_actions[:, : max(ctx_len - 1, 0)].long()
     shared_state = model.predictor.infer(
-        all_states[:, :ctx_len], context_actions=full_ctx_actions
+        all_states[:, :ctx_len], context_actions=full_ctx_actions,
+        dt=model.observation_dt,
     )
 
     window_size = ctx_len + pred_len
@@ -301,7 +311,7 @@ def jepa_eval_step(model, batch, cfg):
             :, start + ctx_len - 1 : start + ctx_len - 1 + n_pred
         ].long()
 
-        window_state = _reseed_window(model.predictor, window_ctx, shared_state)
+        window_state = _reseed_window(model.predictor, window_ctx, shared_state, dt=model.observation_dt)
         pred_z = model.predictor.unroll(window_state, unroll_actions, n_pred)
 
         latent_pred_loss += ((pred_z - target_states) ** 2).mean().item() / num_windows

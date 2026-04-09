@@ -60,7 +60,10 @@ def visual_open_loop_rollout(model, images, actions, dt=None):
     # @torch.no_grad() decorator on this function disables grad globally,
     # but LatentHamiltonianPredictor.step has @torch.enable_grad() locally
     # so its autograd-based ∂H/∂z computation still works at eval time.
-    state = model.predictor.infer(context, context_actions=context_actions)
+    state = model.predictor.infer(
+        context, context_actions=context_actions,
+        dt=dt or model.observation_dt,
+    )
     pred_latents = model.predictor.unroll(state, unroll_actions, horizon, dt=dt)
 
     pred_images = model.decode(

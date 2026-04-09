@@ -54,8 +54,8 @@ class VisionDecoder(nn.Module):
     """Decodes flat (B, D) latents to (B, C, 64, 64) images.
 
     Projects flat latent to (B, 64, 8, 8) spatial, then ResBlock+Upsample ×3 → 64×64.
-    Input is the full latent (latent_channels dims). The decoder is symmetric
-    with respect to q and p — any structural split lives in the predictor.
+    Input is the full latent (latent_channels dims). For velocity-inference
+    predictors, the decoder receives z = q (position only).
     """
 
     def __init__(self, channels=3, latent_channels=16, hidden_channels=512):
@@ -85,11 +85,11 @@ class VisualWorldModel(nn.Module):
     """Encoder/decoder + swappable flat latent-space predictor.
 
     JEPA-only: encoder output IS the state (no state_transform).
-    Latent z ∈ R^D; the Hamiltonian predictor may split it internally into
-    q = z[..., :D//2] and p = z[..., D//2:], but the decoder sees the full z.
-    This removes the asymmetric "q = observable" pressure on the encoder while
-    preserving the Hamiltonian's structural dynamics. SIGReg prevents collapse;
-    BatchNorm projector after encoder.
+    Latent z ∈ R^D; for Hamiltonian predictors with velocity inference,
+    z = q (position only, dt-independent). Momentum p is inferred from
+    latent finite differences and used only inside the dynamics. The
+    decoder sees z = q throughout. SIGReg prevents collapse; BatchNorm
+    projector after encoder.
     """
 
     def __init__(
@@ -106,9 +106,6 @@ class VisualWorldModel(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        assert (
-            latent_channels % 2 == 0
-        ), "Structured latent requires even latent_channels"
         self.latent_channels = latent_channels
         self.hidden_channels = hidden_channels
         self.context_length = context_length
@@ -132,8 +129,8 @@ class VisualWorldModel(nn.Module):
             encoder_frames=encoder_frames,
             hidden_channels=hidden_channels,
         )
-        # Decoder receives the full latent (Option A: no q/p asymmetry on the
-        # decoder side). The Hamiltonian predictor still splits internally.
+        # Decoder receives the position latent (z = q for velocity-inference
+        # predictors). Momentum p is dynamics-internal.
         self.decoder = VisionDecoder(
             channels=channels,
             latent_channels=latent_channels,
@@ -179,11 +176,11 @@ class VisualWorldModel(nn.Module):
         return mu.reshape(B, n_out, D)
 
     def decode(self, z):
-        """Decode the full latent to images.
+        """Decode position latent to images.
 
         Args:
-            z: (B, D) or (B*T, D) full latent state (concatenation of q and p
-               from the predictor's perspective, but opaque to the decoder).
+            z: (B, D) or (B*T, D) latent state. For Hamiltonian predictors
+               with velocity inference, z = q (position only).
         Returns:
             images: (B, C, H, W)
         """
