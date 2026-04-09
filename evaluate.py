@@ -1,13 +1,10 @@
 """
-Evaluation script for trained physics world models.
+Evaluation script for trained visual world models.
 
 Usage:
-    python evaluate.py checkpoint=outputs/2026-02-09/12-00-00/best_model.pt
-    python evaluate.py checkpoint=path/to/best_model.pt eval.horizon=100
-    python evaluate.py checkpoint=path/to/best_model.pt eval.dt_values=[0.05,0.1,0.2,0.5]
-
-    # Visual model evaluation
+    python evaluate.py checkpoint=path/to/best_model.pt
     python evaluate.py checkpoint=path/to/best_model.pt eval.n_rollouts=8
+    python evaluate.py checkpoint=path/to/best_model.pt eval.dt_values=[0.05,0.1,0.2,0.5]
 """
 
 import logging
@@ -20,73 +17,12 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
-from src.eval.utils import load_checkpoint, rebuild_model, rebuild_env, is_visual_checkpoint
-from src.eval.metrics import mse_over_horizon, energy_drift, compute_visual_metrics
-from src.eval.rollout import (
-    open_loop_rollout, dt_generalization_test,
-    visual_open_loop_rollout, visual_dt_generalization_test,
-)
+from src.eval.utils import load_checkpoint, rebuild_model, rebuild_env
+from src.eval.metrics import compute_visual_metrics
+from src.eval.rollout import visual_open_loop_rollout, visual_dt_generalization_test
 from src.data.precomputed import PrecomputedDataset
 
 log = logging.getLogger(__name__)
-
-
-def plot_rollout(pred_states, true_states, title, save_path):
-    """Plot predicted vs true trajectories for each state dimension."""
-    n_dims = pred_states.shape[-1]
-    fig, axes = plt.subplots(n_dims, 1, figsize=(10, 3 * n_dims), sharex=True)
-    if n_dims == 1:
-        axes = [axes]
-
-    dim_labels = [f"dim {i}" for i in range(n_dims)]
-
-    for i, ax in enumerate(axes):
-        ax.plot(true_states[:, i].numpy(), label="Ground Truth", linewidth=2)
-        ax.plot(pred_states[:, i].numpy(), label="Predicted", linewidth=2, linestyle="--")
-        ax.set_ylabel(dim_labels[i])
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-
-    axes[-1].set_xlabel("Timestep")
-    fig.suptitle(title)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    log.info(f"Saved: {save_path}")
-
-
-def plot_energy(pred_energies, true_energies, save_path):
-    """Plot energy conservation comparison."""
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(true_energies.numpy(), label="Ground Truth", linewidth=2)
-    ax.plot(pred_energies.numpy(), label="Predicted", linewidth=2, linestyle="--")
-    ax.set_xlabel("Timestep")
-    ax.set_ylabel("Energy")
-    ax.set_title("Energy Conservation")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    log.info(f"Saved: {save_path}")
-
-
-def plot_dt_generalization(results, save_path):
-    """Bar chart of MSE across different dt values."""
-    dts = sorted(results.keys())
-    mses = [results[dt]["mse"] for dt in dts]
-
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.bar([str(dt) for dt in dts], mses, color="steelblue")
-    ax.set_xlabel("dt")
-    ax.set_ylabel("MSE")
-    ax.set_title("Temporal Generalization (MSE vs dt)")
-    ax.set_yscale("log")
-    ax.grid(True, alpha=0.3, axis="y")
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    log.info(f"Saved: {save_path}")
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
@@ -102,23 +38,23 @@ def main(cfg: DictConfig):
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
+    # Disable autograd globally for the eval script. The rollout helpers
+    # (visual_open_loop_rollout, visual_dt_generalization_test) already use
+    # @torch.no_grad() decorators internally, but direct encoder/decoder
+    # calls in main() below (e.g., for the context-reconstruction grid) run
+    # in the ambient main() scope where autograd would otherwise be on,
+    # producing grad-tracking tensors that then fail `.numpy()` at plot time.
+    # An eval script never needs gradients, so turn them off at the top.
+    torch.set_grad_enabled(False)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-    log.info(f"Loaded {train_cfg.model.name} (epoch {ckpt['epoch']}, val_loss={ckpt.get('val_loss', 'N/A')})")
+    log.info(f"Loaded {train_cfg.model.name} / {train_cfg.predictor.name} "
+             f"(epoch {ckpt['epoch']}, val_loss={ckpt.get('val_loss', 'N/A')})")
 
     output_dir = cfg.checkpoint_dir
     os.makedirs(output_dir, exist_ok=True)
-
-    if is_visual_checkpoint(train_cfg):
-        evaluate_visual(cfg, train_cfg, model, device, output_dir)
-    else:
-        evaluate_vector(cfg, train_cfg, ckpt, model, output_dir)
-
-
-def evaluate_visual(cfg, train_cfg, model, device, output_dir):
-    """Open-loop rollout evaluation for visual world models."""
-    import wandb as wandb_mod
 
     n_rollouts = cfg.eval.get("n_rollouts", 8)
 
@@ -133,7 +69,10 @@ def evaluate_visual(cfg, train_cfg, model, device, output_dir):
     images = batch["images"]  # (B, T+1, C, H, W)
     actions = batch["actions"]  # (B, T)
     B, N, C, H, W = images.shape
-    ctx_len = model.context_length
+    # Use infer_context_length because visual_open_loop_rollout seeds its
+    # infer() call from the first infer_ctx latents. Grid alignment depends
+    # on matching this constant throughout the script.
+    ctx_len = getattr(model, "infer_context_length", model.context_length)
     K = model.encoder_frames
     N_latents = N - K + 1
     horizon = N_latents - ctx_len
@@ -150,7 +89,7 @@ def evaluate_visual(cfg, train_cfg, model, device, output_dir):
     gt_images = images[:, K - 1 + ctx_len:]  # (B, horizon, C, H, W)
     gt_latents = true_latents[:, ctx_len:]   # (B, horizon, D)
 
-    # Latent MSE — flatten non-batch/time dims for per-step mean
+    # Latent MSE
     latent_mse_per_step = ((pred_latents - gt_latents) ** 2).flatten(2).mean(dim=(0, 2))  # (horizon,)
     latent_mse = latent_mse_per_step.mean().item()
     log.info(f"Latent MSE (mean): {latent_mse:.6f}")
@@ -189,10 +128,9 @@ def evaluate_visual(cfg, train_cfg, model, device, output_dir):
     # --- Build rollout grid images ---
     n_show = min(4, B)
     ctx_images = images[:n_show, :ctx_len + K - 1]
-    ctx_mu, _ = model.encode_sequence(ctx_images)  # (n_show, ctx_len, C_lat, sH, sW)
-    C_lat, sH, sW = ctx_mu.shape[2], ctx_mu.shape[3], ctx_mu.shape[4]
-    ctx_s = model.to_state(ctx_mu.reshape(n_show * ctx_len, C_lat, sH, sW))
-    ctx_recon = model.decode(ctx_s).reshape(n_show, ctx_len, C, H, W)
+    ctx_mu = model.encode_sequence(ctx_images)  # (n_show, ctx_len, D)
+    D_enc = ctx_mu.shape[2]
+    ctx_recon = model.decode(ctx_mu.reshape(n_show * ctx_len, D_enc)).reshape(n_show, ctx_len, C, H, W)
 
     blank = torch.zeros(C, H, W, device=device)
     grids = []
@@ -207,7 +145,7 @@ def evaluate_visual(cfg, train_cfg, model, device, output_dir):
         err_row = torch.cat(err_blanks + err_frames, dim=-1)
         grids.extend([gt_row, pred_row, err_row])
 
-    grid = torch.cat(grids, dim=-2).clamp(0, 1).cpu()  # (C, n_show*3*H, N*W)
+    grid = torch.cat(grids, dim=-2).clamp(0, 1).cpu()
 
     grid_path = os.path.join(output_dir, "visual_rollouts.png")
     plt.figure(figsize=(max(16, N * 2), n_show * 4))
@@ -242,7 +180,6 @@ def evaluate_visual(cfg, train_cfg, model, device, output_dir):
         )
 
     # Save rollout grids per dt
-    dt_grid_paths = {}
     for dt_val in dt_sorted:
         dt_grid = dt_results[dt_val]["rollout_grid"]
         C_grid = dt_grid.shape[0]
@@ -257,7 +194,6 @@ def evaluate_visual(cfg, train_cfg, model, device, output_dir):
         plt.tight_layout()
         plt.savefig(dt_grid_path, dpi=150, bbox_inches="tight")
         plt.close()
-        dt_grid_paths[dt_val] = dt_grid_path
         log.info(f"Saved: {dt_grid_path}")
 
     # Plot dt generalization bar charts
@@ -308,10 +244,11 @@ def evaluate_visual(cfg, train_cfg, model, device, output_dir):
 
     # --- wandb logging ---
     if cfg.wandb.enabled:
+        import wandb as wandb_mod
         wandb_mod.init(
             project=cfg.wandb.project,
             config=OmegaConf.to_container(cfg, resolve=True),
-            name=f"eval_{train_cfg.env.name}_{train_cfg.model.name}_{train_cfg.predictor.name}",
+            name=f"eval_{train_cfg.env.name}_{train_cfg.predictor.name}",
         )
         wandb_log = {
             "eval/latent_mse": latent_mse,
@@ -355,85 +292,6 @@ def evaluate_visual(cfg, train_cfg, model, device, output_dir):
 
         wandb_mod.finish()
         log.info("Logged results to wandb")
-
-
-def evaluate_vector(cfg, train_cfg, ckpt, model, output_dir):
-    """Evaluation for vector-state (non-visual) models."""
-    env = rebuild_env(train_cfg)
-    is_ode = train_cfg.model.type == "ode"
-
-    horizon = cfg.eval.horizon
-    dt_values = list(cfg.eval.dt_values)
-
-    # Generate a test trajectory
-    torch.manual_seed(123)
-    np.random.seed(123)
-
-    init_range = np.array(OmegaConf.to_container(train_cfg.env.init_state_range, resolve=True))
-    if init_range.ndim == 1:
-        init_state = torch.tensor(
-            [np.random.uniform(init_range[0], init_range[1]) for _ in range(train_cfg.env.state_dim)]
-        ).float()
-    else:
-        init_state = torch.tensor(
-            [np.random.uniform(r[0], r[1]) for r in init_range]
-        ).float()
-
-    actions = torch.randint(0, train_cfg.env.action_dim, (horizon,))
-    dt = train_cfg.data.dt
-
-    # 1. Open-loop rollout
-    log.info("Running open-loop rollout...")
-    pred_states = open_loop_rollout(model, init_state, actions, dt=dt)
-
-    # Ground truth rollout
-    true_states = []
-    state = init_state.clone()
-    for t in range(horizon):
-        state = env.step(state, actions[t].item(), dt)
-        true_states.append(state)
-    true_states = torch.stack(true_states)
-
-    mse_per_step = mse_over_horizon(pred_states, true_states)
-    log.info(f"Open-loop MSE (mean): {mse_per_step.mean():.6f}")
-
-    plot_rollout(
-        pred_states, true_states,
-        f"{train_cfg.model.name} Open-Loop Rollout",
-        os.path.join(output_dir, "rollout.png"),
-    )
-
-    # 2. Energy conservation
-    log.info("Computing energy conservation...")
-    pred_energies = torch.tensor([env.get_energy(pred_states[t]).item() for t in range(horizon)])
-    true_energies = torch.tensor([env.get_energy(true_states[t]).item() for t in range(horizon)])
-
-    drift = energy_drift(pred_energies)
-    log.info(f"Energy drift: abs={drift['abs_drift']:.4f}, relative={drift['relative_drift']:.4f}")
-
-    plot_energy(pred_energies, true_energies, os.path.join(output_dir, "energy.png"))
-
-    # 3. dt generalization
-    log.info(f"Testing dt generalization: {dt_values}")
-    dt_results = dt_generalization_test(model, env, init_state, actions, dt_values)
-
-    for dt_val in sorted(dt_results.keys()):
-        log.info(f"  dt={dt_val}: MSE={dt_results[dt_val]['mse']:.6f}")
-
-    plot_dt_generalization(dt_results, os.path.join(output_dir, "dt_generalization.png"))
-
-    # Save metrics
-    metrics = {
-        "model": train_cfg.model.name,
-        "env": train_cfg.env.name,
-        "train_epoch": ckpt["epoch"],
-        "train_val_loss": ckpt.get("val_loss"),
-        "open_loop_mse": mse_per_step.mean().item(),
-        "energy_drift": drift,
-        "dt_generalization": {str(dt): dt_results[dt]["mse"] for dt in dt_values},
-    }
-    torch.save(metrics, os.path.join(output_dir, "eval_metrics.pt"))
-    log.info(f"Metrics saved to: {output_dir}/eval_metrics.pt")
 
 
 if __name__ == "__main__":

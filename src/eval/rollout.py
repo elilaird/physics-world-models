@@ -1,135 +1,70 @@
 import numpy as np
 import torch
 
-from src.models.wrappers import TrajectoryMatchingModel
-
-
-def open_loop_rollout(model, init_state, actions, dt=0.1):
-    """
-    Run open-loop rollout: feed model's own predictions back recursively.
-
-    Args:
-        model: A model with forward(state, action) -> next_state (discrete models)
-               or a TrajectoryMatchingModel wrapping an ODE func.
-        init_state: Tensor of shape (state_dim,) or (1, state_dim).
-        actions: Tensor of shape (T,) — action indices for each step.
-        dt: Timestep for ODE models.
-
-    Returns:
-        Tensor of shape (T, state_dim) with predicted states.
-    """
-    states = []
-    state = init_state.unsqueeze(0) if init_state.dim() == 1 else init_state
-
-    is_ode_wrapper = isinstance(model, TrajectoryMatchingModel)
-
-    with torch.no_grad():
-        for t in range(len(actions)):
-            action = actions[t].unsqueeze(0)
-            if is_ode_wrapper:
-                state = model(state, action, dt=dt)
-            else:
-                state = model(state, action)
-            states.append(state.squeeze(0))
-
-    return torch.stack(states)
-
-
-def dt_generalization_test(model, env, init_state, actions, dt_values, variable_params=None):
-    """
-    Test model across different dt values. Compares model predictions
-    against ground-truth env rollouts at each dt.
-
-    Args:
-        model: Model or TrajectoryMatchingModel.
-        env: PhysicsControlEnv for ground truth.
-        init_state: Tensor of shape (state_dim,).
-        actions: Tensor of shape (T,) — action indices.
-        dt_values: List of dt values to test.
-        variable_params: Optional dict of env params.
-
-    Returns:
-        Dict mapping dt -> {'pred_states': Tensor, 'true_states': Tensor, 'mse': float}.
-    """
-    results = {}
-    is_ode_wrapper = isinstance(model, TrajectoryMatchingModel)
-
-    for dt in dt_values:
-        # Ground truth rollout
-        true_states = []
-        state_true = init_state.clone()
-        for t in range(len(actions)):
-            a = actions[t].item()
-            state_true = env.step(state_true, a, dt, variable_params)
-            true_states.append(state_true)
-        true_states = torch.stack(true_states)
-
-        # Model rollout
-        pred_states = open_loop_rollout(model, init_state, actions, dt=dt)
-
-        mse = ((pred_states - true_states) ** 2).mean().item()
-        results[dt] = {
-            "pred_states": pred_states,
-            "true_states": true_states,
-            "mse": mse,
-        }
-
-    return results
-
 
 @torch.no_grad()
-def visual_open_loop_rollout(model, images, actions):
+def visual_open_loop_rollout(model, images, actions, dt=None):
     """Open-loop rollout for visual world models with flat latents.
 
     Encodes all frames with channel-concatenated overlapping windows, then
-    autoregressively predicts remaining latents. Each step the predictor sees
-    context_length latents, produces one next-latent, and the window shifts.
+    calls ``predictor.infer`` ONCE on the first ``infer_context_length``
+    latents to produce an initial state dict (carrying z, optional q/p, and
+    optional static theta), and then ``predictor.unroll`` to roll out over
+    the remaining horizon.
+
+    Infer-once-per-rollout is the architectural discipline that keeps GRU
+    state inference out of the per-step dynamics loop (takeaways/01).
 
     Args:
         model: VisualWorldModel (encoder, decoder, predictor).
         images: (B, T+1, C, H, W) ground-truth image sequence.
         actions: (B, T) discrete action indices.
+        dt: optional timestep override for ODE-based predictors.
+            When None, uses the predictor's training dt (self.dt).
 
     Returns:
         dict with:
-            pred_latents: (B, horizon, D_state) predicted latents
-            true_latents: (B, N_latents, D_state) encoded ground-truth latents
+            pred_latents: (B, horizon, D) predicted latents
+            true_latents: (B, N_latents, D) encoded ground-truth latents
             pred_images: (B, horizon, C, H, W) decoded predicted frames
-        where N_latents = N - encoder_frames + 1, horizon = N_latents - ctx_len
+        where N_latents = N - encoder_frames + 1, horizon = N_latents - infer_ctx
     """
     B, N, C, H, W = images.shape
-    ctx_len = model.context_length
+    infer_ctx = getattr(model, "infer_context_length", model.context_length)
     K = model.encoder_frames
 
-    # Encode all ground-truth frames → posterior means → phase-space states
-    mu_all, _ = model.encode_sequence(images)  # (B, N_latents, D_enc)
+    # Encode all ground-truth frames → latent states (encoder output IS the state)
+    mu_all = model.encode_sequence(images)  # (B, N_latents, D)
     N_latents = mu_all.shape[1]
-    D_enc = mu_all.shape[2]
+    D = mu_all.shape[2]
 
-    mu_flat = mu_all.reshape(B * N_latents, D_enc)
-    true_latents = model.to_state(mu_flat)  # (B*N_latents, D_state)
-    D_state = true_latents.shape[-1]
-    true_latents = true_latents.reshape(B, N_latents, D_state)
-    horizon = N_latents - ctx_len
+    true_latents = mu_all
+    horizon = N_latents - infer_ctx
 
-    # Transition actions: action[K-1+i] drives latent i → i+1
+    # Transition actions: action[K-1+i] drives latent i → i+1, so the actions
+    # aligned with the latent sequence start at index K-1.
     transition_actions = actions[:, K - 1:]  # (B, N_latents - 1)
 
-    # Seed context with the first ctx_len encoded latents
-    context = true_latents[:, :ctx_len].clone()  # (B, ctx_len, D_state)
+    # Context = first infer_ctx latents. Context-internal actions drive those
+    # first latents forward and are consumed by the GRU to infer theta.
+    context = true_latents[:, :infer_ctx]
+    context_actions = transition_actions[:, : infer_ctx - 1].long()
 
-    pred_latents = []
-    for t in range(horizon):
-        act = transition_actions[:, t:t + ctx_len].long()
-        pred = model.predictor(context, act)  # (B, ctx_len, D_state)
-        z_next = pred[:, -1]  # (B, D_state)
-        pred_latents.append(z_next)
-        context = torch.cat([context[:, 1:], z_next.unsqueeze(1)], dim=1)
+    # Unroll actions: the (infer_ctx - 1)-th transition bridges context to
+    # the first predicted step; then we need `horizon` more actions.
+    unroll_actions = transition_actions[
+        :, infer_ctx - 1 : infer_ctx - 1 + horizon
+    ].long()
 
-    pred_latents = torch.stack(pred_latents, dim=1)  # (B, horizon, D_state)
+    # Infer initial state (runs GRU once for Latent-* predictors). The
+    # @torch.no_grad() decorator on this function disables grad globally,
+    # but LatentHamiltonianPredictor.step has @torch.enable_grad() locally
+    # so its autograd-based ∂H/∂z computation still works at eval time.
+    state = model.predictor.infer(context, context_actions=context_actions)
+    pred_latents = model.predictor.unroll(state, unroll_actions, horizon, dt=dt)
 
     pred_images = model.decode(
-        pred_latents.reshape(B * horizon, D_state)
+        pred_latents.reshape(B * horizon, D)
     ).reshape(B, horizon, C, H, W)
 
     return {
@@ -197,7 +132,9 @@ def visual_dt_generalization_test(
     from omegaconf import OmegaConf
     from src.eval.metrics import compute_visual_metrics
 
-    ctx_len = model.context_length
+    # Grid layout and horizon bookkeeping use infer_context_length because
+    # visual_open_loop_rollout seeds from the first infer_ctx latents.
+    ctx_len = getattr(model, "infer_context_length", model.context_length)
     if seq_len is None:
         seq_len = ctx_len + 10
 
@@ -241,16 +178,16 @@ def visual_dt_generalization_test(
         images_batch = torch.stack(all_images).to(device)
         actions_batch = torch.stack(all_actions).to(device)
 
-        # Run visual rollout
+        # Run visual rollout (pass dt so ODE-based predictors integrate correctly)
         K = model.encoder_frames
-        rollout = visual_open_loop_rollout(model, images_batch, actions_batch)
+        rollout = visual_open_loop_rollout(model, images_batch, actions_batch, dt=dt)
         pred_images = rollout["pred_images"]       # (n_seqs, horizon, C, H, W)
-        true_latents = rollout["true_latents"]     # (n_seqs, N_latents, D_state)
-        pred_latents = rollout["pred_latents"]     # (n_seqs, horizon, D_state)
+        true_latents = rollout["true_latents"]     # (n_seqs, N_latents, D)
+        pred_latents = rollout["pred_latents"]     # (n_seqs, horizon, D)
 
         horizon = pred_images.shape[1]
         gt_images = images_batch[:, K - 1 + ctx_len:]  # (n_seqs, horizon, C, H, W)
-        gt_latents = true_latents[:, ctx_len:]          # (n_seqs, horizon, D_state)
+        gt_latents = true_latents[:, ctx_len:]          # (n_seqs, horizon, D)
 
         latent_mse = ((pred_latents - gt_latents) ** 2).mean().item()
         vis_metrics = compute_visual_metrics(pred_images, gt_images)
@@ -263,10 +200,9 @@ def visual_dt_generalization_test(
 
         # Encode context
         ctx_images = images_batch[:n_show, :ctx_len + K - 1]
-        ctx_mu, _ = model.encode_sequence(ctx_images)  # (n_show, ctx_len, D_enc)
+        ctx_mu = model.encode_sequence(ctx_images)  # (n_show, ctx_len, D)
         D_enc = ctx_mu.shape[2]
-        ctx_s = model.to_state(ctx_mu.reshape(n_show * ctx_len, D_enc))
-        ctx_recon = model.decode(ctx_s).reshape(n_show, ctx_len, C, H, W)
+        ctx_recon = model.decode(ctx_mu.reshape(n_show * ctx_len, D_enc)).reshape(n_show, ctx_len, C, H, W)
 
         rows = []
         for i in range(n_show):
