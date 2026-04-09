@@ -536,7 +536,6 @@ def main(cfg: DictConfig):
     for epoch in pbar:
         model.train()
         train_accum = {k: 0.0 for k in loss_keys}
-        n_skipped = 0
         n_steps = 0
 
         train_batches = tqdm(train_loader, desc=f"Epoch {epoch} [Train]", leave=False)
@@ -548,20 +547,11 @@ def main(cfg: DictConfig):
 
             losses = jepa_train_step(model, batch, optimizer, sigreg_module, cfg)
 
-            # Skip non-finite batches (stiff second-order autograd in
-            # Hamiltonian predictors can produce rare NaN losses that would
-            # otherwise poison the model weights via optimizer.step()).
-            if losses.get("skipped", False):
-                n_skipped += 1
-                if n_skipped <= 5 or n_skipped % 10 == 0:
-                    log.warning(
-                        f"Skipped non-finite batch at epoch {epoch} "
-                        f"(total skipped this epoch: {n_skipped})"
-                    )
-                continue
-
-            if _has_nan(losses):
-                log.error(f"NaN detected in training losses at epoch {epoch}: {losses}")
+            if losses.get("skipped", False) or _has_nan(losses):
+                log.error(
+                    f"NaN/Inf detected at epoch {epoch} — aborting training. "
+                    f"Will reload best checkpoint for test evaluation."
+                )
                 training_aborted = True
                 break
 
@@ -571,14 +561,8 @@ def main(cfg: DictConfig):
             train_batches.set_postfix({k: f"{losses.get(k, 0.0):.4f}" for k in loss_keys[:3]})
 
         if training_aborted:
-            log.error("Stopping training due to NaN losses.")
             break
 
-        if n_skipped > 0:
-            log.info(f"Epoch {epoch}: skipped {n_skipped}/{len(train_loader)} non-finite batches")
-
-        # Average over batches that actually contributed (avoid divide-by-zero
-        # if every batch was skipped).
         denom = max(n_steps, 1)
         train_avg = {k: v / denom for k, v in train_accum.items()}
 
