@@ -241,6 +241,7 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
         "latent_pred_loss": latent_pred_loss.item(),
         "sigreg_loss": sigreg_loss.item(),
         "total_loss": loss.item(),
+        "grad_norm": grad_norm.item(),
     }
 
     # Energy monitoring for Hamiltonian predictors.
@@ -515,16 +516,16 @@ def main(cfg: DictConfig):
         f"projections={cfg.training.get('sigreg_projections', 1024)}"
     )
 
-    # Single optimizer + cosine LR decay
     lr = cfg.training.get("lr", 5e-4)
     eta_min = cfg.training.get("lr_min", 1e-6)
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.Adam(trainable_params, lr=lr)
+
+    optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.training.epochs, eta_min=eta_min,
     )
+    log.info(f"Learning rate: {lr:.1e}, eta_min: {eta_min:.1e}")
 
-    loss_keys = ["total_loss", "recon_loss", "pred_recon_loss", "latent_pred_loss", "sigreg_loss"]
+    loss_keys = ["total_loss", "recon_loss", "pred_recon_loss", "latent_pred_loss", "sigreg_loss", "grad_norm"]
     if _has_energy(model.predictor):
         loss_keys.extend(["energy_mean", "energy_std", "energy_time_var", "energy_monotone"])
 
@@ -533,7 +534,7 @@ def main(cfg: DictConfig):
     os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
 
     # Training loop
-    best_val_loss = float("inf")
+    best_rollout_psnr = -float("inf")
     pbar = tqdm(range(1, cfg.training.epochs + 1), desc="Training")
 
     training_aborted = False
@@ -608,9 +609,8 @@ def main(cfg: DictConfig):
             )
 
         # wandb logging
-        current_lr = optimizer.param_groups[0]["lr"]
         if cfg.wandb.enabled:
-            wandb_log = {"epoch": epoch, "train/lr": current_lr}
+            wandb_log = {"epoch": epoch, "train/lr": optimizer.param_groups[0]["lr"]}
             for k in loss_keys:
                 wandb_log[f"train/{k}"] = train_avg[k]
                 wandb_log[f"val/{k}"] = val_avg[k]
@@ -630,13 +630,19 @@ def main(cfg: DictConfig):
 
             wandb.log(wandb_log)
 
-        if avg_val < best_val_loss:
-            best_val_loss = avg_val
+        # Checkpoint on rollout PSNR (best predictor dynamics), not val_total_loss.
+        # val_total_loss is dominated by the 1-step latent pred loss which can
+        # decrease while multi-step rollout quality degrades (non-stationary target).
+        rollout_psnr = rollout_metrics["psnr"] if rollout_metrics is not None else -float("inf")
+        if rollout_psnr > best_rollout_psnr:
+            best_rollout_psnr = rollout_psnr
+            log.info(f"  New best rollout PSNR: {rollout_psnr:.2f} (epoch {epoch}) — saving checkpoint.")
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
                     "epoch": epoch,
                     "val_loss": avg_val,
+                    "rollout_psnr": rollout_psnr,
                     "config": OmegaConf.to_container(cfg, resolve=True),
                 },
                 ckpt_path,
@@ -651,7 +657,7 @@ def main(cfg: DictConfig):
     if training_aborted and os.path.exists(ckpt_path):
         log.warning(
             f"Training aborted on NaN — reloading best checkpoint "
-            f"from {ckpt_path} for test evaluation."
+            f"(rollout PSNR {best_rollout_psnr:.2f}) from {ckpt_path} for test evaluation."
         )
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
@@ -729,7 +735,7 @@ def main(cfg: DictConfig):
                 ),
             })
 
-    log.info(f"Training complete. Best val loss: {best_val_loss:.6f}. Test loss: {avg_test:.6f}.")
+    log.info(f"Training complete. Best rollout PSNR: {best_rollout_psnr:.2f}. Test loss: {avg_test:.6f}.")
     log.info(f"Checkpoint saved to: {ckpt_path}")
 
     if cfg.wandb.enabled:
