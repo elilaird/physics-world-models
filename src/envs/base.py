@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from torchdiffeq import odeint
 
@@ -22,6 +23,42 @@ class PhysicsControlEnv:
 
     def get_energy(self, state, variable_params=None):
         raise NotImplementedError
+
+    def sample_initial_state(self, sampling_mode="uniform_box", init_state_range=None,
+                             energy_radius_range=None, variable_params=None):
+        """Draw an initial state.
+
+        Modes:
+            "uniform_box": independent uniform sample per state dimension from
+                ``init_state_range``. Accepts either a 1D range ``[lo, hi]`` applied
+                to every dim, or a per-dim list ``[[lo_0, hi_0], [lo_1, hi_1], ...]``.
+            "energy_radius": draw uniformly over total-energy levels and uniformly
+                on the constant-energy curve. Eliminates near-zero-energy dead
+                trajectories. Subclasses must override ``_sample_energy_radius_state``.
+        """
+        if sampling_mode == "energy_radius":
+            if energy_radius_range is None:
+                raise ValueError(
+                    "energy_radius_range is required for energy_radius sampling mode"
+                )
+            return self._sample_energy_radius_state(energy_radius_range, variable_params)
+
+        if init_state_range is None:
+            raise ValueError(
+                "init_state_range is required for uniform_box sampling mode"
+            )
+        init_state_range = np.asarray(init_state_range)
+        if init_state_range.ndim == 1:
+            values = [np.random.uniform(init_state_range[0], init_state_range[1])
+                      for _ in range(self.state_dim)]
+        else:
+            values = [np.random.uniform(r[0], r[1]) for r in init_state_range]
+        return torch.tensor(values, dtype=torch.float32)
+
+    def _sample_energy_radius_state(self, energy_radius_range, variable_params=None):
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement energy_radius sampling"
+        )
 
     def render_state(self, state, img_size=64, color=True, render_quality="medium",
                      ball_color=None, bg_color=None, ball_radius=None):

@@ -45,6 +45,7 @@ def register_predictor(name):
     def decorator(cls):
         PREDICTOR_REGISTRY[name] = cls
         return cls
+
     return decorator
 
 
@@ -205,12 +206,16 @@ class LSTMPredictor(BasePredictor):
     def infer(self, context, context_actions=None, dt=None):
         B, T, _ = context.shape
         if context_actions is None:
-            ctx_acts = torch.zeros(B, T, dtype=torch.long, device=context.device)
+            ctx_acts = torch.zeros(
+                B, T, dtype=torch.long, device=context.device
+            )
         else:
             # Pad to length T if shorter (context_actions has T-1 entries normally)
             pad = T - context_actions.shape[1]
             if pad > 0:
-                pad_zeros = torch.zeros(B, pad, dtype=torch.long, device=context.device)
+                pad_zeros = torch.zeros(
+                    B, pad, dtype=torch.long, device=context.device
+                )
                 ctx_acts = torch.cat([context_actions, pad_zeros], dim=1)
             else:
                 ctx_acts = context_actions
@@ -294,15 +299,15 @@ class HamiltonianPredictor(BasePredictor):
         z = state["z"]
         dt_eff = dt if dt is not None else self.dt
 
-        q = _require_grad(z[:, :self.half_dim])
-        p = _require_grad(z[:, self.half_dim:])
+        q = _require_grad(z[:, : self.half_dim])
+        p = _require_grad(z[:, self.half_dim :])
 
         # First autograd pass: ∂H/∂z at (q, p)
         z_cat = torch.cat([q, p], dim=-1)
         H = self.H_net(z_cat).sum()
         dH_dz = torch.autograd.grad(H, z_cat, create_graph=self.training)[0]
-        dH_dq = dH_dz[:, :self.half_dim]
-        dH_dp = dH_dz[:, self.half_dim:]
+        dH_dq = dH_dz[:, : self.half_dim]
+        dH_dp = dH_dz[:, self.half_dim :]
 
         damping = F.softplus(self.log_damping)
         G_u = self.G_net(self.act_emb(action))  # (B, half_dim)
@@ -313,8 +318,10 @@ class HamiltonianPredictor(BasePredictor):
         # Second autograd pass: ∂H/∂p at (q, p_new)
         z_mid = torch.cat([q, p_new], dim=-1)
         H_mid = self.H_net(z_mid).sum()
-        dH_dz_mid = torch.autograd.grad(H_mid, z_mid, create_graph=self.training)[0]
-        dH_dp_new = dH_dz_mid[:, self.half_dim:]
+        dH_dz_mid = torch.autograd.grad(
+            H_mid, z_mid, create_graph=self.training
+        )[0]
+        dH_dp_new = dH_dz_mid[:, self.half_dim :]
 
         q_new = q + dt_eff * dH_dp_new
 
@@ -370,7 +377,9 @@ class LatentNeuralODEPredictor(BasePredictor):
         self.theta_head = nn.Linear(gru_hidden, theta_dim)
 
         self.f_net = nn.Sequential(
-            nn.Linear(latent_dim + theta_dim + action_embedding_dim, hidden_dim),
+            nn.Linear(
+                latent_dim + theta_dim + action_embedding_dim, hidden_dim
+            ),
             nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LeakyReLU(0.2),
@@ -388,7 +397,9 @@ class LatentNeuralODEPredictor(BasePredictor):
         q_seq = context[:, :-1]  # (B, T-1, D)
 
         if context_actions is None:
-            ctx_acts = torch.zeros(B, T - 1, dtype=torch.long, device=context.device)
+            ctx_acts = torch.zeros(
+                B, T - 1, dtype=torch.long, device=context.device
+            )
         else:
             n_acts = context_actions.shape[1]
             if n_acts < T - 1:
@@ -541,13 +552,16 @@ class LatentHamiltonianPredictor(BasePredictor):
         dt_eff = dt if dt is not None else self.dt
 
         # Compute dt-normalized latent velocity: v_t = (q_{t+1} - q_t) / dt
-        velocities = (context[:, 1:] - context[:, :-1]) / dt_eff  # (B, T-1, D)
+        velocities = context[:, 1:] - context[:, :-1]
+        # velocities = (context[:, 1:] - context[:, :-1]) / dt_eff  # (B, T-1, D)
 
         # GRU processes T-1 transition steps: (q_t, v_t, a_t)
         q_seq = context[:, :-1]  # (B, T-1, D)
 
         if context_actions is None:
-            ctx_acts = torch.zeros(B, T - 1, dtype=torch.long, device=context.device)
+            ctx_acts = torch.zeros(
+                B, T - 1, dtype=torch.long, device=context.device
+            )
         else:
             n_acts = context_actions.shape[1]
             if n_acts < T - 1:
@@ -565,7 +579,7 @@ class LatentHamiltonianPredictor(BasePredictor):
 
         theta = self.theta_head(h_final)
         p = self.p_head(h_final)  # GRU-smoothed, dt-normalized momentum
-        q = context[:, -1]        # position from last context frame
+        q = context[:, -1]  # position from last context frame
 
         return {"z": q, "q": q, "p": p, "theta": theta}
 
@@ -583,12 +597,14 @@ class LatentHamiltonianPredictor(BasePredictor):
         inp = torch.cat([z_phase, theta], dim=-1)  # (B, 2D + theta_dim)
         H = self.H_net(inp).sum()
         dH_dz = torch.autograd.grad(H, z_phase, create_graph=self.training)[0]
-        dH_dq = dH_dz[:, :self.q_dim]   # (B, D)
-        dH_dp = dH_dz[:, self.q_dim:]   # (B, D)
+        dH_dq = dH_dz[:, : self.q_dim]  # (B, D)
+        dH_dp = dH_dz[:, self.q_dim :]  # (B, D)
 
         # Per-trajectory damping and action force
         gamma = F.softplus(self.damping_net(theta))  # (B, 1)
-        G_u = self.G_net(torch.cat([self.act_emb(action), theta], dim=-1))  # (B, D)
+        G_u = self.G_net(
+            torch.cat([self.act_emb(action), theta], dim=-1)
+        )  # (B, D)
 
         # Semi-implicit Euler: update p first
         p_new = p + dt_eff * (-dH_dq - gamma * dH_dp + G_u)
@@ -597,8 +613,10 @@ class LatentHamiltonianPredictor(BasePredictor):
         z_mid = torch.cat([q, p_new], dim=-1)
         inp_mid = torch.cat([z_mid, theta], dim=-1)
         H_mid = self.H_net(inp_mid).sum()
-        dH_dz_mid = torch.autograd.grad(H_mid, z_mid, create_graph=self.training)[0]
-        dH_dp_new = dH_dz_mid[:, self.q_dim:]
+        dH_dz_mid = torch.autograd.grad(
+            H_mid, z_mid, create_graph=self.training
+        )[0]
+        dH_dp_new = dH_dz_mid[:, self.q_dim :]
 
         q_new = q + dt_eff * dH_dp_new
 

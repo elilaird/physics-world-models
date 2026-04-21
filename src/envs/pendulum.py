@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from torchdiffeq import odeint
 
@@ -56,6 +57,36 @@ class ForcedPendulum(PhysicsControlEnv):
         kinetic = 0.5 * m * L**2 * omega**2
         potential = m * g * L * (1 - torch.cos(theta))
         return kinetic + potential
+
+    def _sample_energy_radius_state(self, energy_radius_range, variable_params=None):
+        # Pendulum potential is bounded (U ∈ [0, 2mgL]), so we can't rescale to a
+        # universal circle like the oscillator. Instead, draw total energy E, split
+        # it between kinetic and potential, then invert each piece.
+        if variable_params is not None:
+            m = variable_params.get("m", self.m)
+            L = variable_params.get("L", self.L)
+            g = variable_params.get("g", self.g)
+        else:
+            m, L, g = self.m, self.L, self.g
+
+        r_min, r_max = energy_radius_range
+        r = np.random.uniform(r_min, r_max)
+        E = 0.5 * r**2
+
+        # Cap potential at barrier height: above 2mgL the pendulum rotates (no
+        # turning points), and cos(θ)=1-U/(mgL) becomes ill-defined.
+        u_max = min(E, 2.0 * m * g * L)
+        U = np.random.uniform(0.0, u_max)
+        K = max(E - U, 0.0)
+
+        omega_mag = np.sqrt(2.0 * K / (m * L**2))
+        omega = omega_mag * np.random.choice([-1.0, 1.0])
+
+        cos_theta = np.clip(1.0 - U / (m * g * L), -1.0, 1.0)
+        theta_mag = np.arccos(cos_theta)
+        theta = theta_mag * np.random.choice([-1.0, 1.0])
+
+        return torch.tensor([theta, omega], dtype=torch.float32)
 
     def render_state(self, state, img_size=64, color=True, render_quality="medium",
                      ball_color=None, bg_color=None, ball_radius=None):

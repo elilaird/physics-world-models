@@ -141,8 +141,16 @@ def visual_dt_generalization_test(
     if seq_len is None:
         seq_len = ctx_len + 10
 
-    # Render settings from env config
-    env_cfg = cfg.env
+    # Pull the env/sampling config. Prefer cfg.dataset.env when present: that
+    # is the block describing how the training data was generated (it carries
+    # init_sampling / energy_radius_range). cfg.env is the default env config
+    # and may not have the sampling keys. Callers without a dataset block
+    # fall back to cfg.env for backwards compatibility.
+    if "dataset" in cfg and "env" in cfg.dataset:
+        env_cfg = cfg.dataset.env
+    else:
+        env_cfg = cfg.env
+
     render_opts = {
         "img_size": env_cfg.get("img_size", 64),
         "color": env_cfg.get("color", True),
@@ -153,8 +161,19 @@ def visual_dt_generalization_test(
         if v is not None:
             render_opts[k] = list(v) if hasattr(v, "__iter__") else v
 
-    # Init state sampling
-    init_range = np.array(OmegaConf.to_container(env_cfg.init_state_range, resolve=True))
+    # Init state sampling — route through env.sample_initial_state so the eval
+    # distribution matches generate_dataset.py. When the dataset was generated
+    # with init_sampling: energy_radius, eval trajectories start on the same
+    # energy contours, not from a uniform box that biases toward low-energy /
+    # near-equilibrium states.
+    sampling_mode = env_cfg.get("init_sampling", "uniform_box")
+    energy_radius_range = env_cfg.get("energy_radius_range", None)
+    if energy_radius_range is not None:
+        energy_radius_range = list(energy_radius_range)
+    init_state_range = (
+        OmegaConf.to_container(env_cfg.init_state_range, resolve=True)
+        if "init_state_range" in env_cfg else None
+    )
 
     device = next(model.parameters()).device
     results = {}
@@ -163,15 +182,12 @@ def visual_dt_generalization_test(
         all_images = []
         all_actions = []
         for _ in range(n_seqs):
-            if init_range.ndim == 1:
-                init_state = torch.tensor(
-                    [np.random.uniform(init_range[0], init_range[1])
-                     for _ in range(env.state_dim)]
-                ).float()
-            else:
-                init_state = torch.tensor(
-                    [np.random.uniform(r[0], r[1]) for r in init_range]
-                ).float()
+            init_state = env.sample_initial_state(
+                sampling_mode=sampling_mode,
+                init_state_range=init_state_range,
+                energy_radius_range=energy_radius_range,
+                variable_params=None,
+            )
 
             actions = torch.randint(0, env.action_dim, (seq_len,))
             imgs, _ = generate_visual_trajectory(env, init_state, actions, dt, render_opts)
