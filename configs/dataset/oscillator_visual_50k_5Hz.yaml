@@ -1,12 +1,12 @@
 
 name: oscillator_conservative
-version: null
+version: 2026-04-22_11-13-45
 n_seqs: 50000
 seq_len: 50
 dt: 0.2
 val_split: 0.1
 test_split: 0.1
-chunk_size: 1000
+chunk_size: 100
 env:
   name: oscillator
   state_dim: 2
