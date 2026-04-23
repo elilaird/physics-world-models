@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from torchdiffeq import odeint
 
@@ -51,6 +52,20 @@ class ForcedOscillator(PhysicsControlEnv):
 
         x, v = state[..., 0], state[..., 1]
         return 0.5 * m * v**2 + 0.5 * k * x**2
+
+    def _sample_energy_radius_state(self, energy_radius_range, variable_params=None):
+        # Rescaled coordinates x̃ = √k·x, ṽ = √m·v make constant-energy curves circles
+        # of radius r = √(2E). Uniform r × uniform angle gives uniform sampling over
+        # energy levels with no near-zero-energy dead trajectories.
+        k = variable_params.get("k", self.k) if variable_params else self.k
+        m = variable_params.get("m", self.m) if variable_params else self.m
+
+        r_min, r_max = energy_radius_range
+        r = np.random.uniform(r_min, r_max)
+        theta = np.random.uniform(0.0, 2.0 * np.pi)
+        x = r * np.cos(theta) / np.sqrt(k)
+        v = r * np.sin(theta) / np.sqrt(m)
+        return torch.tensor([x, v], dtype=torch.float32)
 
     def render_state(self, state, img_size=64, color=True, render_quality="medium",
                      ball_color=None, bg_color=None, ball_radius=None):

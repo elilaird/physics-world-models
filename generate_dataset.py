@@ -52,6 +52,11 @@ def generate_chunk(env, variable_params, init_state_range, chunk_size, seq_len, 
         if v is not None:
             render_opts[k] = list(v) if hasattr(v, "__iter__") else v
 
+    sampling_mode = cfg.dataset.env.get("init_sampling", "uniform_box")
+    energy_radius_range = cfg.dataset.env.get("energy_radius_range", None)
+    if energy_radius_range is not None:
+        energy_radius_range = list(energy_radius_range)
+
     all_states = []
     all_actions = []
     all_images = []
@@ -63,16 +68,12 @@ def generate_chunk(env, variable_params, init_state_range, chunk_size, seq_len, 
             for k, v in variable_params.items()
         }
 
-        # Sample initial state
-        if init_state_range.ndim == 1:
-            state = torch.tensor(
-                [np.random.uniform(init_state_range[0], init_state_range[1])
-                 for _ in range(env.state_dim)]
-            ).float()
-        else:
-            state = torch.tensor(
-                [np.random.uniform(r[0], r[1]) for r in init_state_range]
-            ).float()
+        state = env.sample_initial_state(
+            sampling_mode=sampling_mode,
+            init_state_range=init_state_range,
+            energy_radius_range=energy_radius_range,
+            variable_params=sampled_params,
+        )
 
         states = [state]
         actions = []
@@ -228,6 +229,8 @@ def main(cfg: DictConfig):
         "generation_time_s": round(gen_time, 1),
         "env_params": OmegaConf.to_container(cfg.dataset.env.params, resolve=True),
         "variable_params": variable_params,
+        "init_sampling": cfg.dataset.env.get("init_sampling", "uniform_box"),
+        "energy_radius_range": list(cfg.dataset.env.get("energy_radius_range", []) or []) or None,
         "visual": {k: cfg.dataset.env[k] for k in ("img_size", "channels", "color", "render_quality", "ball_color", "bg_color", "ball_radius") if k in cfg.dataset.env},
     }
 

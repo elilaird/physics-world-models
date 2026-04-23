@@ -84,15 +84,23 @@ def build_model(cfg):
 # JEPA training step
 # ---------------------------------------------------------------------------
 
-def _reseed_window(predictor, window_ctx, shared_state):
+def _reseed_window(predictor, window_ctx, shared_state, dt=None):
     """Re-seed dynamical variables from window_ctx, reuse shared static keys.
 
-    The predictor's ``infer`` is called on the window context to get fresh
-    (z, q, p) seeded at the last frame of the window, then any static keys
-    from ``shared_state`` — ``theta`` (Latent-*), ``h``/``c`` (LSTM) — are
-    copied over so they are not re-inferred per window.
+    For predictors with velocity-based inference (LatentHamiltonianPredictor),
+    computes momentum from the last two context frames' finite difference
+    rather than re-running the full GRU. This is cheaper and avoids
+    re-inferring theta per window.
+
+    For other predictors, falls back to ``predictor.infer(window_ctx)``.
     """
-    new_state = predictor.infer(window_ctx)
+    if hasattr(predictor, "p_head") and dt is not None and window_ctx.shape[1] >= 2:
+        # Velocity-based predictor: compute p from finite difference
+        q = window_ctx[:, -1]
+        p = (window_ctx[:, -1] - window_ctx[:, -2]) / dt
+        new_state = {"z": q, "q": q, "p": p}
+    else:
+        new_state = predictor.infer(window_ctx, dt=dt)
     for key in ("theta", "h", "c"):
         if key in shared_state:
             new_state[key] = shared_state[key]
@@ -149,7 +157,8 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
     transition_actions = actions[:, K - 1:]  # (B, N_lat - 1)
     full_ctx_actions = transition_actions[:, : max(ctx_len - 1, 0)].long()
     shared_state = model.predictor.infer(
-        all_states[:, :ctx_len], context_actions=full_ctx_actions
+        all_states[:, :ctx_len], context_actions=full_ctx_actions,
+        dt=model.observation_dt,
     )
 
     # 4. Sliding window unroll. Each window re-seeds (q, p) from its own
@@ -177,7 +186,7 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
             :, start + ctx_len - 1 : start + ctx_len - 1 + n_pred
         ].long()
 
-        window_state = _reseed_window(model.predictor, window_ctx, shared_state)
+        window_state = _reseed_window(model.predictor, window_ctx, shared_state, dt=model.observation_dt)
         pred_z = model.predictor.unroll(window_state, unroll_actions, n_pred)
 
         latent_pred_loss = latent_pred_loss + ((pred_z - target_states) ** 2).mean() / num_windows
@@ -232,6 +241,7 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
         "latent_pred_loss": latent_pred_loss.item(),
         "sigreg_loss": sigreg_loss.item(),
         "total_loss": loss.item(),
+        "grad_norm": grad_norm.item(),
     }
 
     # Energy monitoring for Hamiltonian predictors.
@@ -279,7 +289,8 @@ def jepa_eval_step(model, batch, cfg):
     transition_actions = actions[:, K - 1:]
     full_ctx_actions = transition_actions[:, : max(ctx_len - 1, 0)].long()
     shared_state = model.predictor.infer(
-        all_states[:, :ctx_len], context_actions=full_ctx_actions
+        all_states[:, :ctx_len], context_actions=full_ctx_actions,
+        dt=model.observation_dt,
     )
 
     window_size = ctx_len + pred_len
@@ -301,7 +312,7 @@ def jepa_eval_step(model, batch, cfg):
             :, start + ctx_len - 1 : start + ctx_len - 1 + n_pred
         ].long()
 
-        window_state = _reseed_window(model.predictor, window_ctx, shared_state)
+        window_state = _reseed_window(model.predictor, window_ctx, shared_state, dt=model.observation_dt)
         pred_z = model.predictor.unroll(window_state, unroll_actions, n_pred)
 
         latent_pred_loss += ((pred_z - target_states) ** 2).mean().item() / num_windows
@@ -505,12 +516,16 @@ def main(cfg: DictConfig):
         f"projections={cfg.training.get('sigreg_projections', 1024)}"
     )
 
-    # Single optimizer
     lr = cfg.training.get("lr", 5e-4)
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.Adam(trainable_params, lr=lr)
+    eta_min = cfg.training.get("lr_min", 1e-6)
 
-    loss_keys = ["total_loss", "recon_loss", "pred_recon_loss", "latent_pred_loss", "sigreg_loss"]
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cfg.training.epochs, eta_min=eta_min,
+    )
+    log.info(f"Learning rate: {lr:.1e}, eta_min: {eta_min:.1e}")
+
+    loss_keys = ["total_loss", "recon_loss", "pred_recon_loss", "latent_pred_loss", "sigreg_loss", "grad_norm"]
     if _has_energy(model.predictor):
         loss_keys.extend(["energy_mean", "energy_std", "energy_time_var", "energy_monotone"])
 
@@ -519,14 +534,13 @@ def main(cfg: DictConfig):
     os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
 
     # Training loop
-    best_val_loss = float("inf")
+    best_rollout_psnr = -float("inf")
     pbar = tqdm(range(1, cfg.training.epochs + 1), desc="Training")
 
     training_aborted = False
     for epoch in pbar:
         model.train()
         train_accum = {k: 0.0 for k in loss_keys}
-        n_skipped = 0
         n_steps = 0
 
         train_batches = tqdm(train_loader, desc=f"Epoch {epoch} [Train]", leave=False)
@@ -538,20 +552,11 @@ def main(cfg: DictConfig):
 
             losses = jepa_train_step(model, batch, optimizer, sigreg_module, cfg)
 
-            # Skip non-finite batches (stiff second-order autograd in
-            # Hamiltonian predictors can produce rare NaN losses that would
-            # otherwise poison the model weights via optimizer.step()).
-            if losses.get("skipped", False):
-                n_skipped += 1
-                if n_skipped <= 5 or n_skipped % 10 == 0:
-                    log.warning(
-                        f"Skipped non-finite batch at epoch {epoch} "
-                        f"(total skipped this epoch: {n_skipped})"
-                    )
-                continue
-
-            if _has_nan(losses):
-                log.error(f"NaN detected in training losses at epoch {epoch}: {losses}")
+            if losses.get("skipped", False) or _has_nan(losses):
+                log.error(
+                    f"NaN/Inf detected at epoch {epoch} — aborting training. "
+                    f"Will reload best checkpoint for test evaluation."
+                )
                 training_aborted = True
                 break
 
@@ -561,14 +566,8 @@ def main(cfg: DictConfig):
             train_batches.set_postfix({k: f"{losses.get(k, 0.0):.4f}" for k in loss_keys[:3]})
 
         if training_aborted:
-            log.error("Stopping training due to NaN losses.")
             break
 
-        if n_skipped > 0:
-            log.info(f"Epoch {epoch}: skipped {n_skipped}/{len(train_loader)} non-finite batches")
-
-        # Average over batches that actually contributed (avoid divide-by-zero
-        # if every batch was skipped).
         denom = max(n_steps, 1)
         train_avg = {k: v / denom for k, v in train_accum.items()}
 
@@ -611,7 +610,7 @@ def main(cfg: DictConfig):
 
         # wandb logging
         if cfg.wandb.enabled:
-            wandb_log = {"epoch": epoch}
+            wandb_log = {"epoch": epoch, "train/lr": optimizer.param_groups[0]["lr"]}
             for k in loss_keys:
                 wandb_log[f"train/{k}"] = train_avg[k]
                 wandb_log[f"val/{k}"] = val_avg[k]
@@ -631,17 +630,25 @@ def main(cfg: DictConfig):
 
             wandb.log(wandb_log)
 
-        if avg_val < best_val_loss:
-            best_val_loss = avg_val
+        # Checkpoint on rollout PSNR (best predictor dynamics), not val_total_loss.
+        # val_total_loss is dominated by the 1-step latent pred loss which can
+        # decrease while multi-step rollout quality degrades (non-stationary target).
+        rollout_psnr = rollout_metrics["psnr"] if rollout_metrics is not None else -float("inf")
+        if rollout_psnr > best_rollout_psnr:
+            best_rollout_psnr = rollout_psnr
+            log.info(f"  New best rollout PSNR: {rollout_psnr:.2f} (epoch {epoch}) — saving checkpoint.")
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
                     "epoch": epoch,
                     "val_loss": avg_val,
+                    "rollout_psnr": rollout_psnr,
                     "config": OmegaConf.to_container(cfg, resolve=True),
                 },
                 ckpt_path,
             )
+
+        scheduler.step()
 
     # If training aborted due to NaN, the in-memory model weights are poisoned.
     # Reload the best checkpoint (last known good weights) before running test
@@ -650,7 +657,7 @@ def main(cfg: DictConfig):
     if training_aborted and os.path.exists(ckpt_path):
         log.warning(
             f"Training aborted on NaN — reloading best checkpoint "
-            f"from {ckpt_path} for test evaluation."
+            f"(rollout PSNR {best_rollout_psnr:.2f}) from {ckpt_path} for test evaluation."
         )
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
@@ -728,7 +735,7 @@ def main(cfg: DictConfig):
                 ),
             })
 
-    log.info(f"Training complete. Best val loss: {best_val_loss:.6f}. Test loss: {avg_test:.6f}.")
+    log.info(f"Training complete. Best rollout PSNR: {best_rollout_psnr:.2f}. Test loss: {avg_test:.6f}.")
     log.info(f"Checkpoint saved to: {ckpt_path}")
 
     if cfg.wandb.enabled:
