@@ -552,8 +552,7 @@ class LatentHamiltonianPredictor(BasePredictor):
         dt_eff = dt if dt is not None else self.dt
 
         # Compute dt-normalized latent velocity: v_t = (q_{t+1} - q_t) / dt
-        velocities = context[:, 1:] - context[:, :-1]
-        # velocities = (context[:, 1:] - context[:, :-1]) / dt_eff  # (B, T-1, D)
+        velocities = (context[:, 1:] - context[:, :-1]) / dt_eff  # (B, T-1, D)
 
         # GRU processes T-1 transition steps: (q_t, v_t, a_t)
         q_seq = context[:, :-1]  # (B, T-1, D)
