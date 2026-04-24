@@ -30,6 +30,16 @@ training:
   hybrid_recon_weight: 0.0
   # Detach prediction targets in JEPA mode (prevents encoder overfitting to predictor)
   detach_jepa_targets: false
+  # --- Stability / regularization knobs (default OFF — sweep to study effects) ---
+  # Energy-variance regularizer: -λ·log(var(H(z))). Pushes H_net to differentiate
+  # states in z-space, countering the "flat H" failure (energy_time_var ~ 1e-7).
+  energy_var_lambda: 0.0
+  # Gaussian noise on encoder outputs (training only). Symmetric on inputs and
+  # JEPA targets — the encoder learns a noise-robust representation.
+  encoder_noise_std: 0.0
+  # Gaussian noise on predicted latents between unroll steps (training only).
+  # Trains a contractive flow that damps small errors instead of amplifying them.
+  predictor_noise_std: 0.0
 
 ckpt_base_path: '/lustre/smuexa01/client/users/ejlaird/physics-world-models'
 data_root: ${ckpt_base_path}/datasets

@@ -138,11 +138,19 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
     hybrid_recon_weight = cfg.training.get("hybrid_recon_weight", 0.0)
     sigreg_lambda = cfg.training.get("sigreg_lambda", 0.1)
     detach_targets = cfg.training.get("detach_jepa_targets", False)
+    energy_var_lambda = cfg.training.get("energy_var_lambda", 0.0)
+    encoder_noise_std = cfg.training.get("encoder_noise_std", 0.0)
 
     # 1. Encode all frames → flat latents (encoder output IS the state)
     mu_all = model.encode_sequence(images)  # (B, N_lat, D)
     N_lat = mu_all.shape[1]
     D = mu_all.shape[2]
+
+    # Encoder-side noise (training only). Applied symmetrically — both
+    # predictor inputs and JEPA targets see the same noisy latents, so the
+    # encoder learns a noise-robust representation rather than a denoiser.
+    if model.training and encoder_noise_std > 0:
+        mu_all = mu_all + encoder_noise_std * torch.randn_like(mu_all)
 
     all_states = mu_all  # No state_transform, no reparameterization
 
@@ -209,10 +217,21 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
     recon = model.decode(all_states.detach().reshape(B * N_lat, D))
     recon_loss = ((recon - recon_targets) ** 2).mean()
 
-    # Total: JEPA core + decoder probe + optional hybrid recon
+    # Energy-variance regularizer: pushes H_net to differentiate states in
+    # z-space. Counters the "flat H" failure mode (energy_time_var ~ 1e-7)
+    # where the predictor's Hamiltonian collapses to a near-constant and
+    # the dynamics degenerate to action-forcing only.
+    energy_var_loss = torch.tensor(0.0, device=images.device)
+    if energy_var_lambda > 0 and _has_energy(model.predictor):
+        H_vals_reg = model.predictor.energy(all_states, state=shared_state)
+        energy_var_loss = -torch.log(H_vals_reg.var() + 1e-6)
+
+    # Total: JEPA core + decoder probe + optional hybrid recon + optional energy reg
     loss = latent_pred_loss + sigreg_lambda * sigreg_loss + recon_loss
     if hybrid_recon_weight > 0:
         loss = loss + hybrid_recon_weight * pred_recon_loss
+    if energy_var_lambda > 0:
+        loss = loss + energy_var_lambda * energy_var_loss
 
     # NaN/Inf guard: stiff second-order autograd in Hamiltonian predictors
     # can produce non-finite losses on rare pathological batches. Skip the
@@ -248,6 +267,7 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
         "sigreg_loss": sigreg_loss.item(),
         "total_loss": loss.item(),
         "grad_norm": grad_norm.item(),
+        "energy_var_loss": energy_var_loss.item() if energy_var_lambda > 0 else 0.0,
     }
 
     # Energy monitoring for Hamiltonian predictors.
@@ -285,6 +305,7 @@ def jepa_eval_step(model, batch, cfg):
     pred_len = model.pred_length
 
     hybrid_recon_weight = cfg.training.get("hybrid_recon_weight", 0.0)
+    energy_var_lambda = cfg.training.get("energy_var_lambda", 0.0)
 
     mu_all = model.encode_sequence(images)  # (B, N_lat, D)
     N_lat = mu_all.shape[1]
@@ -359,6 +380,8 @@ def jepa_eval_step(model, batch, cfg):
         losses["energy_std"] = H_vals.std().item()
         losses["energy_time_var"] = H_vals.squeeze(-1).var(dim=1).mean().item()
         losses["energy_monotone"] = (H_vals[:, 1:] <= H_vals[:, :-1]).float().mean().item()
+        if energy_var_lambda > 0:
+            losses["energy_var_loss"] = (-torch.log(H_vals.var() + 1e-6)).item()
 
     return losses
 
@@ -482,6 +505,15 @@ def main(cfg: DictConfig):
 
     model = build_model(cfg).to(device)
 
+    # Wire predictor-side noise std onto the predictor. BasePredictor.unroll
+    # reads this attribute at every step and skips noise injection at eval
+    # via the self.training gate. Setting it once here keeps the unroll loop
+    # signature unchanged.
+    predictor_noise_std = cfg.training.get("predictor_noise_std", 0.0)
+    model.predictor._predictor_noise_std = predictor_noise_std
+    if predictor_noise_std > 0:
+        log.info(f"Predictor-side noise std: {predictor_noise_std} (training only)")
+
     # Load pretrained checkpoint if specified
     if cfg.get("pretrained_checkpoint"):
         ckpt = torch.load(cfg.pretrained_checkpoint, map_location=device)
@@ -541,6 +573,8 @@ def main(cfg: DictConfig):
     loss_keys = ["total_loss", "recon_loss", "pred_recon_loss", "latent_pred_loss", "sigreg_loss", "grad_norm"]
     if _has_energy(model.predictor):
         loss_keys.extend(["energy_mean", "energy_std", "energy_time_var", "energy_monotone"])
+    if cfg.training.get("energy_var_lambda", 0.0) > 0:
+        loss_keys.append("energy_var_loss")
 
     # Checkpoint path
     ckpt_path = os.path.join(cfg.checkpoint_dir, "best_model.pt")

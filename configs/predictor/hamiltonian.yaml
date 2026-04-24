@@ -6,3 +6,7 @@ action_embedding_dim: ${model.action_embedding_dim}
 hidden_dim: 256
 dt: ${dataset.dt}
 damping_init: -1.0
+# Integrator: euler (semi-implicit, 1st-order) or implicit_midpoint (2nd-order,
+# symplectic in conservative limit). See latent_hamiltonian.yaml for tradeoffs.
+integrator: euler
+midpoint_iters: 4
