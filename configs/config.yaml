@@ -14,7 +14,7 @@ training:
   epochs: 100
   batch_size: 32
   lr: 5e-4
-  lr_min: 1e-5
+  lr_min: 5e-5
   # Which visual model components to train (false = frozen).
   train_encoder: true
   train_decoder: true
@@ -27,7 +27,7 @@ training:
   # Quadrature knots for Epps-Pulley normality test (paper shows insensitive)
   sigreg_knots: 50
   # Reconstruction loss weight on predicted states (0 = pure JEPA; >0 = hybrid)
-  hybrid_recon_weight: 0.0
+  hybrid_recon_weight: 0.1
   # Detach prediction targets in JEPA mode (prevents encoder overfitting to predictor)
   detach_jepa_targets: false
   # --- Stability / regularization knobs (default OFF — sweep to study effects) ---
@@ -39,7 +39,7 @@ training:
   encoder_noise_std: 0.0
   # Gaussian noise on predicted latents between unroll steps (training only).
   # Trains a contractive flow that damps small errors instead of amplifying them.
-  predictor_noise_std: 0.0
+  predictor_noise_std: 0.001 # new best
 
 ckpt_base_path: '/lustre/smuexa01/client/users/ejlaird/physics-world-models'
 data_root: ${ckpt_base_path}/datasets

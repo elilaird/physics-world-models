@@ -11,5 +11,5 @@ dt: ${dataset.dt}
 # implicit_midpoint (2nd-order, symplectic in conservative limit, ~midpoint_iters
 # H-evals/step). Implicit midpoint is the textbook choice for non-separable
 # port-Hamiltonian systems with dissipation.
-integrator: euler
+integrator: implicit_midpoint
 midpoint_iters: 4
