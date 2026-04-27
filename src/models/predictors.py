@@ -88,6 +88,14 @@ class BasePredictor(nn.Module):
         This trains a contractive flow (the predictor must learn to recover
         from small perturbations rather than amplify them).
 
+        Optionally takes ``_eval_substeps`` internal substeps per emitted
+        observation step at eval time (gated on ``not self.training``).
+        Each substep uses ``dt / N`` and the same action; only the final
+        z per observation is appended. This isolates "is the failure at
+        large dt due to integration step size?" from "is the failure
+        downstream of the integrator?". Cumulative action and damping
+        contributions are preserved (N · (dt/N) · G_u = dt · G_u).
+
         Args:
             state: initial state dict from infer().
             actions: (B, horizon) long tensor.
@@ -98,9 +106,18 @@ class BasePredictor(nn.Module):
             z_seq: (B, horizon, D) predicted latents (post-noise).
         """
         noise_std = getattr(self, "_predictor_noise_std", 0.0)
+        n_substeps = 1
+        if not self.training:
+            n_substeps = max(1, int(getattr(self, "_eval_substeps", 1)))
+
+        dt_eff = dt if dt is not None else getattr(self, "dt", None)
+        sub_dt = (dt_eff / n_substeps) if (dt_eff is not None and n_substeps > 1) else dt
+
         zs = []
         for t in range(horizon):
-            state, z = self.step(state, actions[:, t], dt=dt)
+            action_t = actions[:, t]
+            for _ in range(n_substeps):
+                state, z = self.step(state, action_t, dt=sub_dt)
             if self.training and noise_std > 0:
                 z = z + noise_std * torch.randn_like(z)
                 state["z"] = z

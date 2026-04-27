@@ -69,3 +69,8 @@ eval:
   # Sequence length (actions) for dt generalization trajectories.
   # null = use seq_len from the dataset config.
   dt_seq_len: null
+  # Number of internal integrator substeps per observation step at eval
+  # time. 1 = unchanged. >1 splits each dt into N internal steps of dt/N
+  # using the same action — diagnostic for "is the failure at large dt
+  # caused by integration step size vs downstream?".
+  substeps: 1
