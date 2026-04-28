@@ -1,0 +1,28 @@
+
+name: oscillator_conservative
+version: null # leave null until generated with generate_dataset.py
+n_seqs: 50000
+seq_len: 50
+dt: 0.5 # 2Hz sampling rate
+val_split: 0.1
+test_split: 0.1
+chunk_size: 100
+env:
+  name: oscillator
+  state_dim: 2
+  action_dim: 3
+  params:
+    m: 0.5
+    k: 2.0
+    c: 0.1 # slightly damped
+  variable_params: {} # no variability for now; just want to test on a single deterministic system
+  init_sampling: energy_radius
+  energy_radius_range: [0.5, 1.8]
+  init_state_range: [-1.8, 1.8]
+  img_size: 64
+  channels: 3
+  color: true
+  render_quality: medium
+  ball_color: null
+  bg_color: null
+  ball_radius: null
