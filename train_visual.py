@@ -695,6 +695,20 @@ def main(cfg: DictConfig):
                 ckpt_path,
             )
 
+        epoch_ckpt_path = os.path.join(
+            cfg.checkpoint_dir, f"model_epoch_{epoch:03d}.pt"
+        )
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "epoch": epoch,
+                "val_loss": avg_val,
+                "rollout_psnr": rollout_psnr,
+                "config": OmegaConf.to_container(cfg, resolve=True),
+            },
+            epoch_ckpt_path,
+        )
+
         scheduler.step()
 
     # If training aborted due to NaN, the in-memory model weights are poisoned.
