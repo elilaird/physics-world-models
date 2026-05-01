@@ -88,6 +88,21 @@ def main(cfg: DictConfig):
     N_latents = N - K + 1
     horizon = N_latents - ctx_len
 
+    # eval.horizon clamps the rollout horizon so we can ask "does the
+    # predictor still look good inside its training window?" vs the full
+    # test-sequence horizon. Slicing here propagates the clamp to both
+    # visual_open_loop_rollout (which derives horizon from input shape)
+    # and the dt-gen path (which uses dt_seq_len = horizon + ctx_len).
+    target_horizon = cfg.eval.get("horizon", None)
+    if target_horizon is not None and target_horizon < horizon:
+        n_frames_needed = K - 1 + ctx_len + target_horizon
+        images = images[:, :n_frames_needed]
+        actions = actions[:, : n_frames_needed - 1]
+        N = n_frames_needed
+        N_latents = N - K + 1
+        log.info(f"Clamping rollout horizon: {horizon} → {target_horizon} (eval.horizon override)")
+        horizon = target_horizon
+
     log.info(f"Running visual open-loop rollout: {n_rollouts} sequences, "
              f"context={ctx_len}, horizon={horizon}")
 

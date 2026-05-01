@@ -104,7 +104,7 @@ else
 fi
 
 echo \"WORK_DIR: \$(pwd)\"
-echo "COMMAND: GPU=${GPU} CPUS=${CPUS} MEM=${MEM} PARTITION=${PARTITION} TYPE=${TYPE} TIME=${TIME} CONDA_ENV=${CONDA_ENV} ./make_sbatch.sh ${COMMAND}"
+echo \"COMMAND: GPU=${GPU} CPUS=${CPUS} MEM=${MEM} PARTITION=${PARTITION} TYPE=${TYPE} TIME=${TIME} CONDA_ENV=${CONDA_ENV} ./make_sbatch.sh ${COMMAND}\"
 
 srun --ntasks=${NODES} --distribution=block  bash -c \"${COMMAND}\"
 " > ${TYPE}_${DATETIME}.sbatch
