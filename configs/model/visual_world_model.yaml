@@ -12,6 +12,6 @@ context_length: 3
 # HamiltonianPredictor (no state inference) can keep its short Markov window
 # while Latent-Hamiltonian / Latent-NeuralODE get a longer system-ID window.
 infer_context_length: 8
-pred_length: 5
+pred_length: 10
 observation_dt: ${dataset.dt}
 encoder_frames: 1  # single-frame encoding; velocity inferred in predictor

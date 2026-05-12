@@ -83,6 +83,19 @@ class BasePredictor(nn.Module):
     def unroll(self, state, actions, horizon, dt=None):
         """Default unroll: loop step() and stack the z outputs.
 
+        Optionally injects Gaussian noise on the predicted latent between
+        steps when ``self.training`` is True and ``_predictor_noise_std > 0``.
+        This trains a contractive flow (the predictor must learn to recover
+        from small perturbations rather than amplify them).
+
+        Optionally takes ``_eval_substeps`` internal substeps per emitted
+        observation step at eval time (gated on ``not self.training``).
+        Each substep uses ``dt / N`` and the same action; only the final
+        z per observation is appended. This isolates "is the failure at
+        large dt due to integration step size?" from "is the failure
+        downstream of the integrator?". Cumulative action and damping
+        contributions are preserved (N · (dt/N) · G_u = dt · G_u).
+
         Args:
             state: initial state dict from infer().
             actions: (B, horizon) long tensor.
@@ -90,11 +103,26 @@ class BasePredictor(nn.Module):
             dt: optional float timestep.
 
         Returns:
-            z_seq: (B, horizon, D) predicted latents.
+            z_seq: (B, horizon, D) predicted latents (post-noise).
         """
+        noise_std = getattr(self, "_predictor_noise_std", 0.0)
+        n_substeps = 1
+        if not self.training:
+            n_substeps = max(1, int(getattr(self, "_eval_substeps", 1)))
+
+        dt_eff = dt if dt is not None else getattr(self, "dt", None)
+        sub_dt = (dt_eff / n_substeps) if (dt_eff is not None and n_substeps > 1) else dt
+
         zs = []
         for t in range(horizon):
-            state, z = self.step(state, actions[:, t], dt=dt)
+            action_t = actions[:, t]
+            for _ in range(n_substeps):
+                state, z = self.step(state, action_t, dt=sub_dt)
+            if self.training and noise_std > 0:
+                z = z + noise_std * torch.randn_like(z)
+                state["z"] = z
+                if "q" in state:
+                    state["q"] = z  # q == z for Hamiltonian-family predictors
             zs.append(z)
         return torch.stack(zs, dim=1)
 
@@ -266,6 +294,8 @@ class HamiltonianPredictor(BasePredictor):
         hidden_dim=256,
         dt=0.1,
         damping_init=-1.0,
+        integrator="euler",
+        midpoint_iters=4,
         name="hamiltonian",
         **kwargs,
     ):
@@ -273,6 +303,8 @@ class HamiltonianPredictor(BasePredictor):
         self.latent_dim = latent_dim
         self.half_dim = latent_dim // 2
         self.dt = dt
+        self.integrator = integrator
+        self.midpoint_iters = midpoint_iters
 
         self.H_net = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
@@ -296,6 +328,11 @@ class HamiltonianPredictor(BasePredictor):
 
     @torch.enable_grad()
     def step(self, state, action, dt=None):
+        if self.integrator == "implicit_midpoint":
+            return self._step_implicit_midpoint(state, action, dt)
+        return self._step_semi_implicit_euler(state, action, dt)
+
+    def _step_semi_implicit_euler(self, state, action, dt=None):
         z = state["z"]
         dt_eff = dt if dt is not None else self.dt
 
@@ -324,6 +361,40 @@ class HamiltonianPredictor(BasePredictor):
         dH_dp_new = dH_dz_mid[:, self.half_dim :]
 
         q_new = q + dt_eff * dH_dp_new
+
+        z_new = torch.cat([q_new, p_new], dim=-1)
+        return {"z": z_new}, z_new
+
+    def _step_implicit_midpoint(self, state, action, dt=None):
+        """Implicit midpoint on the full port-Hamiltonian system. See
+        ``LatentHamiltonianPredictor._step_implicit_midpoint`` for details —
+        this version omits θ since H_net only takes z."""
+        z = state["z"]
+        dt_eff = dt if dt is not None else self.dt
+
+        q_n = _require_grad(z[:, : self.half_dim])
+        p_n = _require_grad(z[:, self.half_dim :])
+
+        damping = F.softplus(self.log_damping)
+        G_u = self.G_net(self.act_emb(action))  # (B, half_dim)
+
+        q_new = q_n
+        p_new = p_n
+
+        for _ in range(self.midpoint_iters):
+            q_mid = (q_n + q_new) / 2
+            p_mid = (p_n + p_new) / 2
+
+            z_phase_mid = torch.cat([q_mid, p_mid], dim=-1)
+            H = self.H_net(z_phase_mid).sum()
+            dH = torch.autograd.grad(
+                H, z_phase_mid, create_graph=self.training
+            )[0]
+            dH_dq = dH[:, : self.half_dim]
+            dH_dp = dH[:, self.half_dim :]
+
+            q_new = q_n + dt_eff * dH_dp
+            p_new = p_n + dt_eff * (-dH_dq - damping * dH_dp + G_u)
 
         z_new = torch.cat([q_new, p_new], dim=-1)
         return {"z": z_new}, z_new
@@ -467,6 +538,8 @@ class LatentHamiltonianPredictor(BasePredictor):
         gru_hidden=128,
         theta_dim=8,
         dt=0.1,
+        integrator="euler",
+        midpoint_iters=4,
         name="latent_hamiltonian",
         **kwargs,
     ):
@@ -476,6 +549,8 @@ class LatentHamiltonianPredictor(BasePredictor):
         self.p_dim = latent_dim
         self.theta_dim = theta_dim
         self.dt = dt
+        self.integrator = integrator
+        self.midpoint_iters = midpoint_iters
 
         self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
 
@@ -584,6 +659,11 @@ class LatentHamiltonianPredictor(BasePredictor):
 
     @torch.enable_grad()
     def step(self, state, action, dt=None):
+        if self.integrator == "implicit_midpoint":
+            return self._step_implicit_midpoint(state, action, dt)
+        return self._step_semi_implicit_euler(state, action, dt)
+
+    def _step_semi_implicit_euler(self, state, action, dt=None):
         q, p, theta = state["q"], state["p"], state["theta"]
         dt_eff = dt if dt is not None else self.dt
 
@@ -620,4 +700,55 @@ class LatentHamiltonianPredictor(BasePredictor):
         q_new = q + dt_eff * dH_dp_new
 
         # Decoder-visible state is position only
+        return {"z": q_new, "q": q_new, "p": p_new, "theta": theta}, q_new
+
+    def _step_implicit_midpoint(self, state, action, dt=None):
+        """Implicit midpoint on the full port-Hamiltonian system.
+
+        Solves (q_{n+1}, p_{n+1}) such that the update uses gradients of H
+        evaluated at the midpoint (q_mid, p_mid, θ) where q_mid =
+        (q_n + q_{n+1})/2, p_mid = (p_n + p_{n+1})/2. Symplectic in the
+        conservative limit (γ=0, G=0); 2nd-order accurate; works on
+        non-separable H. Solved via fixed-point iteration starting from
+        (q_n, p_n).
+
+        Cost: ``midpoint_iters`` H_net forwards + autograd.grad calls per
+        step (vs 2 for semi-implicit Euler).
+        """
+        q, p, theta = state["q"], state["p"], state["theta"]
+        dt_eff = dt if dt is not None else self.dt
+
+        # BPTT-safe: ensure leaf tensors require grad without detaching.
+        q_n = _require_grad(q)
+        p_n = _require_grad(p)
+
+        # Per-trajectory damping and action force are evaluated at θ only —
+        # they do not depend on (q, p), so compute once outside the loop.
+        gamma = F.softplus(self.damping_net(theta))  # (B, 1)
+        G_u = self.G_net(
+            torch.cat([self.act_emb(action), theta], dim=-1)
+        )  # (B, D)
+
+        # Initialize with the trivial guess (q_new, p_new) = (q_n, p_n).
+        # First iteration's midpoint = (q_n, p_n), giving an explicit Euler
+        # update; subsequent iterations refine toward the true midpoint.
+        q_new = q_n
+        p_new = p_n
+
+        for _ in range(self.midpoint_iters):
+            q_mid = (q_n + q_new) / 2
+            p_mid = (p_n + p_new) / 2
+
+            z_phase_mid = torch.cat([q_mid, p_mid], dim=-1)
+            inp_mid = torch.cat([z_phase_mid, theta], dim=-1)
+            H = self.H_net(inp_mid).sum()
+            dH = torch.autograd.grad(
+                H, z_phase_mid, create_graph=self.training
+            )[0]
+            dH_dq = dH[:, : self.q_dim]
+            dH_dp = dH[:, self.q_dim :]
+
+            q_new = q_n + dt_eff * dH_dp
+            p_new = p_n + dt_eff * (-dH_dq - gamma * dH_dp + G_u)
+
         return {"z": q_new, "q": q_new, "p": p_new, "theta": theta}, q_new

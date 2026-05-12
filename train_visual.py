@@ -138,11 +138,19 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
     hybrid_recon_weight = cfg.training.get("hybrid_recon_weight", 0.0)
     sigreg_lambda = cfg.training.get("sigreg_lambda", 0.1)
     detach_targets = cfg.training.get("detach_jepa_targets", False)
+    energy_var_lambda = cfg.training.get("energy_var_lambda", 0.0)
+    encoder_noise_std = cfg.training.get("encoder_noise_std", 0.0)
 
     # 1. Encode all frames → flat latents (encoder output IS the state)
     mu_all = model.encode_sequence(images)  # (B, N_lat, D)
     N_lat = mu_all.shape[1]
     D = mu_all.shape[2]
+
+    # Encoder-side noise (training only). Applied symmetrically — both
+    # predictor inputs and JEPA targets see the same noisy latents, so the
+    # encoder learns a noise-robust representation rather than a denoiser.
+    if model.training and encoder_noise_std > 0:
+        mu_all = mu_all + encoder_noise_std * torch.randn_like(mu_all)
 
     all_states = mu_all  # No state_transform, no reparameterization
 
@@ -209,10 +217,21 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
     recon = model.decode(all_states.detach().reshape(B * N_lat, D))
     recon_loss = ((recon - recon_targets) ** 2).mean()
 
-    # Total: JEPA core + decoder probe + optional hybrid recon
+    # Energy-variance regularizer: pushes H_net to differentiate states in
+    # z-space. Counters the "flat H" failure mode (energy_time_var ~ 1e-7)
+    # where the predictor's Hamiltonian collapses to a near-constant and
+    # the dynamics degenerate to action-forcing only.
+    energy_var_loss = torch.tensor(0.0, device=images.device)
+    if energy_var_lambda > 0 and _has_energy(model.predictor):
+        H_vals_reg = model.predictor.energy(all_states, state=shared_state)
+        energy_var_loss = -torch.log(H_vals_reg.var() + 1e-6)
+
+    # Total: JEPA core + decoder probe + optional hybrid recon + optional energy reg
     loss = latent_pred_loss + sigreg_lambda * sigreg_loss + recon_loss
     if hybrid_recon_weight > 0:
         loss = loss + hybrid_recon_weight * pred_recon_loss
+    if energy_var_lambda > 0:
+        loss = loss + energy_var_lambda * energy_var_loss
 
     # NaN/Inf guard: stiff second-order autograd in Hamiltonian predictors
     # can produce non-finite losses on rare pathological batches. Skip the
@@ -248,6 +267,7 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
         "sigreg_loss": sigreg_loss.item(),
         "total_loss": loss.item(),
         "grad_norm": grad_norm.item(),
+        "energy_var_loss": energy_var_loss.item() if energy_var_lambda > 0 else 0.0,
     }
 
     # Energy monitoring for Hamiltonian predictors.
@@ -285,6 +305,7 @@ def jepa_eval_step(model, batch, cfg):
     pred_len = model.pred_length
 
     hybrid_recon_weight = cfg.training.get("hybrid_recon_weight", 0.0)
+    energy_var_lambda = cfg.training.get("energy_var_lambda", 0.0)
 
     mu_all = model.encode_sequence(images)  # (B, N_lat, D)
     N_lat = mu_all.shape[1]
@@ -359,6 +380,8 @@ def jepa_eval_step(model, batch, cfg):
         losses["energy_std"] = H_vals.std().item()
         losses["energy_time_var"] = H_vals.squeeze(-1).var(dim=1).mean().item()
         losses["energy_monotone"] = (H_vals[:, 1:] <= H_vals[:, :-1]).float().mean().item()
+        if energy_var_lambda > 0:
+            losses["energy_var_loss"] = (-torch.log(H_vals.var() + 1e-6)).item()
 
     return losses
 
@@ -482,6 +505,15 @@ def main(cfg: DictConfig):
 
     model = build_model(cfg).to(device)
 
+    # Wire predictor-side noise std onto the predictor. BasePredictor.unroll
+    # reads this attribute at every step and skips noise injection at eval
+    # via the self.training gate. Setting it once here keeps the unroll loop
+    # signature unchanged.
+    predictor_noise_std = cfg.training.get("predictor_noise_std", 0.0)
+    model.predictor._predictor_noise_std = predictor_noise_std
+    if predictor_noise_std > 0:
+        log.info(f"Predictor-side noise std: {predictor_noise_std} (training only)")
+
     # Load pretrained checkpoint if specified
     if cfg.get("pretrained_checkpoint"):
         ckpt = torch.load(cfg.pretrained_checkpoint, map_location=device)
@@ -541,13 +573,22 @@ def main(cfg: DictConfig):
     loss_keys = ["total_loss", "recon_loss", "pred_recon_loss", "latent_pred_loss", "sigreg_loss", "grad_norm"]
     if _has_energy(model.predictor):
         loss_keys.extend(["energy_mean", "energy_std", "energy_time_var", "energy_monotone"])
+    if cfg.training.get("energy_var_lambda", 0.0) > 0:
+        loss_keys.append("energy_var_loss")
 
     # Checkpoint path
     ckpt_path = os.path.join(cfg.checkpoint_dir, "best_model.pt")
     os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
 
+    # dt-gen setup for per-epoch evaluation
+    env = build_env(cfg)
+    training_dt = cfg.dataset.get("dt", cfg.model.observation_dt)
+    dt_gen_every = cfg.eval.get("dt_gen_every_n_epochs", 5)
+    dt_values = list(cfg.eval.dt_values)
+    dt_seq_len = cfg.eval.get("dt_seq_len", None) or cfg.dataset.get("seq_len", 20)
+
     # Training loop
-    best_rollout_psnr = -float("inf")
+    best_dt_gen_psnr = -float("inf")
     pbar = tqdm(range(1, cfg.training.epochs + 1), desc="Training")
 
     training_aborted = False
@@ -643,23 +684,85 @@ def main(cfg: DictConfig):
 
             wandb.log(wandb_log)
 
-        # Checkpoint on rollout PSNR (best predictor dynamics), not val_total_loss.
-        # val_total_loss is dominated by the 1-step latent pred loss which can
-        # decrease while multi-step rollout quality degrades (non-stationary target).
         rollout_psnr = rollout_metrics["psnr"] if rollout_metrics is not None else -float("inf")
-        if rollout_psnr > best_rollout_psnr:
-            best_rollout_psnr = rollout_psnr
-            log.info(f"  New best rollout PSNR: {rollout_psnr:.2f} (epoch {epoch}) — saving checkpoint.")
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "epoch": epoch,
-                    "val_loss": avg_val,
-                    "rollout_psnr": rollout_psnr,
-                    "config": OmegaConf.to_container(cfg, resolve=True),
-                },
-                ckpt_path,
+
+        # Per-epoch dt-gen evaluation (every N epochs + final epoch).
+        # best_model.pt is checkpointed on dt-gen PSNR at training dt — this
+        # captures the shape of the dt curve, not just the metric at training
+        # dt, which can be inflated by a mean-prediction local minimum.
+        run_dt_gen = (epoch % dt_gen_every == 0) or (epoch == cfg.training.epochs)
+        training_dt_psnr = None
+        if run_dt_gen:
+            log.info(f"  Running dt-gen test at epoch {epoch}...")
+            dt_results = visual_dt_generalization_test(
+                model, env, dt_values, cfg,
+                n_seqs=n_rollouts, seq_len=dt_seq_len,
             )
+            for dt_val in sorted(dt_results.keys()):
+                m = dt_results[dt_val]["metrics"]
+                log.info(
+                    f"  dt={dt_val}: MAE={m['mae']:.4f} | PSNR={m['psnr']:.2f} | "
+                    f"SSIM={m['ssim']:.4f} | LPIPS={m['lpips']:.4f} | "
+                    f"Latent MSE={dt_results[dt_val]['latent_mse']:.6f}"
+                )
+
+            if cfg.wandb.enabled:
+                dt_gen_log = {}
+                for dt_val in sorted(dt_results.keys()):
+                    m = dt_results[dt_val]["metrics"]
+                    dt_gen_log[f"val/dt_gen/dt={dt_val}/psnr"] = m["psnr"]
+                    dt_gen_log[f"val/dt_gen/dt={dt_val}/mae"] = m["mae"]
+                    dt_gen_log[f"val/dt_gen/dt={dt_val}/ssim"] = m["ssim"]
+                    dt_gen_log[f"val/dt_gen/dt={dt_val}/lpips"] = m["lpips"]
+                    dt_gen_log[f"val/dt_gen/dt={dt_val}/latent_mse"] = dt_results[dt_val]["latent_mse"]
+                    dt_gen_log[f"val/dt_gen/dt={dt_val}/rollout_grid"] = wandb.Image(
+                        dt_results[dt_val]["rollout_grid"].clamp(0, 1),
+                        caption=f"epoch {epoch}, dt={dt_val} — GT | Pred | |Error|",
+                    )
+                wandb.log(dt_gen_log)
+
+            if training_dt in dt_results:
+                training_dt_psnr = dt_results[training_dt]["metrics"]["psnr"]
+            else:
+                closest = min(dt_results.keys(), key=lambda d: abs(d - training_dt))
+                log.warning(
+                    f"Training dt={training_dt} not in eval.dt_values; "
+                    f"using closest dt={closest} for best_model.pt tracking"
+                )
+                training_dt_psnr = dt_results[closest]["metrics"]["psnr"]
+
+            if training_dt_psnr > best_dt_gen_psnr:
+                best_dt_gen_psnr = training_dt_psnr
+                log.info(
+                    f"  New best dt-gen PSNR @ dt={training_dt}: "
+                    f"{training_dt_psnr:.2f} (epoch {epoch}) — saving best_model.pt"
+                )
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "epoch": epoch,
+                        "val_loss": avg_val,
+                        "dt_gen_psnr": training_dt_psnr,
+                        "rollout_psnr": rollout_psnr,
+                        "config": OmegaConf.to_container(cfg, resolve=True),
+                    },
+                    ckpt_path,
+                )
+
+        epoch_ckpt_path = os.path.join(
+            cfg.checkpoint_dir, f"model_epoch_{epoch:03d}.pt"
+        )
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "epoch": epoch,
+                "val_loss": avg_val,
+                "rollout_psnr": rollout_psnr,
+                "dt_gen_psnr": training_dt_psnr,
+                "config": OmegaConf.to_container(cfg, resolve=True),
+            },
+            epoch_ckpt_path,
+        )
 
         scheduler.step()
 
@@ -670,7 +773,7 @@ def main(cfg: DictConfig):
     if training_aborted and os.path.exists(ckpt_path):
         log.warning(
             f"Training aborted on NaN — reloading best checkpoint "
-            f"(rollout PSNR {best_rollout_psnr:.2f}) from {ckpt_path} for test evaluation."
+            f"(dt-gen PSNR {best_dt_gen_psnr:.2f}) from {ckpt_path} for test evaluation."
         )
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
@@ -715,10 +818,7 @@ def main(cfg: DictConfig):
                 **{f"test/rollout_{k}": v for k, v in test_rollout.items()},
             })
 
-    # dt generalization test
-    dt_values = list(cfg.eval.dt_values)
-    dt_seq_len = cfg.eval.get("dt_seq_len", None) or cfg.dataset.get("seq_len", 20)
-    env = build_env(cfg)
+    # Final dt-generalization test (logged to dt_gen/* for the run summary)
     n_rollouts = cfg.eval.get("n_rollouts", 8)
     log.info(f"Running visual dt generalization test: {dt_values} (seq_len={dt_seq_len})")
     dt_results = visual_dt_generalization_test(
@@ -748,7 +848,7 @@ def main(cfg: DictConfig):
                 ),
             })
 
-    log.info(f"Training complete. Best rollout PSNR: {best_rollout_psnr:.2f}. Test loss: {avg_test:.6f}.")
+    log.info(f"Training complete. Best dt-gen PSNR @ dt={training_dt}: {best_dt_gen_psnr:.2f}. Test loss: {avg_test:.6f}.")
     log.info(f"Checkpoint saved to: {ckpt_path}")
 
     if cfg.wandb.enabled:

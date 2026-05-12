@@ -58,6 +58,17 @@ def main(cfg: DictConfig):
 
     n_rollouts = cfg.eval.get("n_rollouts", 8)
 
+    # Eval-time integrator substepping. At eval, replace each observation
+    # step at dt with N internal substeps of dt/N (same action across all
+    # N). Diagnostic for "does dt-gen failure go away with finer integration
+    # at large dt?" — isolates integrator step size from theta inference
+    # and other downstream causes. Default 1 = unchanged behavior.
+    eval_substeps = int(cfg.eval.get("substeps", 1))
+    model.predictor._eval_substeps = eval_substeps
+    if eval_substeps > 1:
+        log.info(f"Eval substeps: {eval_substeps} (each observation dt is split "
+                 f"into {eval_substeps} internal integration steps)")
+
     # Load test dataset
     dataset_version = os.path.join(train_cfg.dataset.name, train_cfg.dataset.version)
     test_path = os.path.join(train_cfg.data_root, dataset_version, "test.npz")
@@ -76,6 +87,16 @@ def main(cfg: DictConfig):
     K = model.encoder_frames
     N_latents = N - K + 1
     horizon = N_latents - ctx_len
+
+    target_horizon = cfg.eval.get("horizon", None)
+    if target_horizon is not None and target_horizon < horizon:
+        n_frames_needed = K - 1 + ctx_len + target_horizon
+        images = images[:, :n_frames_needed]
+        actions = actions[:, : n_frames_needed - 1]
+        N = n_frames_needed
+        N_latents = N - K + 1
+        log.info(f"Clamping rollout horizon: {horizon} → {target_horizon} (eval.horizon override)")
+        horizon = target_horizon
 
     log.info(f"Running visual open-loop rollout: {n_rollouts} sequences, "
              f"context={ctx_len}, horizon={horizon}")

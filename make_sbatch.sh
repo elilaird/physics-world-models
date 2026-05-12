@@ -5,9 +5,17 @@
 
 DATETIME=$(date +"%Y%m%d_%H%M%S")
 
-TIME=${TIME:-2-00:00:00}
 PARTITION=${PARTITION:-batch}
-TYPE=${TYPE:-train} # jupyter, eval, test
+TYPE=${TYPE:-train} # jupyter, eval, test, train, train_vector, generate_dataset
+
+# Per-TYPE default TIME (eval/jupyter are short-running; train is multi-day).
+# Explicit TIME=... env var still wins.
+if [ "${TYPE}" = "eval" ]; then
+    TIME=${TIME:-0-04:00:00}
+else
+    TIME=${TIME:-2-00:00:00}
+fi
+
 CONDA_ENV=${CONDA_ENV:-world_models}
 NODES=${NODES:-1}
 
@@ -42,8 +50,11 @@ elif [ "${TYPE}" = "train_vector" ]; then
     COMMAND="HYDRA_FULL_ERROR=1 python train.py ${PY_ARGS}"
 elif [ "${TYPE}" = "generate_dataset" ]; then
     COMMAND="HYDRA_FULL_ERROR=1 python generate_dataset.py ${PY_ARGS}"
+elif [ "${TYPE}" = "eval" ]; then
+    COMMAND="HYDRA_FULL_ERROR=1 python evaluate.py ${PY_ARGS}"
 fi
 
+mkdir -p ${HOME_DIR}/output/${TYPE}
 LOG_FILE="output/${TYPE}/${TYPE}_%j.out"
 
 echo "COMMAND: GPU=${GPU} CPUS=${CPUS} MEM=${MEM} PARTITION=${PARTITION} TIME=${TIME} TYPE=${TYPE} CONDA_ENV=${CONDA_ENV} ./make_sbatch.sh ${COMMAND}"
@@ -93,7 +104,7 @@ else
 fi
 
 echo \"WORK_DIR: \$(pwd)\"
-echo "COMMAND: GPU=${GPU} CPUS=${CPUS} MEM=${MEM} PARTITION=${PARTITION} TYPE=${TYPE} TIME=${TIME} CONDA_ENV=${CONDA_ENV} ./make_sbatch.sh ${COMMAND}"
+echo \"COMMAND: GPU=${GPU} CPUS=${CPUS} MEM=${MEM} PARTITION=${PARTITION} TYPE=${TYPE} TIME=${TIME} CONDA_ENV=${CONDA_ENV} ./make_sbatch.sh ${COMMAND}\"
 
 srun --ntasks=${NODES} --distribution=block  bash -c \"${COMMAND}\"
 " > ${TYPE}_${DATETIME}.sbatch

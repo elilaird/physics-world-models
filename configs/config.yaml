@@ -14,7 +14,7 @@ training:
   epochs: 100
   batch_size: 32
   lr: 5e-4
-  lr_min: 1e-5
+  lr_min: 5e-5
   # Which visual model components to train (false = frozen).
   train_encoder: true
   train_decoder: true
@@ -27,9 +27,19 @@ training:
   # Quadrature knots for Epps-Pulley normality test (paper shows insensitive)
   sigreg_knots: 50
   # Reconstruction loss weight on predicted states (0 = pure JEPA; >0 = hybrid)
-  hybrid_recon_weight: 0.0
+  hybrid_recon_weight: 0.1
   # Detach prediction targets in JEPA mode (prevents encoder overfitting to predictor)
   detach_jepa_targets: false
+  # --- Stability / regularization knobs (default OFF — sweep to study effects) ---
+  # Energy-variance regularizer: -λ·log(var(H(z))). Pushes H_net to differentiate
+  # states in z-space, countering the "flat H" failure (energy_time_var ~ 1e-7).
+  energy_var_lambda: 0.0
+  # Gaussian noise on encoder outputs (training only). Symmetric on inputs and
+  # JEPA targets — the encoder learns a noise-robust representation.
+  encoder_noise_std: 0.0
+  # Gaussian noise on predicted latents between unroll steps (training only).
+  # Trains a contractive flow that damps small errors instead of amplifying them.
+  predictor_noise_std: 0.001 # new best
 
 ckpt_base_path: '/lustre/smuexa01/client/users/ejlaird/physics-world-models'
 data_root: ${ckpt_base_path}/datasets
@@ -56,6 +66,6 @@ eval:
   horizon: 50
   dt_values: [0.05,0.1,0.2,0.4,0.5]
   n_rollouts: 8
-  # Sequence length (actions) for dt generalization trajectories.
-  # null = use seq_len from the dataset config.
   dt_seq_len: null
+  substeps: 1
+  dt_gen_every_n_epochs: 5
