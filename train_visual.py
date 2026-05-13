@@ -34,7 +34,12 @@ from src.models import MODEL_REGISTRY
 from src.models.sigreg import SIGReg
 from src.data.precomputed import PrecomputedDataset
 from src.eval.rollout import visual_open_loop_rollout, visual_dt_generalization_test
-from src.eval.metrics import compute_visual_metrics
+from src.eval.metrics import (
+    compute_visual_metrics,
+    compute_latent_divergence_metrics,
+    compute_qp_divergence_metrics,
+)
+from src.eval.curves_logger import EvalCurvesLogger
 
 log = logging.getLogger(__name__)
 
@@ -447,6 +452,17 @@ def compute_rollout_metrics(model, batch, n_samples=4):
     latent_mse = ((pred_latents - gt_latents) ** 2).mean().item()
     vis_metrics = compute_visual_metrics(pred_images, gt_images)
 
+    # Per-step latent divergence (dynamics metrics) + persistence baseline.
+    z_context_last = true_latents[:, ctx_len - 1]   # (B, D)
+    latent_curves = compute_latent_divergence_metrics(
+        pred_latents, gt_latents, z_context_last
+    )
+    D = pred_latents.shape[-1]
+    qp_curves = (
+        compute_qp_divergence_metrics(pred_latents, gt_latents, z_context_last)
+        if D % 2 == 0 else None
+    )
+
     # Build rollout grid
     n_show = min(n_samples, B)
     ctx_images = images[:n_show, :ctx_len + K - 1]
@@ -478,6 +494,11 @@ def compute_rollout_metrics(model, batch, n_samples=4):
         "ssim": vis_metrics["ssim"],
         "lpips": vis_metrics["lpips"],
         "rollout_grid": grid_img,
+        "latent_curves": {k: v.detach().cpu() for k, v in latent_curves.items()},
+        "qp_curves": (
+            {k: v.detach().cpu() for k, v in qp_curves.items()}
+            if qp_curves is not None else None
+        ),
     }
 
 
