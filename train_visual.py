@@ -876,6 +876,36 @@ def main(cfg: DictConfig):
                     f"Latent MSE={dt_results[dt_val]['latent_mse']:.6f}"
                 )
 
+            # Persist per-dt per-step latent curves.
+            if save_curves and curves_logger is not None:
+                per_dt_curves_dict = {
+                    dt_val: dt_results[dt_val]["latent_curves"]
+                    for dt_val in sorted(dt_results.keys())
+                }
+                # qp_curves may be None for non-Hamiltonian runs — pass through.
+                first_qp = dt_results[sorted(dt_results.keys())[0]].get("qp_curves")
+                if first_qp is not None:
+                    per_dt_qp_dict = {
+                        dt_val: dt_results[dt_val]["qp_curves"]
+                        for dt_val in sorted(dt_results.keys())
+                    }
+                else:
+                    per_dt_qp_dict = None
+                curves_logger.append_dt_gen_epoch(
+                    epoch=epoch,
+                    per_dt_curves=per_dt_curves_dict,
+                    per_dt_qp=per_dt_qp_dict,
+                )
+                # Render the per-dt latent-error figure for wandb.
+                horizon = per_dt_curves_dict[
+                    sorted(per_dt_curves_dict.keys())[0]
+                ]["latent_mse"].shape[1]
+                dt_latent_plot = make_dt_latent_error_plot(
+                    per_dt_curves_dict, epoch=epoch, horizon=horizon,
+                )
+            else:
+                dt_latent_plot = None
+
             if cfg.wandb.enabled:
                 dt_gen_log = {}
                 for dt_val in sorted(dt_results.keys()):
@@ -889,6 +919,8 @@ def main(cfg: DictConfig):
                         dt_results[dt_val]["rollout_grid"].clamp(0, 1),
                         caption=f"epoch {epoch}, dt={dt_val} — GT | Pred | |Error|",
                     )
+                if dt_latent_plot is not None:
+                    dt_gen_log["val/dt_gen/latent_error_curves"] = dt_latent_plot
                 wandb.log(dt_gen_log)
 
             if training_dt in dt_results:
