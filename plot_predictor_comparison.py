@@ -288,7 +288,64 @@ def make_figure_b(selections, cfg, output_path):
 
 
 def make_figure_c(selections, cfg, output_path):
-    raise NotImplementedError("Filled in by Task 15.")
+    """Hamiltonian-family q/p split.
+
+    1x2 grid: q-MSE | p-MSE. One solid line per Hamiltonian-family predictor
+    (Hamiltonian, LatentHamiltonian) with +/-1std band; dashed persistence
+    baseline per predictor in same color.
+    """
+    hamiltonian_selections = [
+        (run, sel) for (run, sel) in selections
+        if run["predictor"] in _HAMILTONIAN_FAMILY
+    ]
+    if not hamiltonian_selections:
+        return  # main() already checked, but defensive
+
+    panels = [
+        ("q_mse", "persistence_q_mse", "q-MSE (lower=better)"),
+        ("p_mse", "persistence_p_mse", "p-MSE (lower=better)"),
+    ]
+    figsize = (cfg.figsize[0] * 0.7, cfg.figsize[1])
+
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+    for run, sel in hamiltonian_selections:
+        predictor = run["predictor"]
+        color = _color_for(predictor, cfg)
+        curves = sel["fixed_dt"]
+        # Defensive: a run might be Hamiltonian-named but lack q_mse if it
+        # was trained before this feature landed. Skip silently in that case.
+        if curves.get("q_mse") is None:
+            log.warning(
+                f"Run {run.get('__source_path')} has predictor={predictor} but "
+                f"q_mse=None — skipping in Figure C."
+            )
+            continue
+        horizon = curves["q_mse"].shape[-1]
+        steps = np.arange(1, horizon + 1)
+        for ax, (mkey, pkey, label) in zip(axes, panels):
+            m = curves[mkey].numpy()
+            p = curves[pkey].numpy()
+            mean = m.mean(axis=0)
+            std  = m.std(axis=0)
+            p_mean = p.mean(axis=0)
+            ax.plot(steps, mean, color=color, linewidth=2, label=predictor)
+            ax.fill_between(steps, mean - std, mean + std, color=color, alpha=0.2)
+            ax.plot(steps, p_mean, color=color, linestyle="--", linewidth=1.0,
+                    alpha=0.6, label=f"{predictor} (persistence)")
+
+    for ax, (_, _, label) in zip(axes, panels):
+        ax.set_xlabel("Prediction step")
+        ax.set_ylabel(label)
+        ax.set_title(label)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=cfg.fontsize - 3, loc="best")
+
+    fig.suptitle("Hamiltonian-family: q vs p latent error",
+                 fontsize=cfg.fontsize + 1)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 if __name__ == "__main__":
