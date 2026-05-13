@@ -133,7 +133,11 @@ def visual_dt_generalization_test(
         }
     """
     from omegaconf import OmegaConf
-    from src.eval.metrics import compute_visual_metrics
+    from src.eval.metrics import (
+        compute_visual_metrics,
+        compute_latent_divergence_metrics,
+        compute_qp_divergence_metrics,
+    )
 
     # Grid layout and horizon bookkeeping use infer_context_length because
     # visual_open_loop_rollout seeds from the first infer_ctx latents.
@@ -209,6 +213,25 @@ def visual_dt_generalization_test(
         gt_latents = true_latents[:, ctx_len:]          # (n_seqs, horizon, D)
 
         latent_mse = ((pred_latents - gt_latents) ** 2).mean().item()
+
+        # Per-step latent divergence (dynamics metrics) + persistence baseline.
+        # The last context frame is index ctx_len-1 in true_latents (the latent
+        # the predictor saw last before starting to predict).
+        z_context_last = true_latents[:, ctx_len - 1]   # (n_seqs, D)
+        latent_curves = compute_latent_divergence_metrics(
+            pred_latents, gt_latents, z_context_last
+        )
+        # q/p split is Hamiltonian-only. We can't introspect predictor type
+        # here without circular imports, so always compute it when D is even
+        # and let the caller decide whether to use it.
+        D = pred_latents.shape[-1]
+        if D % 2 == 0:
+            qp_curves = compute_qp_divergence_metrics(
+                pred_latents, gt_latents, z_context_last
+            )
+        else:
+            qp_curves = None
+
         vis_metrics = compute_visual_metrics(pred_images, gt_images)
 
         # Build rollout grid (GT | Pred | Error) for a few samples
@@ -242,6 +265,11 @@ def visual_dt_generalization_test(
             "true_images": gt_images,
             "metrics": vis_metrics,
             "latent_mse": latent_mse,
+            "latent_curves": {k: v.cpu() for k, v in latent_curves.items()},
+            "qp_curves": (
+                {k: v.cpu() for k, v in qp_curves.items()}
+                if qp_curves is not None else None
+            ),
             "rollout_grid": grid,
         }
 
