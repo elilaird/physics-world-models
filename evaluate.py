@@ -18,8 +18,13 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
 from src.eval.utils import load_checkpoint, rebuild_model, rebuild_env
-from src.eval.metrics import compute_visual_metrics
+from src.eval.metrics import (
+    compute_visual_metrics,
+    compute_latent_divergence_metrics,
+    compute_qp_divergence_metrics,
+)
 from src.eval.rollout import visual_open_loop_rollout, visual_dt_generalization_test
+from src.eval.curves_logger import EvalCurvesLogger
 from src.data.precomputed import PrecomputedDataset
 
 log = logging.getLogger(__name__)
@@ -114,6 +119,18 @@ def main(cfg: DictConfig):
     latent_mse_per_step = ((pred_latents - gt_latents) ** 2).flatten(2).mean(dim=(0, 2))  # (horizon,)
     latent_mse = latent_mse_per_step.mean().item()
     log.info(f"Latent MSE (mean): {latent_mse:.6f}")
+
+    # Per-step latent divergence + persistence baseline (for eval_curves.pt).
+    z_context_last = true_latents[:, ctx_len - 1]
+    test_fixed_dt_curves = compute_latent_divergence_metrics(
+        pred_latents, gt_latents, z_context_last
+    )
+    D = pred_latents.shape[-1]
+    if D % 2 == 0:
+        test_fixed_dt_curves.update(
+            compute_qp_divergence_metrics(pred_latents, gt_latents, z_context_last)
+        )
+    test_fixed_dt_curves = {k: v.detach().cpu() for k, v in test_fixed_dt_curves.items()}
 
     # Visual metrics
     log.info("Computing visual metrics (MAE, PSNR, SSIM, LPIPS)...")
@@ -262,6 +279,38 @@ def main(cfg: DictConfig):
     metrics_pt_path = os.path.join(output_dir, "eval_metrics.pt")
     torch.save(all_metrics, metrics_pt_path)
     log.info(f"Metrics saved to: {metrics_pt_path}")
+
+    # Write eval_curves.pt for cross-predictor comparison.
+    # Matches the format produced by train_visual.py, but only the test_final
+    # block is populated (this script doesn't see val epochs).
+    if cfg.eval.get("save_curves", True):
+        curves_path = os.path.join(
+            output_dir,
+            cfg.eval.get("curves_filename", "eval_curves.pt"),
+        )
+        curves_logger = EvalCurvesLogger(
+            path=curves_path,
+            predictor=train_cfg.predictor.name,
+            env=train_cfg.env.name,
+            training_dt=train_cfg.dataset.get("dt", train_cfg.model.observation_dt),
+            horizon=horizon,
+            ctx_len=ctx_len,
+            n_seqs=n_rollouts,
+            dt_values=dt_sorted,
+            latent_dim=train_cfg.model.latent_channels,
+        )
+        # Assemble per_dt block from the dt_results dict that already exists.
+        test_per_dt = {}
+        for dt_val in dt_sorted:
+            entry = dict(dt_results[dt_val]["latent_curves"])
+            if dt_results[dt_val].get("qp_curves") is not None:
+                entry.update(dt_results[dt_val]["qp_curves"])
+            test_per_dt[dt_val] = entry
+        curves_logger.set_test_final(
+            fixed_dt=test_fixed_dt_curves,
+            per_dt=test_per_dt,
+        )
+        log.info(f"Saved eval_curves.pt to: {curves_path}")
 
     # --- wandb logging ---
     if cfg.wandb.enabled:
