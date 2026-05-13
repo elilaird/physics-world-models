@@ -997,6 +997,7 @@ def main(cfg: DictConfig):
     test_rollout_batch = next(iter(DataLoader(test_data, batch_size=n_rollouts, shuffle=False)))
     test_rollout_batch = batch_to_device(test_rollout_batch, device)
     test_rollout = compute_rollout_metrics(model, test_rollout_batch, n_log)
+    test_fixed_dt_curves = None
     if test_rollout is not None:
         log.info(
             f"Test rollout — MAE: {test_rollout['mae']:.4f} | "
@@ -1005,6 +1006,12 @@ def main(cfg: DictConfig):
             f"LPIPS: {test_rollout['lpips']:.4f} | "
             f"Latent MSE: {test_rollout['latent_mse']:.6f}"
         )
+        # Capture test fixed_dt latent curves for the test_final block of
+        # eval_curves.pt. They live in compute_rollout_metrics' return dict.
+        if save_curves and curves_logger is not None:
+            test_fixed_dt_curves = dict(test_rollout["latent_curves"])
+            if test_rollout.get("qp_curves") is not None:
+                test_fixed_dt_curves.update(test_rollout["qp_curves"])
 
     test_img = make_recon_grid(model, batch, n_log)
 
@@ -1015,10 +1022,13 @@ def main(cfg: DictConfig):
         if test_img is not None:
             wandb.log({"test/reconstructions": test_img})
         if test_rollout is not None:
-            wandb.log({
-                "test/rollout_grid": test_rollout.pop("rollout_grid"),
-                **{f"test/rollout_{k}": v for k, v in test_rollout.items()},
-            })
+            test_wandb = {"test/rollout_grid": test_rollout.pop("rollout_grid")}
+            # Strip tensor keys so they don't pour into wandb as scalars.
+            test_rollout.pop("latent_curves", None)
+            test_rollout.pop("qp_curves", None)
+            for k, v in test_rollout.items():
+                test_wandb[f"test/rollout_{k}"] = v
+            wandb.log(test_wandb)
 
     # Final dt-generalization test (logged to dt_gen/* for the run summary)
     n_rollouts = cfg.eval.get("n_rollouts", 8)
@@ -1049,6 +1059,20 @@ def main(cfg: DictConfig):
                     caption=f"dt={dt_val} — GT | Pred | |Error|",
                 ),
             })
+
+    # Assemble and persist test_final block of eval_curves.pt.
+    if save_curves and curves_logger is not None and test_fixed_dt_curves is not None:
+        test_per_dt = {}
+        for dt_val in sorted(dt_results.keys()):
+            entry = dict(dt_results[dt_val]["latent_curves"])
+            if dt_results[dt_val].get("qp_curves") is not None:
+                entry.update(dt_results[dt_val]["qp_curves"])
+            test_per_dt[dt_val] = entry
+        curves_logger.set_test_final(
+            fixed_dt=test_fixed_dt_curves,
+            per_dt=test_per_dt,
+        )
+        log.info(f"Saved test_final block to eval_curves.pt")
 
     log.info(f"Training complete. Best dt-gen PSNR @ dt={training_dt}: {best_dt_gen_psnr:.2f}. Test loss: {avg_test:.6f}.")
     log.info(f"Checkpoint saved to: {ckpt_path}")
