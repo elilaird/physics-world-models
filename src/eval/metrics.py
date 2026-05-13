@@ -190,3 +190,48 @@ def compute_latent_divergence_metrics(pred_z, gt_z, z_context_last, eps=1e-8):
         "persistence_cosine":  persistence_cosine,
         "persistence_norm_l2": persistence_norm_l2,
     }
+
+
+def compute_qp_divergence_metrics(pred_z, gt_z, z_context_last):
+    """Hamiltonian-only: per-step MSE on the q-half and p-half separately.
+
+    The Hamiltonian-family predictors split the latent as z = [q, p] with
+    q, p ∈ R^(D/2). This diagnostic reports MSE on each half separately so
+    you can see whether momentum (p) drifts faster than position (q) or vice
+    versa — a structural read on which part of the dynamics is the weak link.
+
+    Args:
+        pred_z:         (B, horizon, D) predicted latents.
+        gt_z:           (B, horizon, D) ground-truth latents.
+        z_context_last: (B, D) last context frame for persistence baseline.
+
+    Returns:
+        dict with four keys, each a (B, horizon) tensor:
+            q_mse, p_mse, persistence_q_mse, persistence_p_mse
+    """
+    B, H, D = pred_z.shape
+    assert D % 2 == 0, f"q/p split requires even latent dim, got D={D}"
+    assert gt_z.shape == (B, H, D)
+    assert z_context_last.shape == (B, D)
+
+    half = D // 2
+
+    pred_q, pred_p = pred_z[..., :half], pred_z[..., half:]
+    gt_q,   gt_p   = gt_z[...,   :half], gt_z[...,   half:]
+    ctx_q,  ctx_p  = z_context_last[..., :half], z_context_last[..., half:]
+
+    q_mse = ((pred_q - gt_q) ** 2).mean(dim=-1)
+    p_mse = ((pred_p - gt_p) ** 2).mean(dim=-1)
+
+    # Persistence: ctx_q / ctx_p broadcast across horizon
+    persist_q = ctx_q.unsqueeze(1).expand(-1, H, -1)
+    persist_p = ctx_p.unsqueeze(1).expand(-1, H, -1)
+    persistence_q_mse = ((persist_q - gt_q) ** 2).mean(dim=-1)
+    persistence_p_mse = ((persist_p - gt_p) ** 2).mean(dim=-1)
+
+    return {
+        "q_mse":             q_mse,
+        "p_mse":             p_mse,
+        "persistence_q_mse": persistence_q_mse,
+        "persistence_p_mse": persistence_p_mse,
+    }
