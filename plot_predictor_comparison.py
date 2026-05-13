@@ -35,8 +35,7 @@ def _resolve_run_paths(cfg: DictConfig) -> list[str]:
     """Resolve cfg.runs + cfg.runs_glob into a deduplicated list of file paths.
 
     Each entry may point to either an eval_curves.pt file directly or to a
-    directory containing one. Directories are resolved to
-    <dir>/<cfg.eval_curves_filename>.
+    directory containing one. Directories are resolved to <dir>/eval_curves.pt.
     """
     paths: list[str] = []
 
