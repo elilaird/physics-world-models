@@ -126,10 +126,17 @@ def visual_dt_generalization_test(
 
     Returns:
         dict mapping dt -> {
-            'pred_images': (n_seqs, horizon, C, H, W),
-            'true_images': (n_seqs, horizon, C, H, W),
-            'metrics': dict from compute_visual_metrics,
-            'latent_mse': float,
+            'pred_images':   (n_seqs, horizon, C, H, W),
+            'true_images':   (n_seqs, horizon, C, H, W),
+            'metrics':       dict from compute_visual_metrics,
+            'latent_mse':    float (mean across all seqs/steps; back-compat scalar),
+            'latent_curves': dict of (n_seqs, horizon) CPU tensors with keys
+                latent_mse, latent_cosine, latent_norm_l2,
+                persistence_mse, persistence_cosine, persistence_norm_l2,
+            'qp_curves':     dict of (n_seqs, horizon) CPU tensors with keys
+                q_mse, p_mse, persistence_q_mse, persistence_p_mse, OR
+                None when D is odd (no q/p split).
+            'rollout_grid':  (C, H_grid, W_grid) CPU tensor, GT|Pred|Error grid.
         }
     """
     from omegaconf import OmegaConf
