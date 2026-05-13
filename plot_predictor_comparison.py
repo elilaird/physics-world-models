@@ -171,7 +171,56 @@ def main(cfg: DictConfig):
 
 # Plot functions filled in by subsequent tasks.
 def make_figure_a(selections, cfg, output_path):
-    raise NotImplementedError("Filled in by Task 13.")
+    """Per-predictor latent error vs horizon at training dt.
+
+    1x3 grid (MSE | Cosine | Norm-L2). Each subplot has one solid line per
+    predictor with a +/-1std shaded band, plus a dashed persistence baseline
+    per predictor.
+    """
+    panels = [
+        ("latent_mse",     "persistence_mse",     "MSE (lower=better)"),
+        ("latent_cosine",  "persistence_cosine",  "Cosine similarity (higher=better)"),
+        ("latent_norm_l2", "persistence_norm_l2", "Normalized L2 (lower=better)"),
+    ]
+    figsize = tuple(cfg.figsize)
+
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+    training_dts = set()
+
+    for run, sel in selections:
+        predictor = run["predictor"]
+        color = _color_for(predictor, cfg)
+        training_dts.add(run["training_dt"])
+
+        curves = sel["fixed_dt"]
+        horizon = curves["latent_mse"].shape[-1]
+        steps = np.arange(1, horizon + 1)
+
+        for ax, (model_key, persist_key, label) in zip(axes, panels):
+            model = curves[model_key].numpy()    # (B, horizon)
+            persist = curves[persist_key].numpy()
+            mean   = model.mean(axis=0)
+            std    = model.std(axis=0)
+            p_mean = persist.mean(axis=0)
+
+            ax.plot(steps, mean, color=color, linewidth=2, label=predictor)
+            ax.fill_between(steps, mean - std, mean + std, color=color, alpha=0.2)
+            ax.plot(steps, p_mean, color=color, linestyle="--", linewidth=1.0,
+                    alpha=0.6, label=f"{predictor} (persistence)")
+
+    for ax, (_, _, label) in zip(axes, panels):
+        ax.set_xlabel("Prediction step")
+        ax.set_ylabel(label)
+        ax.set_title(label)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=cfg.fontsize - 3, loc="best")
+
+    dt_str = ", ".join(f"{d}" for d in sorted(training_dts))
+    fig.suptitle(f"Latent error vs prediction horizon  (training dt = {dt_str})",
+                 fontsize=cfg.fontsize + 1)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 def make_figure_b(selections, cfg, output_path):
