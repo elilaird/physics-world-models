@@ -704,6 +704,31 @@ def main(cfg: DictConfig):
     dt_values = list(cfg.eval.dt_values)
     dt_seq_len = cfg.eval.get("dt_seq_len", None) or cfg.dataset.get("seq_len", 20)
 
+    # EvalCurvesLogger: persists per-epoch and final test per-step latent
+    # divergence curves to eval_curves.pt next to best_model.pt. See
+    # docs/superpowers/specs/2026-05-13-latent-divergence-evaluation-design.md
+    # for the full save format.
+    save_curves = cfg.eval.get("save_curves", True)
+    curves_logger = None
+    if save_curves:
+        curves_path = os.path.join(
+            cfg.checkpoint_dir,
+            cfg.eval.get("curves_filename", "eval_curves.pt"),
+        )
+        # horizon is inferred from the first rollout — we don't know it yet.
+        # We initialize the logger lazily on the first val-rollout call so we
+        # can pass the actual horizon. Defer construction until then.
+        curves_logger_meta = {
+            "path":        curves_path,
+            "predictor":   cfg.predictor.name,
+            "env":         cfg.env.name,
+            "training_dt": training_dt,
+            "ctx_len":     cfg.model.get("infer_context_length", cfg.model.context_length),
+            "n_seqs":      cfg.eval.get("n_rollouts", 8),
+            "dt_values":   dt_values,
+            "latent_dim":  cfg.model.latent_channels,
+        }
+
     # Training loop
     best_dt_gen_psnr = -float("inf")
     pbar = tqdm(range(1, cfg.training.epochs + 1), desc="Training")
@@ -778,6 +803,25 @@ def main(cfg: DictConfig):
                 f"LPIPS: {rollout_metrics['lpips']:.4f} | "
                 f"Latent MSE: {rollout_metrics['latent_mse']:.6f}"
             )
+            # Persist per-step latent curves and render the wandb plot.
+            if save_curves:
+                latent_curves = rollout_metrics["latent_curves"]
+                qp_curves = rollout_metrics["qp_curves"]
+                # Lazy init: the first call gives us the horizon we need.
+                horizon = latent_curves["latent_mse"].shape[1]
+                if curves_logger is None:
+                    curves_logger = EvalCurvesLogger(
+                        horizon=horizon,
+                        **curves_logger_meta,
+                    )
+                curves_logger.append_val_epoch(
+                    epoch=epoch,
+                    curves=latent_curves,
+                    qp_curves=qp_curves,
+                )
+                rollout_metrics["latent_error_plot"] = make_latent_error_plot(
+                    latent_curves, epoch=epoch, horizon=horizon, dt=training_dt,
+                )
 
         # wandb logging
         if cfg.wandb.enabled:
@@ -796,6 +840,15 @@ def main(cfg: DictConfig):
 
             if rollout_metrics is not None:
                 wandb_log["val/rollout_grid"] = rollout_metrics.pop("rollout_grid")
+                if "latent_error_plot" in rollout_metrics:
+                    wandb_log["val/latent_error_curve"] = rollout_metrics.pop(
+                        "latent_error_plot"
+                    )
+                # latent_curves and qp_curves are tensors — don't pour them
+                # into wandb scalars. Remove them from the dict before the
+                # blanket-log loop below.
+                rollout_metrics.pop("latent_curves", None)
+                rollout_metrics.pop("qp_curves", None)
                 for k, v in rollout_metrics.items():
                     wandb_log[f"val/rollout_{k}"] = v
 

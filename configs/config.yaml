@@ -69,3 +69,5 @@ eval:
   dt_seq_len: null
   substeps: 1
   dt_gen_every_n_epochs: 5
+  save_curves: true
+  curves_filename: eval_curves.pt
