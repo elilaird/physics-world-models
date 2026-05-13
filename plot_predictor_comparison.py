@@ -224,7 +224,67 @@ def make_figure_a(selections, cfg, output_path):
 
 
 def make_figure_b(selections, cfg, output_path):
-    raise NotImplementedError("Filled in by Task 14.")
+    """Per-dt-per-predictor latent error.
+
+    |dt_values| x 3 grid: rows = dt, columns = MSE | Cosine | Norm-L2.
+    Each subplot has one solid line per predictor with +/-1std band.
+    No persistence baselines (too cluttered with N predictors x M dts).
+    """
+    panels = [
+        ("latent_mse",     "MSE (lower=better)"),
+        ("latent_cosine",  "Cosine similarity (higher=better)"),
+        ("latent_norm_l2", "Normalized L2 (lower=better)"),
+    ]
+
+    # Union of dts across runs (sorted).
+    dt_set = set()
+    for run, sel in selections:
+        dt_set.update(sel["per_dt"].keys())
+    dts_sorted = sorted(dt_set)
+    if not dts_sorted:
+        log.warning("Figure B: no per_dt blocks in any run; skipping.")
+        return
+
+    n_rows = len(dts_sorted)
+    n_cols = 3
+    figsize = (cfg.figsize[0], cfg.figsize[1] * n_rows * 0.8)
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False)
+
+    for row_i, dt in enumerate(dts_sorted):
+        for col_j, (key, label) in enumerate(panels):
+            ax = axes[row_i, col_j]
+            for run, sel in selections:
+                predictor = run["predictor"]
+                if dt not in sel["per_dt"]:
+                    continue
+                curves = sel["per_dt"][dt]
+                color = _color_for(predictor, cfg)
+                arr = curves[key].numpy()  # (B, horizon)
+                horizon = arr.shape[-1]
+                steps = np.arange(1, horizon + 1)
+                mean = arr.mean(axis=0)
+                std  = arr.std(axis=0)
+                ax.plot(steps, mean, color=color, linewidth=2, label=predictor)
+                ax.fill_between(steps, mean - std, mean + std, color=color, alpha=0.18)
+
+            ax.set_xlabel("Prediction step")
+            ax.set_ylabel(label if col_j == 0 else "")
+            if row_i == 0:
+                ax.set_title(label)
+            if col_j == 0:
+                ax.text(-0.25, 0.5, f"dt = {dt}",
+                        transform=ax.transAxes, rotation=90,
+                        fontsize=cfg.fontsize, va="center", ha="center")
+            ax.grid(True, alpha=0.3)
+            if row_i == 0 and col_j == n_cols - 1:
+                ax.legend(fontsize=cfg.fontsize - 3, loc="best")
+
+    fig.suptitle("Latent error vs horizon, per dt and predictor",
+                 fontsize=cfg.fontsize + 1)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 def make_figure_c(selections, cfg, output_path):
