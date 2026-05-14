@@ -224,3 +224,42 @@ class EvalCurvesLogger:
             for band, block in per_band.items()
         }
         self._save(doc)
+
+    def set_test_final_per_band_fixed_init(
+        self,
+        per_band: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        """Populate the test_final_per_band_fixed_init block.
+
+        Args:
+            per_band: {band_name: {"init_state": state tensor,
+                                   "fixed_dt": curves_dict,
+                                   "per_dt": {dt: curves_dict}}}.
+                init_state is the band-representative initial state
+                used for every rollout in that band. Each curves_dict
+                has the same BASE_KEYS plus optional QP_KEYS schema.
+                Coexists with test_final and test_final_per_band.
+        """
+        doc = self._load()
+        doc["test_final_per_band_fixed_init"] = {
+            band: {
+                "init_state": (
+                    block["init_state"].detach().cpu()
+                    if isinstance(block["init_state"], torch.Tensor)
+                    else block["init_state"]
+                ),
+                "fixed_dt": {
+                    k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
+                    for k, v in block["fixed_dt"].items()
+                },
+                "per_dt": {
+                    dt: {
+                        k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
+                        for k, v in d.items()
+                    }
+                    for dt, d in block["per_dt"].items()
+                },
+            }
+            for band, block in per_band.items()
+        }
+        self._save(doc)
