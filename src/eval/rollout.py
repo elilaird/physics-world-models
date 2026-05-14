@@ -109,6 +109,7 @@ def generate_visual_trajectory(env, init_state, actions, dt, render_opts):
 @torch.no_grad()
 def visual_dt_generalization_test(
     model, env, dt_values, cfg, n_seqs=8, seq_len=None,
+    energy_radius_range_override=None,
 ):
     """Test visual model across different dt values.
 
@@ -123,6 +124,11 @@ def visual_dt_generalization_test(
         n_seqs: number of trajectories to generate per dt.
         seq_len: number of action steps per trajectory.
             Defaults to context_length + 10.
+        energy_radius_range_override: optional (r_min, r_max) tuple/list that
+            overrides the env-config-derived energy_radius_range AND forces
+            sampling_mode="energy_radius". Used by visual_energy_stratified_test
+            to run rollouts against a specific energy band. Default None
+            preserves all existing behavior.
 
     Returns:
         dict mapping dt -> {
@@ -178,9 +184,15 @@ def visual_dt_generalization_test(
     # energy contours, not from a uniform box that biases toward low-energy /
     # near-equilibrium states.
     sampling_mode = env_cfg.get("init_sampling", "uniform_box")
-    energy_radius_range = env_cfg.get("energy_radius_range", None)
-    if energy_radius_range is not None:
-        energy_radius_range = list(energy_radius_range)
+    if energy_radius_range_override is not None:
+        # Caller (e.g., visual_energy_stratified_test) is providing a band-specific
+        # sub-range. Force energy_radius sampling and use the override.
+        energy_radius_range = list(energy_radius_range_override)
+        sampling_mode = "energy_radius"
+    else:
+        energy_radius_range = env_cfg.get("energy_radius_range", None)
+        if energy_radius_range is not None:
+            energy_radius_range = list(energy_radius_range)
     init_state_range = (
         OmegaConf.to_container(env_cfg.init_state_range, resolve=True)
         if "init_state_range" in env_cfg else None
