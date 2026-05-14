@@ -316,10 +316,14 @@ def main(cfg: DictConfig):
     # --- wandb logging ---
     if cfg.wandb.enabled:
         import wandb as wandb_mod
+        slurm_id = os.environ.get("SLURM_JOB_ID", "")
+        run_name = f"eval_{train_cfg.env.name}_{train_cfg.predictor.name}"
+        if slurm_id:
+            run_name = f"{run_name}_{slurm_id}"
         wandb_mod.init(
             project=cfg.wandb.project,
             config=OmegaConf.to_container(cfg, resolve=True),
-            name=f"eval_{train_cfg.env.name}_{train_cfg.predictor.name}",
+            name=run_name,
         )
         # Render the new per-step latent-divergence figures.
         # test_fixed_dt_curves carries base keys + (for even-D) q/p keys; the
