@@ -25,6 +25,7 @@ from src.eval.metrics import (
 )
 from src.eval.rollout import visual_open_loop_rollout, visual_dt_generalization_test
 from src.eval.curves_logger import EvalCurvesLogger
+from src.eval.plots import make_latent_error_plot, make_dt_latent_error_plot
 from src.data.precomputed import PrecomputedDataset
 
 log = logging.getLogger(__name__)
@@ -320,6 +321,24 @@ def main(cfg: DictConfig):
             config=OmegaConf.to_container(cfg, resolve=True),
             name=f"eval_{train_cfg.env.name}_{train_cfg.predictor.name}",
         )
+        # Render the new per-step latent-divergence figures.
+        # test_fixed_dt_curves carries base keys + (for even-D) q/p keys; the
+        # plot helper reads only the base keys, so passing the merged dict is fine.
+        training_dt = train_cfg.dataset.get("dt", train_cfg.model.observation_dt)
+        latent_error_img = make_latent_error_plot(
+            test_fixed_dt_curves,
+            epoch=ckpt["epoch"],
+            horizon=horizon,
+            dt=training_dt,
+            title_prefix="Test latent divergence",
+        )
+        dt_latent_error_img = make_dt_latent_error_plot(
+            {dt_val: dt_results[dt_val]["latent_curves"] for dt_val in dt_sorted},
+            epoch=ckpt["epoch"],
+            horizon=horizon,
+            title_prefix="Test dt-gen latent divergence",
+        )
+
         wandb_log = {
             "eval/latent_mse": latent_mse,
             "eval/mae": vis_metrics["mae"],
@@ -332,6 +351,8 @@ def main(cfg: DictConfig):
             ),
             "eval/metrics_plot": wandb_mod.Image(metrics_path),
             "eval/dt_generalization_plot": wandb_mod.Image(dt_plot_path),
+            "eval/latent_error_curve": latent_error_img,
+            "eval/dt_gen/latent_error_curves": dt_latent_error_img,
         }
 
         # Log per-step rollout metrics
