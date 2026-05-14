@@ -191,3 +191,36 @@ class EvalCurvesLogger:
             },
         }
         self._save(doc)
+
+    def set_test_final_per_band(
+        self,
+        per_band: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        """Populate the test_final_per_band block.
+
+        Args:
+            per_band: {band_name: {"fixed_dt": curves_dict,
+                                   "per_dt": {dt: curves_dict}}}.
+                Each curves_dict has the same key set as set_test_final's
+                fixed_dt arg (BASE_KEYS plus optional QP_KEYS for
+                Hamiltonian-family runs). Each tensor value has shape
+                (B, horizon).
+        """
+        doc = self._load()
+        doc["test_final_per_band"] = {
+            band: {
+                "fixed_dt": {
+                    k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
+                    for k, v in block["fixed_dt"].items()
+                },
+                "per_dt": {
+                    dt: {
+                        k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
+                        for k, v in d.items()
+                    }
+                    for dt, d in block["per_dt"].items()
+                },
+            }
+            for band, block in per_band.items()
+        }
+        self._save(doc)
