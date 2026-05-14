@@ -214,6 +214,7 @@ def main(cfg: DictConfig):
     )
 
     dt_sorted = sorted(dt_results.keys())
+    training_dt = train_cfg.dataset.get("dt", train_cfg.model.observation_dt)
     for dt_val in dt_sorted:
         m = dt_results[dt_val]["metrics"]
         log.info(
@@ -297,7 +298,7 @@ def main(cfg: DictConfig):
             path=curves_path,
             predictor=train_cfg.predictor.name,
             env=train_cfg.env.name,
-            training_dt=train_cfg.dataset.get("dt", train_cfg.model.observation_dt),
+            training_dt=training_dt,
             horizon=horizon,
             ctx_len=ctx_len,
             n_seqs=n_rollouts,
@@ -437,7 +438,6 @@ def main(cfg: DictConfig):
     # Horizons are derived from each curve tensor's actual shape because the
     # dt-gen rollout uses fresh trajectories whose horizon depends on
     # encoder_frames and can differ from the fixed-dt horizon.
-    training_dt = train_cfg.dataset.get("dt", train_cfg.model.observation_dt)
     fixed_horizon = test_fixed_dt_curves["latent_mse"].shape[1]
     latent_error_path = os.path.join(output_dir, "latent_error_curve.png")
     latent_error_img = make_latent_error_plot(
