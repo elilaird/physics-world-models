@@ -40,6 +40,7 @@ from src.eval.metrics import (
     compute_qp_divergence_metrics,
 )
 from src.eval.curves_logger import EvalCurvesLogger
+from src.eval.plots import make_latent_error_plot, make_dt_latent_error_plot
 
 log = logging.getLogger(__name__)
 
@@ -500,102 +501,6 @@ def compute_rollout_metrics(model, batch, n_samples=4):
             if qp_curves is not None else None
         ),
     }
-
-
-# ---------------------------------------------------------------------------
-# Latent-divergence plot helpers (logged to wandb as Image, like recon_grid)
-# ---------------------------------------------------------------------------
-
-def make_latent_error_plot(curves, epoch, horizon, dt):
-    """Render a 1x3 figure (MSE | Cosine | Norm-L2) for one epoch's val curves.
-
-    Args:
-        curves: dict from compute_latent_divergence_metrics, each value
-            shape (B, horizon) on CPU.
-        epoch:  int, current epoch (used in the title).
-        horizon: int, prediction horizon.
-        dt: float, the dt at which the rollout was run.
-
-    Returns:
-        wandb.Image of the matplotlib figure.
-    """
-    import matplotlib.pyplot as plt
-    steps = list(range(1, horizon + 1))
-
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-    panels = [
-        ("latent_mse",      "persistence_mse",      "MSE (lower=better)"),
-        ("latent_cosine",   "persistence_cosine",   "Cosine similarity (higher=better)"),
-        ("latent_norm_l2",  "persistence_norm_l2",  "Normalized L2 (lower=better)"),
-    ]
-    for ax, (model_key, persist_key, label) in zip(axes, panels):
-        model_mean = curves[model_key].mean(dim=0).numpy()
-        model_std  = curves[model_key].std(dim=0).numpy()
-        persist_mean = curves[persist_key].mean(dim=0).numpy()
-
-        ax.plot(steps, model_mean, label="model",       color="steelblue", linewidth=2)
-        ax.fill_between(
-            steps, model_mean - model_std, model_mean + model_std,
-            color="steelblue", alpha=0.2,
-        )
-        ax.plot(steps, persist_mean, label="persistence", color="gray",
-                linestyle="--", linewidth=1.5)
-        ax.set_xlabel("Prediction step")
-        ax.set_ylabel(label)
-        ax.set_title(label)
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc="best", fontsize=8)
-
-    fig.suptitle(f"Val latent divergence — epoch {epoch}, dt={dt}")
-    plt.tight_layout()
-
-    img = wandb.Image(fig, caption=f"epoch {epoch}, dt={dt}")
-    plt.close(fig)
-    return img
-
-
-def make_dt_latent_error_plot(per_dt_curves, epoch, horizon):
-    """Render a 1x3 figure with one line per dt value (no persistence baseline).
-
-    Args:
-        per_dt_curves: {dt: curves_dict}, each curves_dict has (B, horizon) tensors.
-        epoch: int.
-        horizon: int.
-
-    Returns:
-        wandb.Image of the matplotlib figure.
-    """
-    import matplotlib.pyplot as plt
-    steps = list(range(1, horizon + 1))
-
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-    panels = [
-        ("latent_mse",     "MSE (lower=better)"),
-        ("latent_cosine",  "Cosine similarity (higher=better)"),
-        ("latent_norm_l2", "Normalized L2 (lower=better)"),
-    ]
-    dt_sorted = sorted(per_dt_curves.keys())
-    cmap = plt.cm.viridis
-    for ax, (key, label) in zip(axes, panels):
-        for i, dt in enumerate(dt_sorted):
-            curves = per_dt_curves[dt]
-            mean = curves[key].mean(dim=0).numpy()
-            std  = curves[key].std(dim=0).numpy()
-            color = cmap(i / max(len(dt_sorted) - 1, 1))
-            ax.plot(steps, mean, label=f"dt={dt}", color=color, linewidth=2)
-            ax.fill_between(steps, mean - std, mean + std, color=color, alpha=0.15)
-        ax.set_xlabel("Prediction step")
-        ax.set_ylabel(label)
-        ax.set_title(label)
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc="best", fontsize=8)
-
-    fig.suptitle(f"dt-gen latent divergence — epoch {epoch}")
-    plt.tight_layout()
-
-    img = wandb.Image(fig, caption=f"epoch {epoch} dt-gen latent curves")
-    plt.close(fig)
-    return img
 
 
 # ---------------------------------------------------------------------------
