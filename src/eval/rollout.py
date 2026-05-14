@@ -110,6 +110,7 @@ def generate_visual_trajectory(env, init_state, actions, dt, render_opts):
 def visual_dt_generalization_test(
     model, env, dt_values, cfg, n_seqs=8, seq_len=None,
     energy_radius_range_override=None,
+    fixed_init_state=None,
 ):
     """Test visual model across different dt values.
 
@@ -129,6 +130,11 @@ def visual_dt_generalization_test(
             sampling_mode="energy_radius". Used by visual_energy_stratified_test
             to run rollouts against a specific energy band. Default None
             preserves all existing behavior.
+        fixed_init_state: optional state tensor that, when set, is used as
+            the init for EVERY rollout in this dt-gen call (skipping
+            env.sample_initial_state). Used by visual_fixed_init_stratified_test
+            to collapse within-band init heterogeneity so only action-sequence
+            variance remains. Default None preserves all existing behavior.
 
     Returns:
         dict mapping dt -> {
@@ -205,12 +211,20 @@ def visual_dt_generalization_test(
         all_images = []
         all_actions = []
         for _ in range(n_seqs):
-            init_state = env.sample_initial_state(
-                sampling_mode=sampling_mode,
-                init_state_range=init_state_range,
-                energy_radius_range=energy_radius_range,
-                variable_params=None,
-            )
+            if fixed_init_state is not None:
+                # Caller (e.g., visual_fixed_init_stratified_test) wants every
+                # rollout to start from the SAME init. Clone so each rollout
+                # gets its own tensor object (defensive — generate_visual_trajectory
+                # treats init_state as immutable, but downstream callers shouldn't
+                # be coupled to that contract).
+                init_state = fixed_init_state.clone() if hasattr(fixed_init_state, "clone") else fixed_init_state
+            else:
+                init_state = env.sample_initial_state(
+                    sampling_mode=sampling_mode,
+                    init_state_range=init_state_range,
+                    energy_radius_range=energy_radius_range,
+                    variable_params=None,
+                )
 
             actions = torch.randint(0, env.action_dim, (seq_len,))
             imgs, _ = generate_visual_trajectory(env, init_state, actions, dt, render_opts)
