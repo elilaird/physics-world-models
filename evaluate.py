@@ -371,9 +371,28 @@ def main(cfg: DictConfig):
         run_name = f"eval_{train_cfg.env.name}_{train_cfg.predictor.name}"
         if slurm_id:
             run_name = f"{run_name}_{slurm_id}"
+
+        # Log train_cfg as the wandb config, NOT the eval-script cfg.
+        # The eval-script cfg inherits ALL training defaults from
+        # configs/config.yaml (dataset.name, model.observation_dt,
+        # predictor.dt, etc.) but only its eval.* and wandb.* sub-trees
+        # actually drive evaluation; the rest are shadow defaults that
+        # would mislead anyone reading wandb to think the eval used them.
+        # The actual model/env/dataset come from train_cfg via
+        # rebuild_model / rebuild_env / train_cfg.dataset.*.
+        wandb_config = OmegaConf.to_container(train_cfg, resolve=True)
+        wandb_config["eval_overrides"] = {
+            "checkpoint":    cfg.checkpoint,
+            "ckpt_epoch":    ckpt["epoch"],
+            "n_rollouts":    n_rollouts,
+            "dt_values":     list(cfg.eval.dt_values),
+            "substeps":      eval_substeps,
+            "horizon_override": cfg.eval.get("horizon", None),
+            "save_curves":   cfg.eval.get("save_curves", True),
+        }
         wandb_mod.init(
             project=cfg.wandb.project,
-            config=OmegaConf.to_container(cfg, resolve=True),
+            config=wandb_config,
             name=run_name,
         )
 
