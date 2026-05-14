@@ -17,6 +17,7 @@ def make_latent_error_plot(
     horizon,
     dt,
     title_prefix="Val latent divergence",
+    output_path=None,
 ):
     """Render a 1x3 figure (MSE | Cosine | Norm-L2) with persistence baseline.
 
@@ -30,6 +31,9 @@ def make_latent_error_plot(
         title_prefix: string prepended to the figure suptitle. Defaults to
             "Val latent divergence" for the training-time use case; pass
             "Test latent divergence" from evaluate.py.
+        output_path: optional path to save the rendered PNG to disk before
+            closing the figure. When None (training-time default), no disk
+            write happens — wandb gets the image and the figure is closed.
 
     Returns:
         wandb.Image of the matplotlib figure (the figure is closed).
@@ -68,6 +72,9 @@ def make_latent_error_plot(
     fig.suptitle(f"{title_prefix} — epoch {epoch}, dt={dt}")
     plt.tight_layout()
 
+    if output_path is not None:
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+
     img = wandb.Image(fig, caption=f"epoch {epoch}, dt={dt}")
     plt.close(fig)
     return img
@@ -78,6 +85,7 @@ def make_dt_latent_error_plot(
     epoch,
     horizon,
     title_prefix="dt-gen latent divergence",
+    output_path=None,
 ):
     """Render a 1x3 figure with one line per dt value (no persistence baseline).
 
@@ -88,6 +96,8 @@ def make_dt_latent_error_plot(
         title_prefix: string prepended to the figure suptitle. Defaults to
             "dt-gen latent divergence"; pass "Test dt-gen latent divergence"
             from evaluate.py.
+        output_path: optional path to save the rendered PNG to disk before
+            closing the figure. When None, no disk write happens.
 
     Returns:
         wandb.Image of the matplotlib figure (the figure is closed).
@@ -118,6 +128,9 @@ def make_dt_latent_error_plot(
 
     fig.suptitle(f"{title_prefix} — epoch {epoch}")
     plt.tight_layout()
+
+    if output_path is not None:
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
 
     img = wandb.Image(fig, caption=f"epoch {epoch} dt-gen latent curves")
     plt.close(fig)

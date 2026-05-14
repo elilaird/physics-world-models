@@ -313,6 +313,57 @@ def main(cfg: DictConfig):
         )
         log.info(f"Saved eval_curves.pt to: {curves_path}")
 
+    # --- Render latent-divergence figures and save to disk ---
+    # Always runs, regardless of cfg.wandb.enabled. The returned wandb.Image
+    # objects are then re-used by the wandb block below if wandb is on.
+    # Horizons are derived from each curve tensor's actual shape because the
+    # dt-gen rollout uses fresh trajectories whose horizon depends on
+    # encoder_frames and can differ from the fixed-dt horizon.
+    training_dt = train_cfg.dataset.get("dt", train_cfg.model.observation_dt)
+    fixed_horizon = test_fixed_dt_curves["latent_mse"].shape[1]
+    latent_error_path = os.path.join(output_dir, "latent_error_curve.png")
+    latent_error_img = make_latent_error_plot(
+        test_fixed_dt_curves,
+        epoch=ckpt["epoch"],
+        horizon=fixed_horizon,
+        dt=training_dt,
+        title_prefix="Test latent divergence",
+        output_path=latent_error_path,
+    )
+    log.info(f"Saved: {latent_error_path}")
+
+    dt_per_dt_curves = {dt_val: dt_results[dt_val]["latent_curves"] for dt_val in dt_sorted}
+    dt_horizon = dt_per_dt_curves[dt_sorted[0]]["latent_mse"].shape[1]
+    dt_combined_path = os.path.join(output_dir, "dt_gen_latent_error_curves.png")
+    dt_latent_error_img = make_dt_latent_error_plot(
+        dt_per_dt_curves,
+        epoch=ckpt["epoch"],
+        horizon=dt_horizon,
+        title_prefix="Test dt-gen latent divergence",
+        output_path=dt_combined_path,
+    )
+    log.info(f"Saved: {dt_combined_path}")
+
+    # Per-dt latent error figures (1x3 with persistence baseline), one per dt.
+    per_dt_latent_imgs = {}
+    for d in dt_sorted:
+        curves_d = dt_results[d]["latent_curves"]
+        qp_d = dt_results[d].get("qp_curves")
+        per_dt_merged = dict(curves_d)
+        if qp_d is not None:
+            per_dt_merged.update(qp_d)
+        dt_h = curves_d["latent_mse"].shape[1]
+        per_dt_path = os.path.join(output_dir, f"dt_latent_error_curve_{d}.png")
+        per_dt_latent_imgs[d] = make_latent_error_plot(
+            per_dt_merged,
+            epoch=ckpt["epoch"],
+            horizon=dt_h,
+            dt=d,
+            title_prefix="Test latent divergence",
+            output_path=per_dt_path,
+        )
+        log.info(f"Saved: {per_dt_path}")
+
     # --- wandb logging ---
     if cfg.wandb.enabled:
         import wandb as wandb_mod
@@ -324,30 +375,6 @@ def main(cfg: DictConfig):
             project=cfg.wandb.project,
             config=OmegaConf.to_container(cfg, resolve=True),
             name=run_name,
-        )
-        # Render the new per-step latent-divergence figures.
-        # test_fixed_dt_curves carries base keys + (for even-D) q/p keys; the
-        # plot helper reads only the base keys, so passing the merged dict is fine.
-        # Horizons are derived from the actual curve tensors rather than the
-        # outer `horizon` variable because the dt-gen rollout uses a different
-        # path through the data (fresh trajectories vs precomputed test set),
-        # and the two horizons can disagree when encoder_frames != 2.
-        training_dt = train_cfg.dataset.get("dt", train_cfg.model.observation_dt)
-        fixed_horizon = test_fixed_dt_curves["latent_mse"].shape[1]
-        latent_error_img = make_latent_error_plot(
-            test_fixed_dt_curves,
-            epoch=ckpt["epoch"],
-            horizon=fixed_horizon,
-            dt=training_dt,
-            title_prefix="Test latent divergence",
-        )
-        dt_per_dt_curves = {dt_val: dt_results[dt_val]["latent_curves"] for dt_val in dt_sorted}
-        dt_horizon = dt_per_dt_curves[dt_sorted[0]]["latent_mse"].shape[1]
-        dt_latent_error_img = make_dt_latent_error_plot(
-            dt_per_dt_curves,
-            epoch=ckpt["epoch"],
-            horizon=dt_horizon,
-            title_prefix="Test dt-gen latent divergence",
         )
 
         wandb_log = {
@@ -388,21 +415,6 @@ def main(cfg: DictConfig):
             curves_d = dt_results[d]["latent_curves"]
             qp_d = dt_results[d].get("qp_curves")
 
-            # Per-dt latent error figure (1x3 with persistence baseline).
-            # Reuses the fixed-dt helper since each dt's curves have the same
-            # shape contract; the helper ignores any q/p keys in the dict.
-            per_dt_merged = dict(curves_d)
-            if qp_d is not None:
-                per_dt_merged.update(qp_d)
-            dt_h = curves_d["latent_mse"].shape[1]
-            per_dt_plot = make_latent_error_plot(
-                per_dt_merged,
-                epoch=ckpt["epoch"],
-                horizon=dt_h,
-                dt=d,
-                title_prefix="Test latent divergence",
-            )
-
             log_payload = {
                 "eval_dt/dt": d,
                 "eval_dt/mae": m["mae"],
@@ -414,7 +426,7 @@ def main(cfg: DictConfig):
                     dt_results[d]["rollout_grid"].clamp(0, 1),
                     caption=f"dt={d} — GT | Pred | |Error|",
                 ),
-                "eval_dt/latent_error_curve": per_dt_plot,
+                "eval_dt/latent_error_curve": per_dt_latent_imgs[d],
             }
             # Aggregate trajectory metrics for this dt.
             for k, v in curves_d.items():
