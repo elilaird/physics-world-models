@@ -358,3 +358,64 @@ def visual_energy_stratified_test(
             energy_radius_range_override=band_range,
         )
     return results
+
+
+@torch.no_grad()
+def visual_fixed_init_stratified_test(
+    model, env, dt_values, cfg, energy_radius_range,
+    n_seqs=8, seq_len=None,
+):
+    """Per-band fixed-init eval.
+
+    For each of three energy bands (low / med / high), sample ONE init
+    state from the band's radius sub-range and run n_seqs trajectories
+    from that fixed init with only action sequences varying. variable_params
+    are already implicitly fixed via env construction (env.step / env.sample_initial_state
+    use the env's instance attributes when no per-call params are supplied).
+
+    Args:
+        model:               VisualWorldModel.
+        env:                 PhysicsControlEnv with sample_initial_state() and
+                             _sample_energy_radius_state() implemented.
+        dt_values:           list of dt values to test (per band).
+        cfg:                 Hydra config (forwarded to dt-gen test).
+        energy_radius_range: (r_min, r_max) — full eval distribution to split
+                             into 3 equal sub-ranges for the per-band sampling.
+        n_seqs:              n_rollouts per band.
+        seq_len:             optional seq_len override.
+
+    Returns:
+        dict {band: {"init_state": <state tensor>, "results": dt_results_dict}}
+        where dt_results_dict has the same schema as visual_dt_generalization_test's
+        return value (one entry per dt). init_state is the band-representative
+        state used for all rollouts in that band.
+    """
+    import numpy as np
+    r_min, r_max = float(energy_radius_range[0]), float(energy_radius_range[1])
+    edges = np.linspace(r_min, r_max, 4)
+    bands = {
+        "low":  (float(edges[0]), float(edges[1])),
+        "med":  (float(edges[1]), float(edges[2])),
+        "high": (float(edges[2]), float(edges[3])),
+    }
+
+    results = {}
+    for band_name, band_range in bands.items():
+        # Sample ONE init state from this band's sub-range.
+        init_state = env.sample_initial_state(
+            sampling_mode="energy_radius",
+            init_state_range=None,
+            energy_radius_range=list(band_range),
+            variable_params=None,
+        )
+        # Run n_seqs trajectories from that fixed init (only actions vary).
+        band_results = visual_dt_generalization_test(
+            model, env, dt_values, cfg,
+            n_seqs=n_seqs, seq_len=seq_len,
+            fixed_init_state=init_state,
+        )
+        results[band_name] = {
+            "init_state": init_state,
+            "results": band_results,
+        }
+    return results
