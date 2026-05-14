@@ -46,6 +46,7 @@ def make_latent_error_plot(
         model_mean = curves[model_key].mean(dim=0).numpy()
         model_std  = curves[model_key].std(dim=0).numpy()
         persist_mean = curves[persist_key].mean(dim=0).numpy()
+        persist_std  = curves[persist_key].std(dim=0).numpy()
 
         ax.plot(steps, model_mean, label="model",       color="steelblue", linewidth=2)
         ax.fill_between(
@@ -54,6 +55,10 @@ def make_latent_error_plot(
         )
         ax.plot(steps, persist_mean, label="persistence", color="gray",
                 linestyle="--", linewidth=1.5)
+        ax.fill_between(
+            steps, persist_mean - persist_std, persist_mean + persist_std,
+            color="gray", alpha=0.15,
+        )
         ax.set_xlabel("Prediction step")
         ax.set_ylabel(label)
         ax.set_title(label)

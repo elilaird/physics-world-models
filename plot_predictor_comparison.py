@@ -201,11 +201,16 @@ def make_figure_a(selections, cfg, output_path):
             mean   = model.mean(axis=0)
             std    = model.std(axis=0)
             p_mean = persist.mean(axis=0)
+            p_std  = persist.std(axis=0)
 
             ax.plot(steps, mean, color=color, linewidth=2, label=predictor)
             ax.fill_between(steps, mean - std, mean + std, color=color, alpha=0.2)
             ax.plot(steps, p_mean, color=color, linestyle="--", linewidth=1.0,
                     alpha=0.6, label=f"{predictor} (persistence)")
+            # Persistence band — kept at low alpha so the model lines remain
+            # visually primary in this N-predictor overlay.
+            ax.fill_between(steps, p_mean - p_std, p_mean + p_std,
+                            color=color, alpha=0.1)
 
     for ax, (_, _, label) in zip(axes, panels):
         ax.set_xlabel("Prediction step")
@@ -328,10 +333,15 @@ def make_figure_c(selections, cfg, output_path):
             mean = m.mean(axis=0)
             std  = m.std(axis=0)
             p_mean = p.mean(axis=0)
+            p_std  = p.std(axis=0)
             ax.plot(steps, mean, color=color, linewidth=2, label=predictor)
             ax.fill_between(steps, mean - std, mean + std, color=color, alpha=0.2)
             ax.plot(steps, p_mean, color=color, linestyle="--", linewidth=1.0,
                     alpha=0.6, label=f"{predictor} (persistence)")
+            # Persistence band — low alpha so the model lines remain primary
+            # in cross-predictor overlays.
+            ax.fill_between(steps, p_mean - p_std, p_mean + p_std,
+                            color=color, alpha=0.1)
 
     for ax, (_, _, label) in zip(axes, panels):
         ax.set_xlabel("Prediction step")
