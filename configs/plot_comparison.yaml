@@ -1,0 +1,42 @@
+# Config for plot_predictor_comparison.py — assembles cross-predictor figures
+# from per-run eval_curves.pt files.
+#
+# Usage:
+#   python plot_predictor_comparison.py runs="['outputs/.../mlp/best_model_dir', ...]"
+#   python plot_predictor_comparison.py runs_glob="outputs/2026-05-13/*/eval_curves.pt"
+#   python plot_predictor_comparison.py runs_glob="..." output_dir=paper_figures/
+
+defaults:
+  - _self_
+
+# List of paths to eval_curves.pt files or to run directories containing one.
+# If a directory is provided, the script looks for <dir>/eval_curves.pt.
+runs: null
+
+# Glob pattern, expanded to find eval_curves.pt files. Unioned with `runs`.
+runs_glob: null
+
+# Where to save the figures. Default: current Hydra run dir / plots.
+output_dir: ${hydra:runtime.output_dir}/plots
+
+# Source block inside each eval_curves.pt:
+#   true  → use test_final (the paper numbers; what the plot script does by default)
+#   false → use the last entry of val_per_epoch
+use_test_final: true
+
+# Generate Figure C (q/p split) when any input run has Hamiltonian-family
+# q_mse / p_mse arrays. Silently skipped when no such runs are present.
+include_qp_split: true
+
+# Figure cosmetics.
+figsize: [12, 4]
+fontsize: 11
+
+# Color per predictor name. The plot script will fall back to a default
+# palette if a predictor isn't listed here.
+predictor_colors:
+  mlp:                "#1f77b4"
+  lstm:               "#ff7f0e"
+  hamiltonian:        "#2ca02c"
+  latent_neural_ode:  "#d62728"
+  latent_hamiltonian: "#9467bd"

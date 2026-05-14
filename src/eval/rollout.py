@@ -109,6 +109,8 @@ def generate_visual_trajectory(env, init_state, actions, dt, render_opts):
 @torch.no_grad()
 def visual_dt_generalization_test(
     model, env, dt_values, cfg, n_seqs=8, seq_len=None,
+    energy_radius_range_override=None,
+    fixed_init_state=None,
 ):
     """Test visual model across different dt values.
 
@@ -123,17 +125,38 @@ def visual_dt_generalization_test(
         n_seqs: number of trajectories to generate per dt.
         seq_len: number of action steps per trajectory.
             Defaults to context_length + 10.
+        energy_radius_range_override: optional (r_min, r_max) tuple/list that
+            overrides the env-config-derived energy_radius_range AND forces
+            sampling_mode="energy_radius". Used by visual_energy_stratified_test
+            to run rollouts against a specific energy band. Default None
+            preserves all existing behavior.
+        fixed_init_state: optional state tensor that, when set, is used as
+            the init for EVERY rollout in this dt-gen call (skipping
+            env.sample_initial_state). Used by visual_fixed_init_stratified_test
+            to collapse within-band init heterogeneity so only action-sequence
+            variance remains. Default None preserves all existing behavior.
 
     Returns:
         dict mapping dt -> {
-            'pred_images': (n_seqs, horizon, C, H, W),
-            'true_images': (n_seqs, horizon, C, H, W),
-            'metrics': dict from compute_visual_metrics,
-            'latent_mse': float,
+            'pred_images':   (n_seqs, horizon, C, H, W),
+            'true_images':   (n_seqs, horizon, C, H, W),
+            'metrics':       dict from compute_visual_metrics,
+            'latent_mse':    float (mean across all seqs/steps; back-compat scalar),
+            'latent_curves': dict of (n_seqs, horizon) CPU tensors with keys
+                latent_mse, latent_cosine, latent_norm_l2,
+                persistence_mse, persistence_cosine, persistence_norm_l2,
+            'qp_curves':     dict of (n_seqs, horizon) CPU tensors with keys
+                q_mse, p_mse, persistence_q_mse, persistence_p_mse, OR
+                None when D is odd (no q/p split).
+            'rollout_grid':  (C, H_grid, W_grid) CPU tensor, GT|Pred|Error grid.
         }
     """
     from omegaconf import OmegaConf
-    from src.eval.metrics import compute_visual_metrics
+    from src.eval.metrics import (
+        compute_visual_metrics,
+        compute_latent_divergence_metrics,
+        compute_qp_divergence_metrics,
+    )
 
     # Grid layout and horizon bookkeeping use infer_context_length because
     # visual_open_loop_rollout seeds from the first infer_ctx latents.
@@ -167,9 +190,15 @@ def visual_dt_generalization_test(
     # energy contours, not from a uniform box that biases toward low-energy /
     # near-equilibrium states.
     sampling_mode = env_cfg.get("init_sampling", "uniform_box")
-    energy_radius_range = env_cfg.get("energy_radius_range", None)
-    if energy_radius_range is not None:
-        energy_radius_range = list(energy_radius_range)
+    if energy_radius_range_override is not None:
+        # Caller (e.g., visual_energy_stratified_test) is providing a band-specific
+        # sub-range. Force energy_radius sampling and use the override.
+        energy_radius_range = list(energy_radius_range_override)
+        sampling_mode = "energy_radius"
+    else:
+        energy_radius_range = env_cfg.get("energy_radius_range", None)
+        if energy_radius_range is not None:
+            energy_radius_range = list(energy_radius_range)
     init_state_range = (
         OmegaConf.to_container(env_cfg.init_state_range, resolve=True)
         if "init_state_range" in env_cfg else None
@@ -182,12 +211,20 @@ def visual_dt_generalization_test(
         all_images = []
         all_actions = []
         for _ in range(n_seqs):
-            init_state = env.sample_initial_state(
-                sampling_mode=sampling_mode,
-                init_state_range=init_state_range,
-                energy_radius_range=energy_radius_range,
-                variable_params=None,
-            )
+            if fixed_init_state is not None:
+                # Caller (e.g., visual_fixed_init_stratified_test) wants every
+                # rollout to start from the SAME init. Clone so each rollout
+                # gets its own tensor object (defensive — generate_visual_trajectory
+                # treats init_state as immutable, but downstream callers shouldn't
+                # be coupled to that contract).
+                init_state = fixed_init_state.clone() if hasattr(fixed_init_state, "clone") else fixed_init_state
+            else:
+                init_state = env.sample_initial_state(
+                    sampling_mode=sampling_mode,
+                    init_state_range=init_state_range,
+                    energy_radius_range=energy_radius_range,
+                    variable_params=None,
+                )
 
             actions = torch.randint(0, env.action_dim, (seq_len,))
             imgs, _ = generate_visual_trajectory(env, init_state, actions, dt, render_opts)
@@ -209,6 +246,25 @@ def visual_dt_generalization_test(
         gt_latents = true_latents[:, ctx_len:]          # (n_seqs, horizon, D)
 
         latent_mse = ((pred_latents - gt_latents) ** 2).mean().item()
+
+        # Per-step latent divergence (dynamics metrics) + persistence baseline.
+        # The last context frame is index ctx_len-1 in true_latents (the latent
+        # the predictor saw last before starting to predict).
+        z_context_last = true_latents[:, ctx_len - 1]   # (n_seqs, D)
+        latent_curves = compute_latent_divergence_metrics(
+            pred_latents, gt_latents, z_context_last
+        )
+        # q/p split is Hamiltonian-only. We can't introspect predictor type
+        # here without circular imports, so always compute it when D is even
+        # and let the caller decide whether to use it.
+        D = pred_latents.shape[-1]
+        if D % 2 == 0:
+            qp_curves = compute_qp_divergence_metrics(
+                pred_latents, gt_latents, z_context_last
+            )
+        else:
+            qp_curves = None
+
         vis_metrics = compute_visual_metrics(pred_images, gt_images)
 
         # Build rollout grid (GT | Pred | Error) for a few samples
@@ -242,7 +298,124 @@ def visual_dt_generalization_test(
             "true_images": gt_images,
             "metrics": vis_metrics,
             "latent_mse": latent_mse,
+            "latent_curves": {k: v.cpu() for k, v in latent_curves.items()},
+            "qp_curves": (
+                {k: v.cpu() for k, v in qp_curves.items()}
+                if qp_curves is not None else None
+            ),
             "rollout_grid": grid,
         }
 
+    return results
+
+
+@torch.no_grad()
+def visual_energy_stratified_test(
+    model, env, dt_values, cfg, energy_radius_range,
+    n_seqs=8, seq_len=None,
+):
+    """Run visual_dt_generalization_test once per energy band.
+
+    Slices the supplied energy_radius_range into three equal sub-ranges
+    (low / med / high) and calls visual_dt_generalization_test for each
+    band with energy_radius_range_override set to the band's sub-range.
+
+    Note: for envs whose energy-vs-radius mapping is non-linear
+    (oscillator: energy ∝ r^2), the radius-spaced sub-ranges correspond
+    to non-uniform energy intervals. The "low/med/high" labels describe
+    radius bands, not equal energy partitions.
+
+    Args:
+        model:               VisualWorldModel.
+        env:                 PhysicsControlEnv with render_state() and
+                             _sample_energy_radius_state() implemented.
+        dt_values:           list of dt values to test (per band).
+        cfg:                 Hydra config (forwarded to dt-gen test).
+        energy_radius_range: (r_min, r_max) tuple/list — the full
+                             eval distribution to be split into bands.
+        n_seqs:              n_rollouts per band (NOT divided across bands).
+        seq_len:             optional seq_len override for dt-gen test.
+
+    Returns:
+        dict {band: dt_results_dict} where band is "low" / "med" / "high"
+        and dt_results_dict has the same schema as
+        visual_dt_generalization_test's return value (one entry per dt).
+    """
+    import numpy as np
+    r_min, r_max = float(energy_radius_range[0]), float(energy_radius_range[1])
+    edges = np.linspace(r_min, r_max, 4)
+    bands = {
+        "low":  (float(edges[0]), float(edges[1])),
+        "med":  (float(edges[1]), float(edges[2])),
+        "high": (float(edges[2]), float(edges[3])),
+    }
+
+    results = {}
+    for band_name, band_range in bands.items():
+        results[band_name] = visual_dt_generalization_test(
+            model, env, dt_values, cfg,
+            n_seqs=n_seqs, seq_len=seq_len,
+            energy_radius_range_override=band_range,
+        )
+    return results
+
+
+@torch.no_grad()
+def visual_fixed_init_stratified_test(
+    model, env, dt_values, cfg, energy_radius_range,
+    n_seqs=8, seq_len=None,
+):
+    """Per-band fixed-init eval.
+
+    For each of three energy bands (low / med / high), sample ONE init
+    state from the band's radius sub-range and run n_seqs trajectories
+    from that fixed init with only action sequences varying. variable_params
+    are already implicitly fixed via env construction (env.step / env.sample_initial_state
+    use the env's instance attributes when no per-call params are supplied).
+
+    Args:
+        model:               VisualWorldModel.
+        env:                 PhysicsControlEnv with sample_initial_state() and
+                             _sample_energy_radius_state() implemented.
+        dt_values:           list of dt values to test (per band).
+        cfg:                 Hydra config (forwarded to dt-gen test).
+        energy_radius_range: (r_min, r_max) — full eval distribution to split
+                             into 3 equal sub-ranges for the per-band sampling.
+        n_seqs:              n_rollouts per band.
+        seq_len:             optional seq_len override.
+
+    Returns:
+        dict {band: {"init_state": <state tensor>, "results": dt_results_dict}}
+        where dt_results_dict has the same schema as visual_dt_generalization_test's
+        return value (one entry per dt). init_state is the band-representative
+        state used for all rollouts in that band.
+    """
+    import numpy as np
+    r_min, r_max = float(energy_radius_range[0]), float(energy_radius_range[1])
+    edges = np.linspace(r_min, r_max, 4)
+    bands = {
+        "low":  (float(edges[0]), float(edges[1])),
+        "med":  (float(edges[1]), float(edges[2])),
+        "high": (float(edges[2]), float(edges[3])),
+    }
+
+    results = {}
+    for band_name, band_range in bands.items():
+        # Sample ONE init state from this band's sub-range.
+        init_state = env.sample_initial_state(
+            sampling_mode="energy_radius",
+            init_state_range=None,
+            energy_radius_range=list(band_range),
+            variable_params=None,
+        )
+        # Run n_seqs trajectories from that fixed init (only actions vary).
+        band_results = visual_dt_generalization_test(
+            model, env, dt_values, cfg,
+            n_seqs=n_seqs, seq_len=seq_len,
+            fixed_init_state=init_state,
+        )
+        results[band_name] = {
+            "init_state": init_state,
+            "results": band_results,
+        }
     return results

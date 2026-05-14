@@ -1,6 +1,6 @@
 
 name: pendulum_conservative
-version: null
+version: 2026-05-12_11-00-55
 n_seqs: 50000
 seq_len: 50
 dt: 0.2

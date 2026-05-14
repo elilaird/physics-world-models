@@ -130,3 +130,108 @@ def compute_visual_metrics(pred_images, true_images, lpips_net=None):
     metrics["lpips"] = np.mean(step_lpips)
 
     return metrics
+
+
+# ---------------------------------------------------------------------------
+# Latent divergence metrics (dynamics-focused, not pixel-focused)
+# ---------------------------------------------------------------------------
+
+def compute_latent_divergence_metrics(pred_z, gt_z, z_context_last, eps=1e-8):
+    """Per-step latent divergence + persistence baselines.
+
+    Measures how well predicted latents track ground-truth encoded latents
+    along the rollout horizon. Unlike the visual metrics in this file, these
+    are dimensionless-by-construction (under SIGReg's ~N(0,I) marginal) and
+    measure dynamics quality rather than decoder quality.
+
+    Args:
+        pred_z:         (B, horizon, D) predicted latent trajectory.
+        gt_z:           (B, horizon, D) ground-truth encoded latent trajectory.
+        z_context_last: (B, D) last context-frame latent — used as the
+            persistence prediction (a "freeze in place" null hypothesis).
+        eps: numerical stability constant for cosine and norm_l2.
+
+    Returns:
+        dict with these six keys, each a (B, horizon) tensor:
+            latent_mse, latent_cosine, latent_norm_l2
+            persistence_mse, persistence_cosine, persistence_norm_l2
+    """
+    B, H, D = pred_z.shape
+    assert gt_z.shape == (B, H, D)
+    assert z_context_last.shape == (B, D)
+
+    # --- Model predictions vs GT ---
+    diff = pred_z - gt_z                                    # (B, H, D)
+    latent_mse = (diff ** 2).mean(dim=-1)                   # (B, H)
+
+    pred_norm = pred_z.norm(dim=-1)                         # (B, H)
+    gt_norm   = gt_z.norm(dim=-1)                           # (B, H)
+    dot       = (pred_z * gt_z).sum(dim=-1)                 # (B, H)
+    latent_cosine = dot / (pred_norm * gt_norm + eps)       # (B, H)
+
+    latent_norm_l2 = diff.norm(dim=-1) / (gt_norm + eps)    # (B, H)
+
+    # --- Persistence baseline: z_pred[t] = z_context_last for all t ---
+    persist = z_context_last.unsqueeze(1).expand(-1, H, -1) # (B, H, D)
+    pdiff = persist - gt_z
+    persistence_mse = (pdiff ** 2).mean(dim=-1)
+
+    persist_norm = z_context_last.norm(dim=-1, keepdim=True).expand(-1, H)  # (B, H)
+    pdot = (persist * gt_z).sum(dim=-1)
+    persistence_cosine = pdot / (persist_norm * gt_norm + eps)
+
+    persistence_norm_l2 = pdiff.norm(dim=-1) / (gt_norm + eps)
+
+    return {
+        "latent_mse":          latent_mse,
+        "latent_cosine":       latent_cosine,
+        "latent_norm_l2":      latent_norm_l2,
+        "persistence_mse":     persistence_mse,
+        "persistence_cosine":  persistence_cosine,
+        "persistence_norm_l2": persistence_norm_l2,
+    }
+
+
+def compute_qp_divergence_metrics(pred_z, gt_z, z_context_last):
+    """Hamiltonian-only: per-step MSE on the q-half and p-half separately.
+
+    The Hamiltonian-family predictors split the latent as z = [q, p] with
+    q, p ∈ R^(D/2). This diagnostic reports MSE on each half separately so
+    you can see whether momentum (p) drifts faster than position (q) or vice
+    versa — a structural read on which part of the dynamics is the weak link.
+
+    Args:
+        pred_z:         (B, horizon, D) predicted latents.
+        gt_z:           (B, horizon, D) ground-truth latents.
+        z_context_last: (B, D) last context frame for persistence baseline.
+
+    Returns:
+        dict with four keys, each a (B, horizon) tensor:
+            q_mse, p_mse, persistence_q_mse, persistence_p_mse
+    """
+    B, H, D = pred_z.shape
+    assert D % 2 == 0, f"q/p split requires even latent dim, got D={D}"
+    assert gt_z.shape == (B, H, D)
+    assert z_context_last.shape == (B, D)
+
+    half = D // 2
+
+    pred_q, pred_p = pred_z[..., :half], pred_z[..., half:]
+    gt_q,   gt_p   = gt_z[...,   :half], gt_z[...,   half:]
+    ctx_q,  ctx_p  = z_context_last[..., :half], z_context_last[..., half:]
+
+    q_mse = ((pred_q - gt_q) ** 2).mean(dim=-1)
+    p_mse = ((pred_p - gt_p) ** 2).mean(dim=-1)
+
+    # Persistence: ctx_q / ctx_p broadcast across horizon
+    persist_q = ctx_q.unsqueeze(1).expand(-1, H, -1)
+    persist_p = ctx_p.unsqueeze(1).expand(-1, H, -1)
+    persistence_q_mse = ((persist_q - gt_q) ** 2).mean(dim=-1)
+    persistence_p_mse = ((persist_p - gt_p) ** 2).mean(dim=-1)
+
+    return {
+        "q_mse":             q_mse,
+        "p_mse":             p_mse,
+        "persistence_q_mse": persistence_q_mse,
+        "persistence_p_mse": persistence_p_mse,
+    }

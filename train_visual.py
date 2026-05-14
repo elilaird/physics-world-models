@@ -34,7 +34,13 @@ from src.models import MODEL_REGISTRY
 from src.models.sigreg import SIGReg
 from src.data.precomputed import PrecomputedDataset
 from src.eval.rollout import visual_open_loop_rollout, visual_dt_generalization_test
-from src.eval.metrics import compute_visual_metrics
+from src.eval.metrics import (
+    compute_visual_metrics,
+    compute_latent_divergence_metrics,
+    compute_qp_divergence_metrics,
+)
+from src.eval.curves_logger import EvalCurvesLogger
+from src.eval.plots import make_latent_error_plot, make_dt_latent_error_plot
 
 log = logging.getLogger(__name__)
 
@@ -447,6 +453,17 @@ def compute_rollout_metrics(model, batch, n_samples=4):
     latent_mse = ((pred_latents - gt_latents) ** 2).mean().item()
     vis_metrics = compute_visual_metrics(pred_images, gt_images)
 
+    # Per-step latent divergence (dynamics metrics) + persistence baseline.
+    z_context_last = true_latents[:, ctx_len - 1]   # (B, D)
+    latent_curves = compute_latent_divergence_metrics(
+        pred_latents, gt_latents, z_context_last
+    )
+    D = pred_latents.shape[-1]
+    qp_curves = (
+        compute_qp_divergence_metrics(pred_latents, gt_latents, z_context_last)
+        if D % 2 == 0 else None
+    )
+
     # Build rollout grid
     n_show = min(n_samples, B)
     ctx_images = images[:n_show, :ctx_len + K - 1]
@@ -478,6 +495,11 @@ def compute_rollout_metrics(model, batch, n_samples=4):
         "ssim": vis_metrics["ssim"],
         "lpips": vis_metrics["lpips"],
         "rollout_grid": grid_img,
+        "latent_curves": {k: v.detach().cpu() for k, v in latent_curves.items()},
+        "qp_curves": (
+            {k: v.detach().cpu() for k, v in qp_curves.items()}
+            if qp_curves is not None else None
+        ),
     }
 
 
@@ -587,6 +609,31 @@ def main(cfg: DictConfig):
     dt_values = list(cfg.eval.dt_values)
     dt_seq_len = cfg.eval.get("dt_seq_len", None) or cfg.dataset.get("seq_len", 20)
 
+    # EvalCurvesLogger: persists per-epoch and final test per-step latent
+    # divergence curves to eval_curves.pt next to best_model.pt. See
+    # docs/superpowers/specs/2026-05-13-latent-divergence-evaluation-design.md
+    # for the full save format.
+    save_curves = cfg.eval.get("save_curves", True)
+    curves_logger = None
+    if save_curves:
+        curves_path = os.path.join(
+            cfg.checkpoint_dir,
+            cfg.eval.get("curves_filename", "eval_curves.pt"),
+        )
+        # horizon is inferred from the first rollout — we don't know it yet.
+        # We initialize the logger lazily on the first val-rollout call so we
+        # can pass the actual horizon. Defer construction until then.
+        curves_logger_meta = {
+            "path":        curves_path,
+            "predictor":   cfg.predictor.name,
+            "env":         cfg.env.name,
+            "training_dt": training_dt,
+            "ctx_len":     cfg.model.get("infer_context_length", cfg.model.context_length),
+            "n_seqs":      cfg.eval.get("n_rollouts", 8),
+            "dt_values":   dt_values,
+            "latent_dim":  cfg.model.latent_channels,
+        }
+
     # Training loop
     best_dt_gen_psnr = -float("inf")
     pbar = tqdm(range(1, cfg.training.epochs + 1), desc="Training")
@@ -661,6 +708,25 @@ def main(cfg: DictConfig):
                 f"LPIPS: {rollout_metrics['lpips']:.4f} | "
                 f"Latent MSE: {rollout_metrics['latent_mse']:.6f}"
             )
+            # Persist per-step latent curves and render the wandb plot.
+            if save_curves:
+                latent_curves = rollout_metrics["latent_curves"]
+                qp_curves = rollout_metrics["qp_curves"]
+                # Lazy init: the first call gives us the horizon we need.
+                horizon = latent_curves["latent_mse"].shape[1]
+                if curves_logger is None:
+                    curves_logger = EvalCurvesLogger(
+                        horizon=horizon,
+                        **curves_logger_meta,
+                    )
+                curves_logger.append_val_epoch(
+                    epoch=epoch,
+                    curves=latent_curves,
+                    qp_curves=qp_curves,
+                )
+                rollout_metrics["latent_error_plot"] = make_latent_error_plot(
+                    latent_curves, epoch=epoch, horizon=horizon, dt=training_dt,
+                )
 
         # wandb logging
         if cfg.wandb.enabled:
@@ -679,6 +745,26 @@ def main(cfg: DictConfig):
 
             if rollout_metrics is not None:
                 wandb_log["val/rollout_grid"] = rollout_metrics.pop("rollout_grid")
+                if "latent_error_plot" in rollout_metrics:
+                    wandb_log["val/latent_error_curve"] = rollout_metrics.pop(
+                        "latent_error_plot"
+                    )
+                # Aggregate trajectory scalars: mean over batch and horizon for
+                # each latent / persistence / qp key. Computed BEFORE popping the
+                # tensor dicts so the data is still available.
+                latent_curves_for_agg = rollout_metrics.get("latent_curves")
+                if latent_curves_for_agg is not None:
+                    for k, v in latent_curves_for_agg.items():
+                        wandb_log[f"val/rollout_{k}_mean"] = float(v.mean().item())
+                qp_curves_for_agg = rollout_metrics.get("qp_curves")
+                if qp_curves_for_agg is not None:
+                    for k, v in qp_curves_for_agg.items():
+                        wandb_log[f"val/rollout_{k}_mean"] = float(v.mean().item())
+                # latent_curves and qp_curves are tensors — don't pour them
+                # into wandb scalars. Remove them from the dict before the
+                # blanket-log loop below.
+                rollout_metrics.pop("latent_curves", None)
+                rollout_metrics.pop("qp_curves", None)
                 for k, v in rollout_metrics.items():
                     wandb_log[f"val/rollout_{k}"] = v
 
@@ -706,6 +792,36 @@ def main(cfg: DictConfig):
                     f"Latent MSE={dt_results[dt_val]['latent_mse']:.6f}"
                 )
 
+            # Persist per-dt per-step latent curves.
+            if save_curves and curves_logger is not None:
+                per_dt_curves_dict = {
+                    dt_val: dt_results[dt_val]["latent_curves"]
+                    for dt_val in sorted(dt_results.keys())
+                }
+                # qp_curves may be None for non-Hamiltonian runs — pass through.
+                first_qp = dt_results[sorted(dt_results.keys())[0]].get("qp_curves")
+                if first_qp is not None:
+                    per_dt_qp_dict = {
+                        dt_val: dt_results[dt_val]["qp_curves"]
+                        for dt_val in sorted(dt_results.keys())
+                    }
+                else:
+                    per_dt_qp_dict = None
+                curves_logger.append_dt_gen_epoch(
+                    epoch=epoch,
+                    per_dt_curves=per_dt_curves_dict,
+                    per_dt_qp=per_dt_qp_dict,
+                )
+                # Render the per-dt latent-error figure for wandb.
+                horizon = per_dt_curves_dict[
+                    sorted(per_dt_curves_dict.keys())[0]
+                ]["latent_mse"].shape[1]
+                dt_latent_plot = make_dt_latent_error_plot(
+                    per_dt_curves_dict, epoch=epoch, horizon=horizon,
+                )
+            else:
+                dt_latent_plot = None
+
             if cfg.wandb.enabled:
                 dt_gen_log = {}
                 for dt_val in sorted(dt_results.keys()):
@@ -719,6 +835,29 @@ def main(cfg: DictConfig):
                         dt_results[dt_val]["rollout_grid"].clamp(0, 1),
                         caption=f"epoch {epoch}, dt={dt_val} — GT | Pred | |Error|",
                     )
+                    # Aggregate trajectory scalars (mean over batch and horizon)
+                    # for every latent / persistence / qp key at this dt.
+                    curves_d = dt_results[dt_val]["latent_curves"]
+                    for k, v in curves_d.items():
+                        dt_gen_log[f"val/dt_gen/dt={dt_val}/{k}_mean"] = float(v.mean().item())
+                    qp_d = dt_results[dt_val].get("qp_curves")
+                    if qp_d is not None:
+                        for k, v in qp_d.items():
+                            dt_gen_log[f"val/dt_gen/dt={dt_val}/{k}_mean"] = float(v.mean().item())
+                    # Per-dt latent error figure (1x3 with persistence baseline).
+                    # Reuses make_latent_error_plot — it ignores qp keys in the
+                    # merged dict, so passing both is safe.
+                    per_dt_merged = dict(curves_d)
+                    if qp_d is not None:
+                        per_dt_merged.update(qp_d)
+                    dt_h = curves_d["latent_mse"].shape[1]
+                    dt_gen_log[f"val/dt_gen/dt={dt_val}/latent_error_curve"] = (
+                        make_latent_error_plot(
+                            per_dt_merged, epoch=epoch, horizon=dt_h, dt=dt_val,
+                        )
+                    )
+                if dt_latent_plot is not None:
+                    dt_gen_log["val/dt_gen/latent_error_curves"] = dt_latent_plot
                 wandb.log(dt_gen_log)
 
             if training_dt in dt_results:
@@ -795,6 +934,7 @@ def main(cfg: DictConfig):
     test_rollout_batch = next(iter(DataLoader(test_data, batch_size=n_rollouts, shuffle=False)))
     test_rollout_batch = batch_to_device(test_rollout_batch, device)
     test_rollout = compute_rollout_metrics(model, test_rollout_batch, n_log)
+    test_fixed_dt_curves = None
     if test_rollout is not None:
         log.info(
             f"Test rollout — MAE: {test_rollout['mae']:.4f} | "
@@ -803,6 +943,12 @@ def main(cfg: DictConfig):
             f"LPIPS: {test_rollout['lpips']:.4f} | "
             f"Latent MSE: {test_rollout['latent_mse']:.6f}"
         )
+        # Capture test fixed_dt latent curves for the test_final block of
+        # eval_curves.pt. They live in compute_rollout_metrics' return dict.
+        if save_curves and curves_logger is not None:
+            test_fixed_dt_curves = dict(test_rollout["latent_curves"])
+            if test_rollout.get("qp_curves") is not None:
+                test_fixed_dt_curves.update(test_rollout["qp_curves"])
 
     test_img = make_recon_grid(model, batch, n_log)
 
@@ -813,10 +959,13 @@ def main(cfg: DictConfig):
         if test_img is not None:
             wandb.log({"test/reconstructions": test_img})
         if test_rollout is not None:
-            wandb.log({
-                "test/rollout_grid": test_rollout.pop("rollout_grid"),
-                **{f"test/rollout_{k}": v for k, v in test_rollout.items()},
-            })
+            test_wandb = {"test/rollout_grid": test_rollout.pop("rollout_grid")}
+            # Strip tensor keys so they don't pour into wandb as scalars.
+            test_rollout.pop("latent_curves", None)
+            test_rollout.pop("qp_curves", None)
+            for k, v in test_rollout.items():
+                test_wandb[f"test/rollout_{k}"] = v
+            wandb.log(test_wandb)
 
     # Final dt-generalization test (logged to dt_gen/* for the run summary)
     n_rollouts = cfg.eval.get("n_rollouts", 8)
@@ -847,6 +996,20 @@ def main(cfg: DictConfig):
                     caption=f"dt={dt_val} — GT | Pred | |Error|",
                 ),
             })
+
+    # Assemble and persist test_final block of eval_curves.pt.
+    if save_curves and curves_logger is not None and test_fixed_dt_curves is not None:
+        test_per_dt = {}
+        for dt_val in sorted(dt_results.keys()):
+            entry = dict(dt_results[dt_val]["latent_curves"])
+            if dt_results[dt_val].get("qp_curves") is not None:
+                entry.update(dt_results[dt_val]["qp_curves"])
+            test_per_dt[dt_val] = entry
+        curves_logger.set_test_final(
+            fixed_dt=test_fixed_dt_curves,
+            per_dt=test_per_dt,
+        )
+        log.info(f"Saved test_final block to eval_curves.pt")
 
     log.info(f"Training complete. Best dt-gen PSNR @ dt={training_dt}: {best_dt_gen_psnr:.2f}. Test loss: {avg_test:.6f}.")
     log.info(f"Checkpoint saved to: {ckpt_path}")

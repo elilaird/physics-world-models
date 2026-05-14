@@ -7,6 +7,7 @@ Usage:
     python evaluate.py checkpoint=path/to/best_model.pt eval.dt_values=[0.05,0.1,0.2,0.5]
 """
 
+import json
 import logging
 import os
 
@@ -18,8 +19,19 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
 from src.eval.utils import load_checkpoint, rebuild_model, rebuild_env
-from src.eval.metrics import compute_visual_metrics
-from src.eval.rollout import visual_open_loop_rollout, visual_dt_generalization_test
+from src.eval.metrics import (
+    compute_visual_metrics,
+    compute_latent_divergence_metrics,
+    compute_qp_divergence_metrics,
+)
+from src.eval.rollout import (
+    visual_open_loop_rollout,
+    visual_dt_generalization_test,
+    visual_energy_stratified_test,
+    visual_fixed_init_stratified_test,
+)
+from src.eval.curves_logger import EvalCurvesLogger
+from src.eval.plots import make_latent_error_plot, make_dt_latent_error_plot
 from src.data.precomputed import PrecomputedDataset
 
 log = logging.getLogger(__name__)
@@ -115,6 +127,18 @@ def main(cfg: DictConfig):
     latent_mse = latent_mse_per_step.mean().item()
     log.info(f"Latent MSE (mean): {latent_mse:.6f}")
 
+    # Per-step latent divergence + persistence baseline (for eval_curves.pt).
+    z_context_last = true_latents[:, ctx_len - 1]
+    test_fixed_dt_curves = compute_latent_divergence_metrics(
+        pred_latents, gt_latents, z_context_last
+    )
+    D = pred_latents.shape[-1]
+    if D % 2 == 0:
+        test_fixed_dt_curves.update(
+            compute_qp_divergence_metrics(pred_latents, gt_latents, z_context_last)
+        )
+    test_fixed_dt_curves = {k: v.detach().cpu() for k, v in test_fixed_dt_curves.items()}
+
     # Visual metrics
     log.info("Computing visual metrics (MAE, PSNR, SSIM, LPIPS)...")
     vis_metrics = compute_visual_metrics(pred_images, gt_images)
@@ -192,6 +216,7 @@ def main(cfg: DictConfig):
     )
 
     dt_sorted = sorted(dt_results.keys())
+    training_dt = train_cfg.dataset.get("dt", train_cfg.model.observation_dt)
     for dt_val in dt_sorted:
         m = dt_results[dt_val]["metrics"]
         log.info(
@@ -263,14 +288,373 @@ def main(cfg: DictConfig):
     torch.save(all_metrics, metrics_pt_path)
     log.info(f"Metrics saved to: {metrics_pt_path}")
 
+    # Write eval_curves.pt for cross-predictor comparison.
+    # Matches the format produced by train_visual.py, but only the test_final
+    # block is populated (this script doesn't see val epochs).
+    if cfg.eval.get("save_curves", True):
+        curves_path = os.path.join(
+            output_dir,
+            cfg.eval.get("curves_filename", "eval_curves.pt"),
+        )
+        curves_logger = EvalCurvesLogger(
+            path=curves_path,
+            predictor=train_cfg.predictor.name,
+            env=train_cfg.env.name,
+            training_dt=training_dt,
+            horizon=horizon,
+            ctx_len=ctx_len,
+            n_seqs=n_rollouts,
+            dt_values=dt_sorted,
+            latent_dim=train_cfg.model.latent_channels,
+        )
+        # Assemble per_dt block from the dt_results dict that already exists.
+        test_per_dt = {}
+        for dt_val in dt_sorted:
+            entry = dict(dt_results[dt_val]["latent_curves"])
+            if dt_results[dt_val].get("qp_curves") is not None:
+                entry.update(dt_results[dt_val]["qp_curves"])
+            test_per_dt[dt_val] = entry
+        curves_logger.set_test_final(
+            fixed_dt=test_fixed_dt_curves,
+            per_dt=test_per_dt,
+        )
+        log.info(f"Saved eval_curves.pt to: {curves_path}")
+
+    # --- Energy-stratified eval ---
+    # Decompose latent-error variance by initial-state energy. Splits the
+    # env's energy_radius_range into three equal radius sub-ranges and
+    # runs the existing dt-gen rollout once per band. Per-band plots are
+    # saved to disk + logged to wandb; per-band curves go into
+    # test_final_per_band in eval_curves.pt.
+    env_cfg_for_bands = (
+        train_cfg.dataset.env if "env" in train_cfg.dataset else train_cfg.env
+    )
+    eval_energy_range = env_cfg_for_bands.get("energy_radius_range", None)
+    if eval_energy_range is None:
+        log.info(
+            "Skipping energy-stratified eval: env config has no "
+            "energy_radius_range (uniform-box-sampled env)."
+        )
+    else:
+        log.info(
+            f"Running energy-stratified eval over radius range "
+            f"{list(eval_energy_range)} split into 3 bands..."
+        )
+        # 1. Fixed-dt-equivalent: stratified rollouts at training dt only.
+        stratified_fixed = visual_energy_stratified_test(
+            model, env, [training_dt], train_cfg,
+            energy_radius_range=list(eval_energy_range),
+            n_seqs=n_rollouts, seq_len=dt_seq_len,
+        )
+        # 2. Multi-dt: stratified rollouts at all eval dt_values.
+        stratified_multi = visual_energy_stratified_test(
+            model, env, dt_values, train_cfg,
+            energy_radius_range=list(eval_energy_range),
+            n_seqs=n_rollouts, seq_len=dt_seq_len,
+        )
+
+        # Render per-band plots and save to disk.
+        per_band_imgs_fixed = {}    # {band: wandb.Image}
+        per_band_imgs_combined = {} # {band: wandb.Image (combined-dt overlay)}
+        per_band_imgs_perdt = {}    # {(band, dt): wandb.Image}
+        for band in ("low", "med", "high"):
+            # Fixed-dt (single-dt) per-band figure: pull the single-dt entry.
+            band_fixed_curves = stratified_fixed[band][training_dt]["latent_curves"]
+            band_fixed_qp = stratified_fixed[band][training_dt].get("qp_curves")
+            fixed_merged = dict(band_fixed_curves)
+            if band_fixed_qp is not None:
+                fixed_merged.update(band_fixed_qp)
+            fixed_path = os.path.join(output_dir, f"latent_error_curve_{band}.png")
+            per_band_imgs_fixed[band] = make_latent_error_plot(
+                fixed_merged,
+                epoch=ckpt["epoch"],
+                horizon=fixed_merged["latent_mse"].shape[1],
+                dt=training_dt,
+                title_prefix=f"Test latent divergence — {band} energy",
+                output_path=fixed_path,
+            )
+            log.info(f"Saved: {fixed_path}")
+
+            # Combined-dt overlay per band.
+            band_multi_curves = {
+                dt_val: stratified_multi[band][dt_val]["latent_curves"]
+                for dt_val in dt_sorted
+            }
+            combined_path = os.path.join(
+                output_dir, f"dt_gen_latent_error_curves_{band}.png"
+            )
+            per_band_imgs_combined[band] = make_dt_latent_error_plot(
+                band_multi_curves,
+                epoch=ckpt["epoch"],
+                horizon=band_multi_curves[dt_sorted[0]]["latent_mse"].shape[1],
+                title_prefix=f"Test dt-gen latent divergence — {band} energy",
+                output_path=combined_path,
+            )
+            log.info(f"Saved: {combined_path}")
+
+            # Per-(band, dt) individual figures.
+            for dt_val in dt_sorted:
+                pd_curves = stratified_multi[band][dt_val]["latent_curves"]
+                pd_qp = stratified_multi[band][dt_val].get("qp_curves")
+                pd_merged = dict(pd_curves)
+                if pd_qp is not None:
+                    pd_merged.update(pd_qp)
+                pd_path = os.path.join(
+                    output_dir,
+                    f"dt_latent_error_curve_{band}_dt={dt_val}.png",
+                )
+                per_band_imgs_perdt[(band, dt_val)] = make_latent_error_plot(
+                    pd_merged,
+                    epoch=ckpt["epoch"],
+                    horizon=pd_merged["latent_mse"].shape[1],
+                    dt=dt_val,
+                    title_prefix=f"Test latent divergence — {band} energy",
+                    output_path=pd_path,
+                )
+                log.info(f"Saved: {pd_path}")
+
+        # Write test_final_per_band block of eval_curves.pt.
+        if cfg.eval.get("save_curves", True):
+            stratified_for_disk = {}
+            for band in ("low", "med", "high"):
+                band_fixed = stratified_fixed[band][training_dt]
+                fixed_merged_disk = dict(band_fixed["latent_curves"])
+                if band_fixed.get("qp_curves") is not None:
+                    fixed_merged_disk.update(band_fixed["qp_curves"])
+                per_dt_merged_disk = {}
+                for dt_val in dt_sorted:
+                    entry = dict(stratified_multi[band][dt_val]["latent_curves"])
+                    if stratified_multi[band][dt_val].get("qp_curves") is not None:
+                        entry.update(stratified_multi[band][dt_val]["qp_curves"])
+                    per_dt_merged_disk[dt_val] = entry
+                stratified_for_disk[band] = {
+                    "fixed_dt": fixed_merged_disk,
+                    "per_dt": per_dt_merged_disk,
+                }
+            curves_logger.set_test_final_per_band(stratified_for_disk)
+            log.info("Saved test_final_per_band to eval_curves.pt")
+
+    # --- Fixed-init eval ---
+    # Per energy band, sample ONE init state and run n_rollouts trajectories
+    # from that fixed init. Variable_params are already implicitly fixed via
+    # env construction, so the only inter-rollout variance left is from
+    # action sequences. Composes with the energy-stratified eval above:
+    # comparing free-init-band variance vs fixed-init-band variance gives
+    # the within-band init-state contribution.
+    if eval_energy_range is None:
+        log.info(
+            "Skipping fixed-init eval: env config has no "
+            "energy_radius_range (uniform-box-sampled env)."
+        )
+    else:
+        log.info(
+            f"Running fixed-init eval over radius range "
+            f"{list(eval_energy_range)} split into 3 bands..."
+        )
+        # 1. Fixed-dt-equivalent at training dt only.
+        fi_stratified_fixed = visual_fixed_init_stratified_test(
+            model, env, [training_dt], train_cfg,
+            energy_radius_range=list(eval_energy_range),
+            n_seqs=n_rollouts, seq_len=dt_seq_len,
+        )
+        # 2. Multi-dt at full cfg.eval.dt_values.
+        fi_stratified_multi = visual_fixed_init_stratified_test(
+            model, env, dt_values, train_cfg,
+            energy_radius_range=list(eval_energy_range),
+            n_seqs=n_rollouts, seq_len=dt_seq_len,
+        )
+
+        # Write the fixed_init_states.json sidecar (independent of save_curves).
+        edges_for_json = np.linspace(
+            float(eval_energy_range[0]), float(eval_energy_range[1]), 4
+        )
+        sidecar = {
+            "low":  {
+                "init_state": fi_stratified_fixed["low"]["init_state"].detach().cpu().tolist(),
+                "energy_radius_range": [float(edges_for_json[0]), float(edges_for_json[1])],
+            },
+            "med":  {
+                "init_state": fi_stratified_fixed["med"]["init_state"].detach().cpu().tolist(),
+                "energy_radius_range": [float(edges_for_json[1]), float(edges_for_json[2])],
+            },
+            "high": {
+                "init_state": fi_stratified_fixed["high"]["init_state"].detach().cpu().tolist(),
+                "energy_radius_range": [float(edges_for_json[2]), float(edges_for_json[3])],
+            },
+        }
+        sidecar_path = os.path.join(output_dir, "fixed_init_states.json")
+        with open(sidecar_path, "w") as f:
+            json.dump(sidecar, f, indent=2)
+        log.info(f"Saved: {sidecar_path}")
+
+        # Render per-band plots and save to disk.
+        fi_per_band_imgs_fixed = {}
+        fi_per_band_imgs_combined = {}
+        fi_per_band_imgs_perdt = {}
+        for band in ("low", "med", "high"):
+            band_fixed_dtres = fi_stratified_fixed[band]["results"][training_dt]
+            band_fixed_curves = band_fixed_dtres["latent_curves"]
+            band_fixed_qp = band_fixed_dtres.get("qp_curves")
+            fixed_merged = dict(band_fixed_curves)
+            if band_fixed_qp is not None:
+                fixed_merged.update(band_fixed_qp)
+            fixed_path = os.path.join(
+                output_dir, f"latent_error_curve_fixed_init_{band}.png"
+            )
+            fi_per_band_imgs_fixed[band] = make_latent_error_plot(
+                fixed_merged,
+                epoch=ckpt["epoch"],
+                horizon=fixed_merged["latent_mse"].shape[1],
+                dt=training_dt,
+                title_prefix=f"Fixed-init test latent divergence — {band} energy",
+                output_path=fixed_path,
+            )
+            log.info(f"Saved: {fixed_path}")
+
+            # Combined-dt overlay per band.
+            band_multi_curves = {
+                dt_val: fi_stratified_multi[band]["results"][dt_val]["latent_curves"]
+                for dt_val in dt_sorted
+            }
+            combined_path = os.path.join(
+                output_dir, f"dt_gen_latent_error_curves_fixed_init_{band}.png"
+            )
+            fi_per_band_imgs_combined[band] = make_dt_latent_error_plot(
+                band_multi_curves,
+                epoch=ckpt["epoch"],
+                horizon=band_multi_curves[dt_sorted[0]]["latent_mse"].shape[1],
+                title_prefix=f"Fixed-init test dt-gen latent divergence — {band} energy",
+                output_path=combined_path,
+            )
+            log.info(f"Saved: {combined_path}")
+
+            # Per-(band, dt) individual figures.
+            for dt_val in dt_sorted:
+                pd_dtres = fi_stratified_multi[band]["results"][dt_val]
+                pd_curves = pd_dtres["latent_curves"]
+                pd_qp = pd_dtres.get("qp_curves")
+                pd_merged = dict(pd_curves)
+                if pd_qp is not None:
+                    pd_merged.update(pd_qp)
+                pd_path = os.path.join(
+                    output_dir,
+                    f"dt_latent_error_curve_fixed_init_{band}_dt={dt_val}.png",
+                )
+                fi_per_band_imgs_perdt[(band, dt_val)] = make_latent_error_plot(
+                    pd_merged,
+                    epoch=ckpt["epoch"],
+                    horizon=pd_merged["latent_mse"].shape[1],
+                    dt=dt_val,
+                    title_prefix=f"Fixed-init test latent divergence — {band} energy",
+                    output_path=pd_path,
+                )
+                log.info(f"Saved: {pd_path}")
+
+        # Write test_final_per_band_fixed_init block of eval_curves.pt.
+        if cfg.eval.get("save_curves", True):
+            fi_for_disk = {}
+            for band in ("low", "med", "high"):
+                band_fixed_dtres = fi_stratified_fixed[band]["results"][training_dt]
+                fixed_merged_disk = dict(band_fixed_dtres["latent_curves"])
+                if band_fixed_dtres.get("qp_curves") is not None:
+                    fixed_merged_disk.update(band_fixed_dtres["qp_curves"])
+                per_dt_merged_disk = {}
+                for dt_val in dt_sorted:
+                    pd_dtres = fi_stratified_multi[band]["results"][dt_val]
+                    entry = dict(pd_dtres["latent_curves"])
+                    if pd_dtres.get("qp_curves") is not None:
+                        entry.update(pd_dtres["qp_curves"])
+                    per_dt_merged_disk[dt_val] = entry
+                fi_for_disk[band] = {
+                    "init_state": fi_stratified_fixed[band]["init_state"],
+                    "fixed_dt": fixed_merged_disk,
+                    "per_dt": per_dt_merged_disk,
+                }
+            curves_logger.set_test_final_per_band_fixed_init(fi_for_disk)
+            log.info("Saved test_final_per_band_fixed_init to eval_curves.pt")
+
+    # --- Render latent-divergence figures and save to disk ---
+    # Always runs, regardless of cfg.wandb.enabled. The returned wandb.Image
+    # objects are then re-used by the wandb block below if wandb is on.
+    # Horizons are derived from each curve tensor's actual shape because the
+    # dt-gen rollout uses fresh trajectories whose horizon depends on
+    # encoder_frames and can differ from the fixed-dt horizon.
+    fixed_horizon = test_fixed_dt_curves["latent_mse"].shape[1]
+    latent_error_path = os.path.join(output_dir, "latent_error_curve.png")
+    latent_error_img = make_latent_error_plot(
+        test_fixed_dt_curves,
+        epoch=ckpt["epoch"],
+        horizon=fixed_horizon,
+        dt=training_dt,
+        title_prefix="Test latent divergence",
+        output_path=latent_error_path,
+    )
+    log.info(f"Saved: {latent_error_path}")
+
+    dt_per_dt_curves = {dt_val: dt_results[dt_val]["latent_curves"] for dt_val in dt_sorted}
+    dt_horizon = dt_per_dt_curves[dt_sorted[0]]["latent_mse"].shape[1]
+    dt_combined_path = os.path.join(output_dir, "dt_gen_latent_error_curves.png")
+    dt_latent_error_img = make_dt_latent_error_plot(
+        dt_per_dt_curves,
+        epoch=ckpt["epoch"],
+        horizon=dt_horizon,
+        title_prefix="Test dt-gen latent divergence",
+        output_path=dt_combined_path,
+    )
+    log.info(f"Saved: {dt_combined_path}")
+
+    # Per-dt latent error figures (1x3 with persistence baseline), one per dt.
+    per_dt_latent_imgs = {}
+    for d in dt_sorted:
+        curves_d = dt_results[d]["latent_curves"]
+        qp_d = dt_results[d].get("qp_curves")
+        per_dt_merged = dict(curves_d)
+        if qp_d is not None:
+            per_dt_merged.update(qp_d)
+        dt_h = curves_d["latent_mse"].shape[1]
+        per_dt_path = os.path.join(output_dir, f"dt_latent_error_curve_{d}.png")
+        per_dt_latent_imgs[d] = make_latent_error_plot(
+            per_dt_merged,
+            epoch=ckpt["epoch"],
+            horizon=dt_h,
+            dt=d,
+            title_prefix="Test latent divergence",
+            output_path=per_dt_path,
+        )
+        log.info(f"Saved: {per_dt_path}")
+
     # --- wandb logging ---
     if cfg.wandb.enabled:
         import wandb as wandb_mod
+        slurm_id = os.environ.get("SLURM_JOB_ID", "")
+        run_name = f"eval_{train_cfg.env.name}_{train_cfg.predictor.name}"
+        if slurm_id:
+            run_name = f"{run_name}_{slurm_id}"
+
+        # Log train_cfg as the wandb config, NOT the eval-script cfg.
+        # The eval-script cfg inherits ALL training defaults from
+        # configs/config.yaml (dataset.name, model.observation_dt,
+        # predictor.dt, etc.) but only its eval.* and wandb.* sub-trees
+        # actually drive evaluation; the rest are shadow defaults that
+        # would mislead anyone reading wandb to think the eval used them.
+        # The actual model/env/dataset come from train_cfg via
+        # rebuild_model / rebuild_env / train_cfg.dataset.*.
+        wandb_config = OmegaConf.to_container(train_cfg, resolve=True)
+        wandb_config["eval_overrides"] = {
+            "checkpoint":    cfg.checkpoint,
+            "ckpt_epoch":    ckpt["epoch"],
+            "n_rollouts":    n_rollouts,
+            "dt_values":     list(cfg.eval.dt_values),
+            "substeps":      eval_substeps,
+            "horizon_override": cfg.eval.get("horizon", None),
+            "save_curves":   cfg.eval.get("save_curves", True),
+        }
         wandb_mod.init(
             project=cfg.wandb.project,
-            config=OmegaConf.to_container(cfg, resolve=True),
-            name=f"eval_{train_cfg.env.name}_{train_cfg.predictor.name}",
+            config=wandb_config,
+            name=run_name,
         )
+
         wandb_log = {
             "eval/latent_mse": latent_mse,
             "eval/mae": vis_metrics["mae"],
@@ -283,7 +667,48 @@ def main(cfg: DictConfig):
             ),
             "eval/metrics_plot": wandb_mod.Image(metrics_path),
             "eval/dt_generalization_plot": wandb_mod.Image(dt_plot_path),
+            "eval/latent_error_curve": latent_error_img,
+            "eval/dt_gen/latent_error_curves": dt_latent_error_img,
         }
+
+        # Aggregate trajectory metrics: mean over batch and horizon for each
+        # latent / persistence / qp key. Surfaces scalar comparisons in wandb
+        # alongside the per-step matplotlib figures.
+        for k, v in test_fixed_dt_curves.items():
+            wandb_log[f"eval/{k}_mean"] = float(v.mean().item())
+
+        # Per-band logging (only when stratified eval ran).
+        if eval_energy_range is not None:
+            for band in ("low", "med", "high"):
+                # Per-band fixed-dt image.
+                wandb_log[f"eval/{band}/latent_error_curve"] = per_band_imgs_fixed[band]
+                # Per-band combined-dt overlay image.
+                wandb_log[f"eval/dt_gen/{band}/latent_error_curves"] = (
+                    per_band_imgs_combined[band]
+                )
+                # Per-band aggregate scalars (fixed-dt).
+                band_fixed = stratified_fixed[band][training_dt]
+                for k, v in band_fixed["latent_curves"].items():
+                    wandb_log[f"eval/{band}/{k}_mean"] = float(v.mean().item())
+                if band_fixed.get("qp_curves") is not None:
+                    for k, v in band_fixed["qp_curves"].items():
+                        wandb_log[f"eval/{band}/{k}_mean"] = float(v.mean().item())
+
+        # Per-band fixed-init logging (only when fixed-init eval ran).
+        if eval_energy_range is not None:
+            for band in ("low", "med", "high"):
+                wandb_log[f"eval/{band}/fixed_init/latent_error_curve"] = (
+                    fi_per_band_imgs_fixed[band]
+                )
+                wandb_log[f"eval/dt_gen/{band}/fixed_init/latent_error_curves"] = (
+                    fi_per_band_imgs_combined[band]
+                )
+                band_fixed_dtres = fi_stratified_fixed[band]["results"][training_dt]
+                for k, v in band_fixed_dtres["latent_curves"].items():
+                    wandb_log[f"eval/{band}/fixed_init/{k}_mean"] = float(v.mean().item())
+                if band_fixed_dtres.get("qp_curves") is not None:
+                    for k, v in band_fixed_dtres["qp_curves"].items():
+                        wandb_log[f"eval/{band}/fixed_init/{k}_mean"] = float(v.mean().item())
 
         # Log per-step rollout metrics
         for t in range(horizon):
@@ -295,10 +720,13 @@ def main(cfg: DictConfig):
             wandb_mod.log(wandb_log)
             wandb_log = {}
 
-        # Log dt generalization metrics and rollout grids
+        # Log dt generalization metrics, per-dt latent-error plots, and rollout grids
         for d in dt_sorted:
             m = dt_results[d]["metrics"]
-            wandb_mod.log({
+            curves_d = dt_results[d]["latent_curves"]
+            qp_d = dt_results[d].get("qp_curves")
+
+            log_payload = {
                 "eval_dt/dt": d,
                 "eval_dt/mae": m["mae"],
                 "eval_dt/psnr": m["psnr"],
@@ -309,7 +737,39 @@ def main(cfg: DictConfig):
                     dt_results[d]["rollout_grid"].clamp(0, 1),
                     caption=f"dt={d} — GT | Pred | |Error|",
                 ),
-            })
+                "eval_dt/latent_error_curve": per_dt_latent_imgs[d],
+            }
+            # Aggregate trajectory metrics for this dt.
+            for k, v in curves_d.items():
+                log_payload[f"eval_dt/{k}_mean"] = float(v.mean().item())
+            if qp_d is not None:
+                for k, v in qp_d.items():
+                    log_payload[f"eval_dt/{k}_mean"] = float(v.mean().item())
+            # Per-band per-dt: add band-specific images and scalars for this dt.
+            if eval_energy_range is not None:
+                for band in ("low", "med", "high"):
+                    log_payload[f"eval_dt/{band}/latent_error_curve"] = (
+                        per_band_imgs_perdt[(band, d)]
+                    )
+                    band_dt_entry = stratified_multi[band][d]
+                    for k, v in band_dt_entry["latent_curves"].items():
+                        log_payload[f"eval_dt/{band}/{k}_mean"] = float(v.mean().item())
+                    if band_dt_entry.get("qp_curves") is not None:
+                        for k, v in band_dt_entry["qp_curves"].items():
+                            log_payload[f"eval_dt/{band}/{k}_mean"] = float(v.mean().item())
+            # Per-band per-dt fixed-init: add fixed-init images and scalars for this dt.
+            if eval_energy_range is not None:
+                for band in ("low", "med", "high"):
+                    log_payload[f"eval_dt/{band}/fixed_init/latent_error_curve"] = (
+                        fi_per_band_imgs_perdt[(band, d)]
+                    )
+                    band_dt_entry = fi_stratified_multi[band]["results"][d]
+                    for k, v in band_dt_entry["latent_curves"].items():
+                        log_payload[f"eval_dt/{band}/fixed_init/{k}_mean"] = float(v.mean().item())
+                    if band_dt_entry.get("qp_curves") is not None:
+                        for k, v in band_dt_entry["qp_curves"].items():
+                            log_payload[f"eval_dt/{band}/fixed_init/{k}_mean"] = float(v.mean().item())
+            wandb_mod.log(log_payload)
 
         wandb_mod.finish()
         log.info("Logged results to wandb")
