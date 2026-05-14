@@ -749,6 +749,17 @@ def main(cfg: DictConfig):
                     wandb_log["val/latent_error_curve"] = rollout_metrics.pop(
                         "latent_error_plot"
                     )
+                # Aggregate trajectory scalars: mean over batch and horizon for
+                # each latent / persistence / qp key. Computed BEFORE popping the
+                # tensor dicts so the data is still available.
+                latent_curves_for_agg = rollout_metrics.get("latent_curves")
+                if latent_curves_for_agg is not None:
+                    for k, v in latent_curves_for_agg.items():
+                        wandb_log[f"val/rollout_{k}_mean"] = float(v.mean().item())
+                qp_curves_for_agg = rollout_metrics.get("qp_curves")
+                if qp_curves_for_agg is not None:
+                    for k, v in qp_curves_for_agg.items():
+                        wandb_log[f"val/rollout_{k}_mean"] = float(v.mean().item())
                 # latent_curves and qp_curves are tensors — don't pour them
                 # into wandb scalars. Remove them from the dict before the
                 # blanket-log loop below.
@@ -823,6 +834,27 @@ def main(cfg: DictConfig):
                     dt_gen_log[f"val/dt_gen/dt={dt_val}/rollout_grid"] = wandb.Image(
                         dt_results[dt_val]["rollout_grid"].clamp(0, 1),
                         caption=f"epoch {epoch}, dt={dt_val} — GT | Pred | |Error|",
+                    )
+                    # Aggregate trajectory scalars (mean over batch and horizon)
+                    # for every latent / persistence / qp key at this dt.
+                    curves_d = dt_results[dt_val]["latent_curves"]
+                    for k, v in curves_d.items():
+                        dt_gen_log[f"val/dt_gen/dt={dt_val}/{k}_mean"] = float(v.mean().item())
+                    qp_d = dt_results[dt_val].get("qp_curves")
+                    if qp_d is not None:
+                        for k, v in qp_d.items():
+                            dt_gen_log[f"val/dt_gen/dt={dt_val}/{k}_mean"] = float(v.mean().item())
+                    # Per-dt latent error figure (1x3 with persistence baseline).
+                    # Reuses make_latent_error_plot — it ignores qp keys in the
+                    # merged dict, so passing both is safe.
+                    per_dt_merged = dict(curves_d)
+                    if qp_d is not None:
+                        per_dt_merged.update(qp_d)
+                    dt_h = curves_d["latent_mse"].shape[1]
+                    dt_gen_log[f"val/dt_gen/dt={dt_val}/latent_error_curve"] = (
+                        make_latent_error_plot(
+                            per_dt_merged, epoch=epoch, horizon=dt_h, dt=dt_val,
+                        )
                     )
                 if dt_latent_plot is not None:
                     dt_gen_log["val/dt_gen/latent_error_curves"] = dt_latent_plot
