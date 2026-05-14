@@ -293,3 +293,54 @@ def visual_dt_generalization_test(
         }
 
     return results
+
+
+@torch.no_grad()
+def visual_energy_stratified_test(
+    model, env, dt_values, cfg, energy_radius_range,
+    n_seqs=8, seq_len=None,
+):
+    """Run visual_dt_generalization_test once per energy band.
+
+    Slices the supplied energy_radius_range into three equal sub-ranges
+    (low / med / high) and calls visual_dt_generalization_test for each
+    band with energy_radius_range_override set to the band's sub-range.
+
+    Note: for envs whose energy-vs-radius mapping is non-linear
+    (oscillator: energy ∝ r^2), the radius-spaced sub-ranges correspond
+    to non-uniform energy intervals. The "low/med/high" labels describe
+    radius bands, not equal energy partitions.
+
+    Args:
+        model:               VisualWorldModel.
+        env:                 PhysicsControlEnv with render_state() and
+                             _sample_energy_radius_state() implemented.
+        dt_values:           list of dt values to test (per band).
+        cfg:                 Hydra config (forwarded to dt-gen test).
+        energy_radius_range: (r_min, r_max) tuple/list — the full
+                             eval distribution to be split into bands.
+        n_seqs:              n_rollouts per band (NOT divided across bands).
+        seq_len:             optional seq_len override for dt-gen test.
+
+    Returns:
+        dict {band: dt_results_dict} where band is "low" / "med" / "high"
+        and dt_results_dict has the same schema as
+        visual_dt_generalization_test's return value (one entry per dt).
+    """
+    import numpy as np
+    r_min, r_max = float(energy_radius_range[0]), float(energy_radius_range[1])
+    edges = np.linspace(r_min, r_max, 4)
+    bands = {
+        "low":  (float(edges[0]), float(edges[1])),
+        "med":  (float(edges[1]), float(edges[2])),
+        "high": (float(edges[2]), float(edges[3])),
+    }
+
+    results = {}
+    for band_name, band_range in bands.items():
+        results[band_name] = visual_dt_generalization_test(
+            model, env, dt_values, cfg,
+            n_seqs=n_seqs, seq_len=seq_len,
+            energy_radius_range_override=band_range,
+        )
+    return results
