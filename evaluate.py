@@ -324,18 +324,25 @@ def main(cfg: DictConfig):
         # Render the new per-step latent-divergence figures.
         # test_fixed_dt_curves carries base keys + (for even-D) q/p keys; the
         # plot helper reads only the base keys, so passing the merged dict is fine.
+        # Horizons are derived from the actual curve tensors rather than the
+        # outer `horizon` variable because the dt-gen rollout uses a different
+        # path through the data (fresh trajectories vs precomputed test set),
+        # and the two horizons can disagree when encoder_frames != 2.
         training_dt = train_cfg.dataset.get("dt", train_cfg.model.observation_dt)
+        fixed_horizon = test_fixed_dt_curves["latent_mse"].shape[1]
         latent_error_img = make_latent_error_plot(
             test_fixed_dt_curves,
             epoch=ckpt["epoch"],
-            horizon=horizon,
+            horizon=fixed_horizon,
             dt=training_dt,
             title_prefix="Test latent divergence",
         )
+        dt_per_dt_curves = {dt_val: dt_results[dt_val]["latent_curves"] for dt_val in dt_sorted}
+        dt_horizon = dt_per_dt_curves[dt_sorted[0]]["latent_mse"].shape[1]
         dt_latent_error_img = make_dt_latent_error_plot(
-            {dt_val: dt_results[dt_val]["latent_curves"] for dt_val in dt_sorted},
+            dt_per_dt_curves,
             epoch=ckpt["epoch"],
-            horizon=horizon,
+            horizon=dt_horizon,
             title_prefix="Test dt-gen latent divergence",
         )
 
