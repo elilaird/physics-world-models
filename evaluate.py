@@ -362,6 +362,12 @@ def main(cfg: DictConfig):
             "eval/dt_gen/latent_error_curves": dt_latent_error_img,
         }
 
+        # Aggregate trajectory metrics: mean over batch and horizon for each
+        # latent / persistence / qp key. Surfaces scalar comparisons in wandb
+        # alongside the per-step matplotlib figures.
+        for k, v in test_fixed_dt_curves.items():
+            wandb_log[f"eval/{k}_mean"] = float(v.mean().item())
+
         # Log per-step rollout metrics
         for t in range(horizon):
             wandb_log[f"eval_step/mae"] = vis_metrics["mae_per_step"][t]
@@ -372,10 +378,28 @@ def main(cfg: DictConfig):
             wandb_mod.log(wandb_log)
             wandb_log = {}
 
-        # Log dt generalization metrics and rollout grids
+        # Log dt generalization metrics, per-dt latent-error plots, and rollout grids
         for d in dt_sorted:
             m = dt_results[d]["metrics"]
-            wandb_mod.log({
+            curves_d = dt_results[d]["latent_curves"]
+            qp_d = dt_results[d].get("qp_curves")
+
+            # Per-dt latent error figure (1x3 with persistence baseline).
+            # Reuses the fixed-dt helper since each dt's curves have the same
+            # shape contract; the helper ignores any q/p keys in the dict.
+            per_dt_merged = dict(curves_d)
+            if qp_d is not None:
+                per_dt_merged.update(qp_d)
+            dt_h = curves_d["latent_mse"].shape[1]
+            per_dt_plot = make_latent_error_plot(
+                per_dt_merged,
+                epoch=ckpt["epoch"],
+                horizon=dt_h,
+                dt=d,
+                title_prefix="Test latent divergence",
+            )
+
+            log_payload = {
                 "eval_dt/dt": d,
                 "eval_dt/mae": m["mae"],
                 "eval_dt/psnr": m["psnr"],
@@ -386,7 +410,15 @@ def main(cfg: DictConfig):
                     dt_results[d]["rollout_grid"].clamp(0, 1),
                     caption=f"dt={d} — GT | Pred | |Error|",
                 ),
-            })
+                "eval_dt/latent_error_curve": per_dt_plot,
+            }
+            # Aggregate trajectory metrics for this dt.
+            for k, v in curves_d.items():
+                log_payload[f"eval_dt/{k}_mean"] = float(v.mean().item())
+            if qp_d is not None:
+                for k, v in qp_d.items():
+                    log_payload[f"eval_dt/{k}_mean"] = float(v.mean().item())
+            wandb_mod.log(log_payload)
 
         wandb_mod.finish()
         log.info("Logged results to wandb")
