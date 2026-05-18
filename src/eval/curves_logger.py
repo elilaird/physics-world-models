@@ -66,17 +66,19 @@ class EvalCurvesLogger:
         n_seqs: int,
         dt_values: list,
         latent_dim: int,
+        eval_dataset_dir: str | None = None,
     ):
         self.path = path
         self._metadata = {
-            "predictor":   predictor,
-            "env":         env,
-            "training_dt": training_dt,
-            "horizon":     horizon,
-            "ctx_len":     ctx_len,
-            "n_seqs":      n_seqs,
-            "dt_values":   list(dt_values),
-            "latent_dim":  latent_dim,
+            "predictor":        predictor,
+            "env":              env,
+            "training_dt":      training_dt,
+            "horizon":          horizon,
+            "ctx_len":          ctx_len,
+            "n_seqs":           n_seqs,
+            "dt_values":        list(dt_values),
+            "latent_dim":       latent_dim,
+            "eval_dataset_dir": eval_dataset_dir,
         }
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
