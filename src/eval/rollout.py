@@ -111,6 +111,8 @@ def visual_dt_generalization_test(
     model, env, dt_values, cfg, n_seqs=8, seq_len=None,
     energy_radius_range_override=None,
     fixed_init_state=None,
+    eval_dataset_dir=None,
+    band_label=None,
 ):
     """Test visual model across different dt values.
 
@@ -135,6 +137,16 @@ def visual_dt_generalization_test(
             env.sample_initial_state). Used by visual_fixed_init_stratified_test
             to collapse within-band init heterogeneity so only action-sequence
             variance remains. Default None preserves all existing behavior.
+        eval_dataset_dir: optional path to a canonical eval dataset directory
+            (produced by generate_eval_dataset.py). When set, the per-rollout
+            loop loads pre-rendered (images, actions) from
+            <eval_dataset_dir>/<band_label>/dt={dt}.npz instead of sampling
+            at runtime. Used by paired cross-predictor comparison so every
+            eval consumes identical trajectories. Default None preserves
+            existing runtime-sampling behavior.
+        band_label: required when eval_dataset_dir is set; specifies which
+            band sub-directory to read ("low"/"med"/"high", or "all" for
+            un-stratified). Ignored when eval_dataset_dir is None.
 
     Returns:
         dict mapping dt -> {
@@ -207,32 +219,55 @@ def visual_dt_generalization_test(
     device = next(model.parameters()).device
     results = {}
 
+    # Resolve where image/action batches come from for each dt:
+    #   - eval_dataset_dir set: load pre-rendered (images, actions) from disk.
+    #     band_label decides which band sub-directory to read from.
+    #   - otherwise: sample trajectories at runtime (existing back-compat path).
+    use_dataset = eval_dataset_dir is not None
+
+    if use_dataset:
+        # Lazy import to keep the existing back-compat path free of new deps.
+        from src.eval.eval_dataset_io import load_band_dt_npz
+        if band_label is None:
+            # No band stratification: use a flat directory layout. To keep
+            # things simple, we still require a band sub-folder so the
+            # dataset structure is uniform; an "all" band can be added later.
+            raise ValueError(
+                "eval_dataset_dir requires band_label (one of 'low', 'med', 'high'). "
+                "Pass band_label='all' to use a single un-stratified sub-folder."
+            )
+
     for dt in dt_values:
-        all_images = []
-        all_actions = []
-        for _ in range(n_seqs):
-            if fixed_init_state is not None:
-                # Caller (e.g., visual_fixed_init_stratified_test) wants every
-                # rollout to start from the SAME init. Clone so each rollout
-                # gets its own tensor object (defensive — generate_visual_trajectory
-                # treats init_state as immutable, but downstream callers shouldn't
-                # be coupled to that contract).
-                init_state = fixed_init_state.clone() if hasattr(fixed_init_state, "clone") else fixed_init_state
-            else:
-                init_state = env.sample_initial_state(
-                    sampling_mode=sampling_mode,
-                    init_state_range=init_state_range,
-                    energy_radius_range=energy_radius_range,
-                    variable_params=None,
-                )
+        if use_dataset:
+            loaded = load_band_dt_npz(eval_dataset_dir, band=band_label, dt=float(dt))
+            images_batch = torch.from_numpy(loaded["images"]).to(device)
+            actions_batch = torch.from_numpy(loaded["actions"]).to(device)
+        else:
+            all_images = []
+            all_actions = []
+            for _ in range(n_seqs):
+                if fixed_init_state is not None:
+                    # Caller (e.g., visual_fixed_init_stratified_test) wants every
+                    # rollout to start from the SAME init. Clone so each rollout
+                    # gets its own tensor object (defensive — generate_visual_trajectory
+                    # treats init_state as immutable, but downstream callers shouldn't
+                    # be coupled to that contract).
+                    init_state = fixed_init_state.clone() if hasattr(fixed_init_state, "clone") else fixed_init_state
+                else:
+                    init_state = env.sample_initial_state(
+                        sampling_mode=sampling_mode,
+                        init_state_range=init_state_range,
+                        energy_radius_range=energy_radius_range,
+                        variable_params=None,
+                    )
 
-            actions = torch.randint(0, env.action_dim, (seq_len,))
-            imgs, _ = generate_visual_trajectory(env, init_state, actions, dt, render_opts)
-            all_images.append(imgs)
-            all_actions.append(actions)
+                actions = torch.randint(0, env.action_dim, (seq_len,))
+                imgs, _ = generate_visual_trajectory(env, init_state, actions, dt, render_opts)
+                all_images.append(imgs)
+                all_actions.append(actions)
 
-        images_batch = torch.stack(all_images).to(device)
-        actions_batch = torch.stack(all_actions).to(device)
+            images_batch = torch.stack(all_images).to(device)
+            actions_batch = torch.stack(all_actions).to(device)
 
         # Run visual rollout (pass dt so ODE-based predictors integrate correctly)
         K = model.encoder_frames
