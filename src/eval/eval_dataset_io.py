@@ -104,8 +104,11 @@ def load_band_dt_npz(dataset_dir: str, band: str, dt: float) -> dict:
     # band is the most representative slice of the full energy range.
     effective_band = "med" if band == "all" else band
     band_dir = os.path.join(dataset_dir, effective_band)
-    # Canonical writer format: zero-padded 4-decimal, sorts naturally under `ls`.
-    path = os.path.join(band_dir, f"dt={float(dt):.4f}.npz")
+    # Canonical writer format: dt as ms, zero-padded to 4 digits.
+    # No '=' or '.' in filenames (shell-friendly), sorts naturally under `ls`.
+    # dt=0.4 -> dt_0400.npz, dt=0.05 -> dt_0050.npz, dt=1.5 -> dt_1500.npz.
+    dt_ms = int(round(float(dt) * 1000))
+    path = os.path.join(band_dir, f"dt_{dt_ms:04d}.npz")
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"No eval-dataset file found for band={band} "

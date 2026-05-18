@@ -177,9 +177,12 @@ def main(cfg: DictConfig):
             images_arr = np.stack(all_images, axis=0)    # (n_seqs, T+1, C, H, W)
             actions_arr = np.stack(all_actions, axis=0)  # (n_seqs, T)
 
-            # Zero-padded 4-decimal format sorts naturally under `ls` even when
-            # dt_values mixes 0.05, 0.1, 0.15, 1.0, etc.
-            npz_path = os.path.join(band_dir, f"dt={float(dt):.4f}.npz")
+            # Shell-friendly format: dt as ms, zero-padded to 4 digits.
+            # Avoids '=' and '.' in filenames (no shell quoting needed) AND
+            # sorts naturally under `ls`. dt=0.4 -> dt_0400.npz,
+            # dt=0.05 -> dt_0050.npz, dt=1.5 -> dt_1500.npz.
+            dt_ms = int(round(float(dt) * 1000))
+            npz_path = os.path.join(band_dir, f"dt_{dt_ms:04d}.npz")
             np.savez_compressed(npz_path, images=images_arr, actions=actions_arr)
             log.info(
                 f"  Saved {npz_path}  images.shape={images_arr.shape}  "
