@@ -6,11 +6,11 @@
 DATETIME=$(date +"%Y%m%d_%H%M%S")
 
 PARTITION=${PARTITION:-batch}
-TYPE=${TYPE:-train} # jupyter, eval, test, train, train_vector, generate_dataset
+TYPE=${TYPE:-train} # jupyter, eval, plot, test, train, train_vector, generate_dataset
 
-# Per-TYPE default TIME (eval/jupyter are short-running; train is multi-day).
+# Per-TYPE default TIME (eval/plot/jupyter are short-running; train is multi-day).
 # Explicit TIME=... env var still wins.
-if [ "${TYPE}" = "eval" ]; then
+if [ "${TYPE}" = "eval" ] || [ "${TYPE}" = "plot" ]; then
     TIME=${TIME:-0-04:00:00}
 else
     TIME=${TIME:-2-00:00:00}
@@ -52,6 +52,8 @@ elif [ "${TYPE}" = "generate_dataset" ]; then
     COMMAND="HYDRA_FULL_ERROR=1 python generate_dataset.py ${PY_ARGS}"
 elif [ "${TYPE}" = "eval" ]; then
     COMMAND="HYDRA_FULL_ERROR=1 python evaluate.py ${PY_ARGS}"
+elif [ "${TYPE}" = "plot" ]; then
+    COMMAND="HYDRA_FULL_ERROR=1 python plot_predictor_comparison.py ${PY_ARGS}"
 fi
 
 mkdir -p ${HOME_DIR}/output/${TYPE}
