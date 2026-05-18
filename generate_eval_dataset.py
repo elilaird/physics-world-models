@@ -150,6 +150,19 @@ def main(cfg: DictConfig):
             }
 
     # ---- Render and save per-(band, dt) ----
+    # Warn at generation time about dts that produce too few frames for any
+    # plausible eval. evaluate.py's infer_context_length is typically 8, so
+    # ceil(total_T / dt) + 1 must exceed that for the eval rollout to seed.
+    total_T = ref_seq_len * ref_dt
+    for dt in dt_values:
+        frames_at_dt = int(np.ceil(total_T / float(dt))) + 1
+        if frames_at_dt <= 8:
+            log.warning(
+                f"dt={dt}: only {frames_at_dt} frames per sequence at this dt "
+                f"(total_T={total_T}s / dt={dt}s + 1 init frame). Eval scripts "
+                f"with infer_context_length >= {frames_at_dt} will skip this dt. "
+                f"Increase ref_seq_len if you want to include large dts."
+            )
     for band_name in bands.keys():
         band_dir = os.path.join(output_dir, band_name)
         os.makedirs(band_dir, exist_ok=True)

@@ -1,5 +1,9 @@
+import logging
+
 import numpy as np
 import torch
+
+log = logging.getLogger(__name__)
 
 
 @torch.no_grad()
@@ -279,8 +283,24 @@ def visual_dt_generalization_test(
             images_batch = torch.stack(all_images).to(device)
             actions_batch = torch.stack(all_actions).to(device)
 
-        # Run visual rollout (pass dt so ODE-based predictors integrate correctly)
+        # Skip dts where the trajectory is too short to seed an inference.
+        # visual_open_loop_rollout would compute horizon = N_latents - infer_ctx;
+        # when that's non-positive the predictor.unroll loop runs 0 times and
+        # crashes on `torch.stack([], dim=1)`. Most common cause: large eval_dt
+        # divides total_T into fewer than infer_context_length frames.
         K = model.encoder_frames
+        n_latents_available = images_batch.shape[1] - K + 1
+        if n_latents_available <= ctx_len:
+            log.warning(
+                f"Skipping dt={dt}: dataset has {images_batch.shape[1]} frames per "
+                f"sequence ({n_latents_available} latents after K={K} window), but "
+                f"infer_context_length={ctx_len} requires more. To include this dt, "
+                f"regenerate the dataset with a larger ref_seq_len so that "
+                f"ceil(ref_seq_len * ref_dt / {dt}) + 1 > {ctx_len}."
+            )
+            continue
+
+        # Run visual rollout (pass dt so ODE-based predictors integrate correctly)
         rollout = visual_open_loop_rollout(model, images_batch, actions_batch, dt=dt)
         pred_images = rollout["pred_images"]       # (n_seqs, horizon, C, H, W)
         true_latents = rollout["true_latents"]     # (n_seqs, N_latents, D)
