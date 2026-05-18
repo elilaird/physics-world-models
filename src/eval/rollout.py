@@ -348,6 +348,7 @@ def visual_dt_generalization_test(
 def visual_energy_stratified_test(
     model, env, dt_values, cfg, energy_radius_range,
     n_seqs=8, seq_len=None,
+    eval_dataset_dir=None,
 ):
     """Run visual_dt_generalization_test once per energy band.
 
@@ -391,6 +392,8 @@ def visual_energy_stratified_test(
             model, env, dt_values, cfg,
             n_seqs=n_seqs, seq_len=seq_len,
             energy_radius_range_override=band_range,
+            eval_dataset_dir=eval_dataset_dir,
+            band_label=band_name if eval_dataset_dir is not None else None,
         )
     return results
 
@@ -399,6 +402,7 @@ def visual_energy_stratified_test(
 def visual_fixed_init_stratified_test(
     model, env, dt_values, cfg, energy_radius_range,
     n_seqs=8, seq_len=None,
+    eval_dataset_dir=None,
 ):
     """Per-band fixed-init eval.
 
@@ -434,20 +438,38 @@ def visual_fixed_init_stratified_test(
         "high": (float(edges[2]), float(edges[3])),
     }
 
+    # When eval_dataset_dir is set, take the canonical "fixed init" as the
+    # first sequence's init_state from metadata.json. This makes the fixed-
+    # init eval paired across evals (same canonical init per band).
+    canonical_inits = {}
+    if eval_dataset_dir is not None:
+        from src.eval.eval_dataset_io import load_metadata
+        md = load_metadata(eval_dataset_dir)
+        for band_name in bands.keys():
+            anchor = md["anchors"][band_name]["0"]  # JSON keys are strings
+            canonical_inits[band_name] = torch.as_tensor(
+                anchor["init_state"]
+            ).float()
+
     results = {}
     for band_name, band_range in bands.items():
-        # Sample ONE init state from this band's sub-range.
-        init_state = env.sample_initial_state(
-            sampling_mode="energy_radius",
-            init_state_range=None,
-            energy_radius_range=list(band_range),
-            variable_params=None,
-        )
+        if eval_dataset_dir is not None:
+            init_state = canonical_inits[band_name]
+        else:
+            # Sample ONE init state from this band's sub-range.
+            init_state = env.sample_initial_state(
+                sampling_mode="energy_radius",
+                init_state_range=None,
+                energy_radius_range=list(band_range),
+                variable_params=None,
+            )
         # Run n_seqs trajectories from that fixed init (only actions vary).
         band_results = visual_dt_generalization_test(
             model, env, dt_values, cfg,
             n_seqs=n_seqs, seq_len=seq_len,
             fixed_init_state=init_state,
+            eval_dataset_dir=eval_dataset_dir,
+            band_label=band_name if eval_dataset_dir is not None else None,
         )
         results[band_name] = {
             "init_state": init_state,
