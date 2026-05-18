@@ -71,3 +71,5 @@ eval:
   dt_gen_every_n_epochs: 5
   save_curves: true
   curves_filename: eval_curves.pt
+  eval_dataset_dir: null
+  eval_dataset_seed: 0

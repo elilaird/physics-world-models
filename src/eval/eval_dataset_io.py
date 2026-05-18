@@ -98,9 +98,12 @@ def load_band_dt_npz(dataset_dir: str, band: str, dt: float) -> dict:
     Raises:
         FileNotFoundError: when the requested (band, dt) file is missing.
     """
-    # Match the writer's filename format: dt={dt:.6g}.npz, but for safety
-    # also try a few common formatters.
-    band_dir = os.path.join(dataset_dir, band)
+    # 'all' resolves to the 'med' band as a pooled un-stratified view.
+    # When evaluate.py runs without energy stratification but with a
+    # canonical dataset, we still need to pick some sub-folder; the med
+    # band is the most representative slice of the full energy range.
+    effective_band = "med" if band == "all" else band
+    band_dir = os.path.join(dataset_dir, effective_band)
     candidates = [
         os.path.join(band_dir, f"dt={dt}.npz"),
         os.path.join(band_dir, f"dt={dt:.1f}.npz"),
@@ -112,6 +115,6 @@ def load_band_dt_npz(dataset_dir: str, band: str, dt: float) -> dict:
             data = np.load(path)
             return {"images": data["images"], "actions": data["actions"]}
     raise FileNotFoundError(
-        f"No eval-dataset file found for band={band}, dt={dt}. "
-        f"Tried: {candidates}"
+        f"No eval-dataset file found for band={band} (effective={effective_band}), "
+        f"dt={dt}. Tried: {candidates}"
     )

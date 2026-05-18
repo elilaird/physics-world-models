@@ -210,9 +210,14 @@ def main(cfg: DictConfig):
     dt_seq_len = cfg.eval.get("dt_seq_len", None) or (horizon + ctx_len)
     env = rebuild_env(train_cfg)
     log.info(f"Running visual dt generalization test: {dt_values} (seq_len={dt_seq_len})")
+    eval_dataset_dir = cfg.eval.get("eval_dataset_dir", None)
+    if eval_dataset_dir is not None:
+        log.info(f"Using canonical eval dataset at: {eval_dataset_dir}")
     dt_results = visual_dt_generalization_test(
         model, env, dt_values, train_cfg,
         n_seqs=n_rollouts, seq_len=dt_seq_len,
+        eval_dataset_dir=eval_dataset_dir,
+        band_label="all" if eval_dataset_dir is not None else None,
     )
 
     dt_sorted = sorted(dt_results.keys())
@@ -306,6 +311,7 @@ def main(cfg: DictConfig):
             n_seqs=n_rollouts,
             dt_values=dt_sorted,
             latent_dim=train_cfg.model.latent_channels,
+            eval_dataset_dir=cfg.eval.get("eval_dataset_dir", None),
         )
         # Assemble per_dt block from the dt_results dict that already exists.
         test_per_dt = {}
@@ -345,12 +351,14 @@ def main(cfg: DictConfig):
             model, env, [training_dt], train_cfg,
             energy_radius_range=list(eval_energy_range),
             n_seqs=n_rollouts, seq_len=dt_seq_len,
+            eval_dataset_dir=eval_dataset_dir,
         )
         # 2. Multi-dt: stratified rollouts at all eval dt_values.
         stratified_multi = visual_energy_stratified_test(
             model, env, dt_values, train_cfg,
             energy_radius_range=list(eval_energy_range),
             n_seqs=n_rollouts, seq_len=dt_seq_len,
+            eval_dataset_dir=eval_dataset_dir,
         )
 
         # Render per-band plots and save to disk.
@@ -456,12 +464,14 @@ def main(cfg: DictConfig):
             model, env, [training_dt], train_cfg,
             energy_radius_range=list(eval_energy_range),
             n_seqs=n_rollouts, seq_len=dt_seq_len,
+            eval_dataset_dir=eval_dataset_dir,
         )
         # 2. Multi-dt at full cfg.eval.dt_values.
         fi_stratified_multi = visual_fixed_init_stratified_test(
             model, env, dt_values, train_cfg,
             energy_radius_range=list(eval_energy_range),
             n_seqs=n_rollouts, seq_len=dt_seq_len,
+            eval_dataset_dir=eval_dataset_dir,
         )
 
         # Write the fixed_init_states.json sidecar (independent of save_curves).
