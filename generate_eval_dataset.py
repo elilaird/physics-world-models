@@ -65,7 +65,15 @@ def split_bands(energy_radius_range):
 
 
 def resolve_output_dir(cfg: DictConfig) -> str:
-    """Resolve eval_dataset.output_dir, defaulting to a content-addressed path."""
+    """Resolve eval_dataset.output_dir, defaulting to a content-addressed path
+    anchored at cfg.data_root (matching the convention used by training
+    datasets via PrecomputedDataset).
+
+    Hydra changes cwd to a fresh timestamp dir before invoking main(), so a
+    relative path like "datasets/..." would land inside the SLURM workdir
+    rather than at the canonical project datasets root. We use the absolute
+    cfg.data_root to anchor against the lustre filesystem.
+    """
     if cfg.eval_dataset.get("output_dir") is not None:
         return str(cfg.eval_dataset.output_dir)
     env_name = cfg.dataset.env.name
@@ -73,7 +81,7 @@ def resolve_output_dir(cfg: DictConfig) -> str:
     n_seqs = int(cfg.eval_dataset.n_seqs)
     ref_seq_len = int(cfg.eval_dataset.ref_seq_len)
     return os.path.join(
-        "datasets", env_name, "eval",
+        str(cfg.data_root), env_name, "eval",
         f"seed_{seed}_n{n_seqs}_T{ref_seq_len}",
     )
 
@@ -169,7 +177,9 @@ def main(cfg: DictConfig):
             images_arr = np.stack(all_images, axis=0)    # (n_seqs, T+1, C, H, W)
             actions_arr = np.stack(all_actions, axis=0)  # (n_seqs, T)
 
-            npz_path = os.path.join(band_dir, f"dt={dt}.npz")
+            # Zero-padded 4-decimal format sorts naturally under `ls` even when
+            # dt_values mixes 0.05, 0.1, 0.15, 1.0, etc.
+            npz_path = os.path.join(band_dir, f"dt={float(dt):.4f}.npz")
             np.savez_compressed(npz_path, images=images_arr, actions=actions_arr)
             log.info(
                 f"  Saved {npz_path}  images.shape={images_arr.shape}  "
