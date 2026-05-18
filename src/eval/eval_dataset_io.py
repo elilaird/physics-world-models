@@ -104,21 +104,12 @@ def load_band_dt_npz(dataset_dir: str, band: str, dt: float) -> dict:
     # band is the most representative slice of the full energy range.
     effective_band = "med" if band == "all" else band
     band_dir = os.path.join(dataset_dir, effective_band)
-    # Try the 4-decimal zero-padded format FIRST (the current writer's format,
-    # chosen because it sorts naturally under `ls`). The remaining candidates
-    # keep backwards compat with the older `f"dt={dt}.npz"` writer output.
-    candidates = [
-        os.path.join(band_dir, f"dt={float(dt):.4f}.npz"),
-        os.path.join(band_dir, f"dt={dt}.npz"),
-        os.path.join(band_dir, f"dt={dt:.1f}.npz"),
-        os.path.join(band_dir, f"dt={dt:.2f}.npz"),
-        os.path.join(band_dir, f"dt={dt:.6g}.npz"),
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            data = np.load(path)
-            return {"images": data["images"], "actions": data["actions"]}
-    raise FileNotFoundError(
-        f"No eval-dataset file found for band={band} (effective={effective_band}), "
-        f"dt={dt}. Tried: {candidates}"
-    )
+    # Canonical writer format: zero-padded 4-decimal, sorts naturally under `ls`.
+    path = os.path.join(band_dir, f"dt={float(dt):.4f}.npz")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"No eval-dataset file found for band={band} "
+            f"(effective={effective_band}), dt={dt}. Expected: {path}"
+        )
+    data = np.load(path)
+    return {"images": data["images"], "actions": data["actions"]}
