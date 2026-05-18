@@ -229,19 +229,29 @@ def visual_dt_generalization_test(
         # Lazy import to keep the existing back-compat path free of new deps.
         from src.eval.eval_dataset_io import load_band_dt_npz
         if band_label is None:
-            # No band stratification: use a flat directory layout. To keep
-            # things simple, we still require a band sub-folder so the
-            # dataset structure is uniform; an "all" band can be added later.
             raise ValueError(
                 "eval_dataset_dir requires band_label (one of 'low', 'med', 'high'). "
-                "Pass band_label='all' to use a single un-stratified sub-folder."
+                "Pass band_label='all' to load the 'med' band sub-directory as "
+                "a pooled un-stratified view (see load_band_dt_npz for the remap)."
             )
 
     for dt in dt_values:
         if use_dataset:
             loaded = load_band_dt_npz(eval_dataset_dir, band=band_label, dt=float(dt))
-            images_batch = torch.from_numpy(loaded["images"]).to(device)
-            actions_batch = torch.from_numpy(loaded["actions"]).to(device)
+            # Sanity-check that the dataset's batch size matches what the caller
+            # asked for. Slice down rather than crash; if the dataset has FEWER
+            # sequences than n_seqs the downstream metrics will be silently
+            # weaker — flag that loudly.
+            n_loaded = loaded["images"].shape[0]
+            if n_loaded < n_seqs:
+                raise ValueError(
+                    f"Eval dataset at {eval_dataset_dir} has only {n_loaded} "
+                    f"sequences in band={band_label} dt={dt}, but n_seqs={n_seqs} "
+                    f"was requested. Regenerate the dataset with eval_dataset.n_seqs"
+                    f"={n_seqs} or pass eval.n_rollouts={n_loaded}."
+                )
+            images_batch = torch.from_numpy(loaded["images"][:n_seqs]).to(device)
+            actions_batch = torch.from_numpy(loaded["actions"][:n_seqs]).to(device)
         else:
             all_images = []
             all_actions = []

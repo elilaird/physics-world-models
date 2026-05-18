@@ -18,5 +18,8 @@ defaults:
 eval_dataset:
   output_dir: null      # if null, derived from dataset name + params
   n_seqs: 16            # canonical sequences per band
-  ref_seq_len: ${eval.dt_seq_len}   # reference action length at training dt
+  # reference action length at training dt; eval.dt_seq_len defaults to null
+  # so we fall back to a concrete value here rather than letting int(None) crash.
+  # Override on CLI with eval_dataset.ref_seq_len=<N>.
+  ref_seq_len: 20
   seed: ${eval.eval_dataset_seed}   # content-addressed per seed for replicates
