@@ -78,7 +78,7 @@ def deterministic_seed(
         non-negative int in [0, 2**31).
     """
     payload = f"{int(base_seed)}|{band}|{int(seq_index)}|{kind}"
-    digest = hashlib.md5(payload.encode()).digest()
+    digest = hashlib.md5(payload.encode(), usedforsecurity=False).digest()
     return int.from_bytes(digest[:4], "big") & 0x7FFF_FFFF
 
 
