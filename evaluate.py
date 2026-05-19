@@ -34,7 +34,175 @@ from src.eval.curves_logger import EvalCurvesLogger
 from src.eval.plots import make_latent_error_plot, make_dt_latent_error_plot
 from src.data.precomputed import PrecomputedDataset
 
+# HGN baseline lives in a parallel pipeline (src/models/hgn.py, train_hgn.py).
+# Detect HGN checkpoints at load time and route through the HGN-specific rollout.
+# Only basic open-loop rollout + pixel/latent metrics are produced for HGN; the
+# dt-gen / energy-stratified / fixed-init blocks below are guarded and skipped
+# for HGN because they internally call visual_open_loop_rollout which assumes
+# the VisualWorldModel encoder API.
+from src.models.hgn import HGNModel
+from src.eval.hgn_rollout import hgn_open_loop_rollout
+
 log = logging.getLogger(__name__)
+
+
+def _run_hgn_basic_eval(model, images, actions, output_dir, cfg, train_cfg, ckpt, n_rollouts):
+    """Minimal eval for HGN checkpoints — pixel/latent metrics + per-step plot.
+
+    Skips the dt-generalization, energy-stratified, fixed-init, and rollout-grid
+    blocks that the main script runs for VisualWorldModel checkpoints. Those
+    blocks call visual_open_loop_rollout internally on (model, images, actions)
+    triplets and assume the per-frame encoder + ctx_len latent-context-window
+    layout that HGN doesn't share. Out of scope for this branch.
+    """
+    B, N, C, H, W = images.shape
+    T_ctx = model.infer_context_length
+
+    log.info(
+        f"HGN basic eval: {n_rollouts} sequences, T_ctx={T_ctx}, horizon={N - T_ctx}"
+    )
+
+    result = hgn_open_loop_rollout(model, images, actions)
+    pred_latents = result["pred_latents"]   # (B, horizon, D)
+    true_latents = result["true_latents"]   # (B, N - T_ctx + 1, D)
+    pred_images = result["pred_images"]     # (B, horizon, C, H, W)
+    horizon = pred_latents.shape[1]
+
+    # HGN alignment: pred_latents starts at frame index T_ctx (one step beyond q_0).
+    # true_latents starts at frame T_ctx-1 (the q_0 frame), so the gt for predictions
+    # is true_latents[:, 1:].
+    gt_latents = true_latents[:, 1:]                       # (B, horizon, D)
+    gt_images = images[:, T_ctx:]                          # (B, horizon, C, H, W)
+
+    # Latent MSE
+    latent_mse_per_step = ((pred_latents - gt_latents) ** 2).flatten(2).mean(dim=(0, 2))
+    latent_mse = latent_mse_per_step.mean().item()
+    log.info(f"Latent MSE (mean): {latent_mse:.6f}")
+
+    # Per-step latent divergence + persistence baseline.
+    # z_context_last is the q at the last context frame — which is true_latents[:, 0]
+    # (= q_0 from f_psi). Use it as the persistence baseline.
+    z_context_last = true_latents[:, 0]
+    fixed_dt_curves = compute_latent_divergence_metrics(
+        pred_latents, gt_latents, z_context_last
+    )
+    D = pred_latents.shape[-1]
+    if D % 2 == 0:
+        fixed_dt_curves.update(
+            compute_qp_divergence_metrics(pred_latents, gt_latents, z_context_last)
+        )
+    fixed_dt_curves = {k: v.detach().cpu() for k, v in fixed_dt_curves.items()}
+
+    # Visual metrics
+    log.info("Computing visual metrics (MAE, PSNR, SSIM, LPIPS)...")
+    vis_metrics = compute_visual_metrics(pred_images, gt_images)
+    log.info(f"MAE:   {vis_metrics['mae']:.4f}")
+    log.info(f"PSNR:  {vis_metrics['psnr']:.2f} dB")
+    log.info(f"SSIM:  {vis_metrics['ssim']:.4f}")
+    log.info(f"LPIPS: {vis_metrics['lpips']:.4f}")
+
+    # Per-step metrics plot
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    steps = range(1, horizon + 1)
+    for ax, key, label in zip(
+        axes.flat,
+        ["mae_per_step", "psnr_per_step", "ssim_per_step", "lpips_per_step"],
+        ["MAE", "PSNR (dB)", "SSIM", "LPIPS"],
+    ):
+        ax.plot(steps, vis_metrics[key], linewidth=2)
+        ax.set_xlabel("Prediction step")
+        ax.set_ylabel(label)
+        ax.set_title(label)
+        ax.grid(True, alpha=0.3)
+    fig.suptitle(f"{train_cfg.model.name} (HGN) — Open-Loop Metrics")
+    plt.tight_layout()
+    metrics_path = os.path.join(output_dir, "visual_metrics.png")
+    plt.savefig(metrics_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    log.info(f"Saved: {metrics_path}")
+
+    # Latent error figure (fixed-dt only — no dt-gen for HGN in this PR).
+    fixed_horizon = fixed_dt_curves["latent_mse"].shape[1]
+    training_dt = train_cfg.dataset.get("dt", train_cfg.model.observation_dt)
+    latent_error_path = os.path.join(output_dir, "latent_error_curve.png")
+    latent_error_img = make_latent_error_plot(
+        fixed_dt_curves,
+        epoch=ckpt["epoch"],
+        horizon=fixed_horizon,
+        dt=training_dt,
+        title_prefix="HGN test latent divergence",
+        output_path=latent_error_path,
+    )
+    log.info(f"Saved: {latent_error_path}")
+
+    # Save eval_metrics.pt
+    all_metrics = {
+        "model": train_cfg.model.name,
+        "predictor": train_cfg.model.name,  # HGN has no separate predictor cfg
+        "env": train_cfg.env.name,
+        "context_length": T_ctx,
+        "horizon": horizon,
+        "n_rollouts": n_rollouts,
+        "latent_mse": latent_mse,
+        "latent_mse_per_step": latent_mse_per_step.cpu().numpy().tolist(),
+        **vis_metrics,
+    }
+    metrics_pt_path = os.path.join(output_dir, "eval_metrics.pt")
+    torch.save(all_metrics, metrics_pt_path)
+    log.info(f"Metrics saved to: {metrics_pt_path}")
+
+    # Save eval_curves.pt (fixed_dt only — no per_dt, no per_band, no fixed_init).
+    if cfg.eval.get("save_curves", True):
+        curves_path = os.path.join(output_dir, cfg.eval.get("curves_filename", "eval_curves.pt"))
+        curves_logger = EvalCurvesLogger(
+            path=curves_path,
+            predictor=train_cfg.model.name,  # HGN uses model.name in place of predictor.name
+            env=train_cfg.env.name,
+            training_dt=training_dt,
+            horizon=horizon,
+            ctx_len=T_ctx,
+            n_seqs=n_rollouts,
+            dt_values=[training_dt],  # single dt; no dt-gen for HGN
+            latent_dim=train_cfg.model.latent_channels,
+            eval_dataset_dir=cfg.eval.get("eval_dataset_dir", None),
+        )
+        curves_logger.set_test_final(fixed_dt=fixed_dt_curves, per_dt={})
+        log.info(f"Saved eval_curves.pt to: {curves_path}")
+
+    # Optional wandb logging — minimal HGN payload.
+    if cfg.wandb.enabled:
+        import wandb as wandb_mod
+        slurm_id = os.environ.get("SLURM_JOB_ID", "")
+        run_name = f"eval_{train_cfg.env.name}_hgn"
+        if slurm_id:
+            run_name = f"{run_name}_{slurm_id}"
+        wandb_config = OmegaConf.to_container(train_cfg, resolve=True)
+        wandb_config["eval_overrides"] = {
+            "checkpoint":    cfg.checkpoint,
+            "ckpt_epoch":    ckpt["epoch"],
+            "n_rollouts":    n_rollouts,
+            "is_hgn":        True,
+            "eval_dataset_dir": cfg.eval.get("eval_dataset_dir", None),
+        }
+        wandb_mod.init(
+            project=cfg.wandb.project,
+            config=wandb_config,
+            name=run_name,
+        )
+        wandb_log = {
+            "eval/latent_mse": latent_mse,
+            "eval/mae":   vis_metrics["mae"],
+            "eval/psnr":  vis_metrics["psnr"],
+            "eval/ssim":  vis_metrics["ssim"],
+            "eval/lpips": vis_metrics["lpips"],
+            "eval/metrics_plot": wandb_mod.Image(metrics_path),
+            "eval/latent_error_curve": latent_error_img,
+        }
+        for k, v in fixed_dt_curves.items():
+            wandb_log[f"eval/{k}_mean"] = float(v.mean().item())
+        wandb_mod.log(wandb_log)
+        wandb_mod.finish()
+        log.info("Logged results to wandb")
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
@@ -49,6 +217,16 @@ def main(cfg: DictConfig):
     model = rebuild_model(train_cfg)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
+
+    # Dispatch: HGN checkpoints route through hgn_open_loop_rollout. The
+    # advanced blocks (dt-gen, energy-stratified, fixed-init, rollout grid)
+    # are skipped for HGN — see the matching `if is_hgn:` guards below.
+    is_hgn = isinstance(model, HGNModel)
+    open_loop_rollout_fn = hgn_open_loop_rollout if is_hgn else visual_open_loop_rollout
+    if is_hgn:
+        log.info("HGN checkpoint detected — routing through hgn_open_loop_rollout. "
+                 "dt-generalization, energy-stratified, fixed-init, and rollout-grid "
+                 "blocks are skipped for HGN in this script (out of scope).")
 
     # Disable autograd globally for the eval script. The rollout helpers
     # (visual_open_loop_rollout, visual_dt_generalization_test) already use
@@ -113,8 +291,27 @@ def main(cfg: DictConfig):
     log.info(f"Running visual open-loop rollout: {n_rollouts} sequences, "
              f"context={ctx_len}, horizon={horizon}")
 
-    # Run rollout
-    result = visual_open_loop_rollout(model, images, actions)
+    # HGN gets a dedicated minimal-eval path (pixel + latent metrics + per-step
+    # plot + eval_metrics.pt + eval_curves.pt fixed_dt). The dt-generalization,
+    # energy-stratified, fixed-init, and rollout-grid blocks below assume the
+    # VisualWorldModel encoder API (sliding-window K=1 single-frame encoding +
+    # ctx_len-frame context window inside the latent sequence) and are out of
+    # scope for this PR. See spec for the trade-off rationale.
+    if is_hgn:
+        _run_hgn_basic_eval(
+            model=model,
+            images=images,
+            actions=actions,
+            output_dir=output_dir,
+            cfg=cfg,
+            train_cfg=train_cfg,
+            ckpt=ckpt,
+            n_rollouts=n_rollouts,
+        )
+        return
+
+    # Run rollout (visual_open_loop_rollout for VisualWorldModel).
+    result = open_loop_rollout_fn(model, images, actions)
     pred_latents = result["pred_latents"]  # (B, horizon, D)
     true_latents = result["true_latents"]  # (B, N_latents, D)
     pred_images = result["pred_images"]    # (B, horizon, C, H, W)
