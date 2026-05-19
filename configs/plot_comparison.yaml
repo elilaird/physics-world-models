@@ -35,8 +35,9 @@ fontsize: 11
 # Color per predictor name. The plot script will fall back to a default
 # palette if a predictor isn't listed here.
 predictor_colors:
-  mlp:                "#1f77b4"
-  lstm:               "#ff7f0e"
-  hamiltonian:        "#2ca02c"
-  latent_neural_ode:  "#d62728"
-  latent_hamiltonian: "#9467bd"
+  mlp:                            "#1f77b4"
+  lstm:                           "#ff7f0e"
+  hamiltonian:                    "#2ca02c"
+  latent_neural_ode:              "#d62728"
+  latent_hamiltonian:             "#9467bd"
+  latent_hamiltonian_transformer: "#8c564b"
