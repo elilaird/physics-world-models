@@ -910,7 +910,7 @@ class TransformerLatentHamiltonianPredictor(BasePredictor):
         self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
 
         # Transformer SID backbone — replaces LatentHamiltonianPredictor's GRU.
-        self.sid = SIDTransformer(
+        self.sid_transformer = SIDTransformer(
             q_dim=latent_dim,
             act_emb_dim=action_embedding_dim,
             d_model=sid_d_model,
@@ -990,15 +990,29 @@ class TransformerLatentHamiltonianPredictor(BasePredictor):
         velocities = (context[:, 1:] - context[:, :-1]) / dt_eff  # (B, T-1, D)
         q_seq = context[:, :-1]                                    # (B, T-1, D)
 
+        # Defensive pad/trim of context_actions to length T-1 — mirrors
+        # LatentHamiltonianPredictor.infer() so the two predictors are
+        # drop-in interchangeable for callers that pass slightly mis-shaped
+        # action tensors.
         if context_actions is None:
+            # Preserve the original transformer convention: a float zero
+            # tensor (no learned embedding lookup for the None case).
             act_emb_seq = torch.zeros(
                 B, T - 1, self.act_emb.embedding_dim,
                 device=context.device, dtype=context.dtype,
             )
         else:
-            act_emb_seq = self.act_emb(context_actions)  # (B, T-1, act_emb_dim)
+            n_acts = context_actions.shape[1]
+            if n_acts < T - 1:
+                pad = torch.zeros(
+                    B, T - 1 - n_acts, dtype=torch.long, device=context.device
+                )
+                ctx_acts = torch.cat([context_actions, pad], dim=1)
+            else:
+                ctx_acts = context_actions[:, : T - 1]
+            act_emb_seq = self.act_emb(ctx_acts)  # (B, T-1, act_emb_dim)
 
-        theta, p_0 = self.sid(q_seq, velocities, act_emb_seq)
+        theta, p_0 = self.sid_transformer(q_seq, velocities, act_emb_seq)
 
         return {
             "z": context[:, -1],
