@@ -1,0 +1,33 @@
+# Latent-Hamiltonian with a TRANSFORMER-backbone system-identification branch.
+# Architecturally identical to latent_hamiltonian below the SID layer (same
+# Hamilton's equations, same H_net, same damping_net, same G_net), but the
+# GRU is replaced with a small causal transformer that infers theta and p_0
+# via two learned [CLS] query tokens appended at the end of the context.
+#
+# Use as a drop-in for ablation studies:
+#   python train_visual.py predictor=latent_hamiltonian_transformer
+
+_target_: src.models.predictors.TransformerLatentHamiltonianPredictor
+name: latent_hamiltonian_transformer
+
+# --- Shared with latent_hamiltonian (identical defaults + interpolations) ---
+latent_dim: ${model.latent_channels}
+action_dim: ${env.action_dim}
+action_embedding_dim: ${model.action_embedding_dim}
+hidden_dim: 256
+theta_dim: 8
+dt: ${dataset.dt}
+# Integrator: euler (semi-implicit, 1st-order, 2 H-evals/step) or
+# implicit_midpoint (2nd-order, symplectic in conservative limit, ~midpoint_iters
+# H-evals/step). Implicit midpoint is the textbook choice for non-separable
+# port-Hamiltonian systems with dissipation.
+integrator: implicit_midpoint
+midpoint_iters: 4
+
+# --- Transformer SID branch (new; replaces gru_hidden from latent_hamiltonian) ---
+sid_d_model: 128         # transformer hidden dim
+sid_n_layers: 2
+sid_n_heads: 4
+sid_dim_feedforward: 256
+sid_max_context_len: 32  # upper bound on T_trans for positional embeddings
+sid_dropout: 0.0
