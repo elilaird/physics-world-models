@@ -414,7 +414,17 @@ class HGNModel(nn.Module):
 
 
 def compute_elbo_loss(model_out, recon_target, beta_kl=1.0):
-    """ELBO loss: (1/T_total) * sum_t MSE(d_theta(q_t), x_t) + beta_kl * KL.
+    """ELBO loss (paper-faithful magnitude): -E_q[log p(x|q)] + beta_kl * KL.
+
+    Per-frame log-likelihood under a unit-variance Gaussian:
+        log p(x_t | q_t) = -0.5 * sum_pixels (x_t - x_hat_t)^2 + const.
+    The paper's objective (Eq. 4) is (1/(T+1)) sum_t [E_q log p(x_t|q_t)] - KL.
+    We negate to get a loss to minimize:
+        loss = (1/(T+1)) sum_t [ 0.5 * sum_pixels (x_t - x_hat_t)^2 ] + beta_kl * KL
+    Implementation: sum MSE over the pixel axes (C, H, W) per frame, then mean
+    over batch AND time (the (1/(T+1)) factor is folded into the over-time
+    mean). beta_kl is left as a knob for the original 1.0 (faithful ELBO) and
+    for beta-VAE-style sweeps; the paper uses beta_kl=1.
 
     Args:
         model_out:    dict from HGNModel.forward — contains mu_z, logvar_z,
@@ -437,8 +447,9 @@ def compute_elbo_loss(model_out, recon_target, beta_kl=1.0):
             f"recon_target {tuple(recon_target.shape)}. Caller must align."
         )
 
-    # Per-frame mean MSE, averaged over frames.
-    recon = ((pred_images - recon_target) ** 2).mean()
+    # Negative log-likelihood under unit-variance Gaussian: 0.5 * sum_pixels(MSE).
+    # Mean over batch and time matches the paper's (1/(T+1)) per-frame average.
+    recon = 0.5 * ((pred_images - recon_target) ** 2).sum(dim=(-3, -2, -1)).mean()
 
     # Closed-form Gaussian KL vs N(0, I), summed over latent dim, mean over batch.
     kl = 0.5 * (mu_z.pow(2) + logvar_z.exp() - 1 - logvar_z).sum(dim=-1).mean()
