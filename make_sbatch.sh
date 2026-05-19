@@ -6,7 +6,7 @@
 DATETIME=$(date +"%Y%m%d_%H%M%S")
 
 PARTITION=${PARTITION:-batch}
-TYPE=${TYPE:-train} # jupyter, eval, plot, test, train, train_vector, generate_dataset, generate_eval_dataset
+TYPE=${TYPE:-train} # jupyter, eval, plot, test, train, train_hgn, train_vector, generate_dataset, generate_eval_dataset
 
 # Per-TYPE default TIME (eval/plot/jupyter are short-running; train is multi-day).
 # Explicit TIME=... env var still wins.
@@ -46,6 +46,8 @@ if [ "${TYPE}" = "jupyter" ]; then
     COMMAND="jupyter notebook --ip=0.0.0.0 --port=8888 --no-browser --allow-root"
 elif [ "${TYPE}" = "train" ]; then
     COMMAND="HYDRA_FULL_ERROR=1 python train_visual.py ${PY_ARGS}"
+elif [ "${TYPE}" = "train_hgn" ]; then
+    COMMAND="HYDRA_FULL_ERROR=1 python train_hgn.py ${PY_ARGS}"
 elif [ "${TYPE}" = "train_vector" ]; then
     COMMAND="HYDRA_FULL_ERROR=1 python train.py ${PY_ARGS}"
 elif [ "${TYPE}" = "generate_dataset" ]; then
