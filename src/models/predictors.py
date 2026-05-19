@@ -859,3 +859,233 @@ class SIDTransformer(nn.Module):
         theta = self.theta_head(theta_repr)
         p_0 = self.p_head(p_repr)
         return theta, p_0
+
+
+@register_predictor("latent_hamiltonian_transformer")
+class TransformerLatentHamiltonianPredictor(BasePredictor):
+    """Latent-Hamiltonian with a transformer-backbone system-identification branch.
+
+    Architecturally identical to LatentHamiltonianPredictor below the SID
+    layer (same Hamilton's equations, same H_net, same damping_net, same
+    G_net, same q/p split convention, same static-theta discipline). The
+    only difference: the GRU in infer() is replaced by a small causal
+    transformer (see SIDTransformer) with two learned CLS query tokens
+    that infer theta and p_0 from the context window.
+
+    Dynamics (semi-implicit Euler on full phase space):
+        p_{t+1} = p_t + dt * (-dH/dq(q_t, p_t, theta) - gamma(theta)*dH/dp + G(a_t, theta))
+        q_{t+1} = q_t + dt * dH/dp(q_t, p_{t+1}, theta)
+
+    Theta is STATIC over the unroll. State dict carries z, q, p, theta.
+    """
+
+    def __init__(
+        self,
+        latent_dim=64,
+        action_dim=3,
+        action_embedding_dim=8,
+        hidden_dim=256,
+        theta_dim=8,
+        dt=0.4,
+        integrator="implicit_midpoint",
+        midpoint_iters=4,
+        sid_d_model=128,
+        sid_n_layers=2,
+        sid_n_heads=4,
+        sid_dim_feedforward=256,
+        sid_max_context_len=32,
+        sid_dropout=0.0,
+        name="latent_hamiltonian_transformer",
+        **kwargs,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.q_dim = latent_dim
+        self.p_dim = latent_dim
+        self.theta_dim = theta_dim
+        self.dt = dt
+        self.integrator = integrator
+        self.midpoint_iters = midpoint_iters
+
+        self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
+
+        # Transformer SID backbone — replaces LatentHamiltonianPredictor's GRU.
+        self.sid = SIDTransformer(
+            q_dim=latent_dim,
+            act_emb_dim=action_embedding_dim,
+            d_model=sid_d_model,
+            n_layers=sid_n_layers,
+            n_heads=sid_n_heads,
+            dim_feedforward=sid_dim_feedforward,
+            max_context_len=sid_max_context_len,
+            theta_dim=theta_dim,
+            dropout=sid_dropout,
+        )
+
+        # H(q, p, theta): scalar energy over full phase space + system ID
+        self.H_net = nn.Sequential(
+            nn.Linear(2 * latent_dim + theta_dim, hidden_dim),
+            nn.Softplus(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Softplus(),
+            nn.Linear(hidden_dim, 1),
+        )
+        # Per-trajectory scalar damping gamma(theta) >= 0
+        self.damping_net = nn.Linear(theta_dim, 1)
+        # Per-trajectory action force G(a, theta) on momentum — full D dims
+        self.G_net = nn.Sequential(
+            nn.Linear(action_embedding_dim + theta_dim, hidden_dim // 2),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim // 2, latent_dim),
+        )
+
+    def energy(self, z, state=None):
+        """Scalar energy H(q, p, theta).
+
+        Mirrors LatentHamiltonianPredictor.energy: z is position-only from
+        the encoder. If state contains 'p', uses it; otherwise approximates
+        p=0 (energy at zero momentum).
+        """
+        if state is None or "theta" not in state:
+            raise ValueError(
+                "TransformerLatentHamiltonianPredictor.energy requires "
+                "state['theta'] from a prior infer() call."
+            )
+        theta = state["theta"]
+        p = state.get("p", None)
+
+        if z.ndim == 3:
+            B, T, D = z.shape
+            theta_bc = theta.unsqueeze(1).expand(-1, T, -1)
+            if p is not None and p.ndim == 2:
+                p_bc = p.unsqueeze(1).expand(-1, T, -1)
+            elif p is not None:
+                p_bc = p
+            else:
+                p_bc = torch.zeros_like(z)
+            phase = torch.cat([z, p_bc], dim=-1)
+            inp = torch.cat([phase, theta_bc], dim=-1)
+            return self.H_net(inp.reshape(B * T, -1)).reshape(B, T, 1)
+        else:
+            if p is None:
+                p = torch.zeros_like(z)
+            phase = torch.cat([z, p], dim=-1)
+            inp = torch.cat([phase, theta], dim=-1)
+            return self.H_net(inp)
+
+    def infer(self, context, context_actions=None, dt=None):
+        """Infer (theta, p_0) from the context window via the transformer.
+
+        Args:
+            context:         (B, T, D) sequence of position-only latents.
+            context_actions: (B, T-1) long tensor of discrete actions; or None.
+            dt:              optional float; defaults to self.dt.
+
+        Returns:
+            state dict with keys: z (B, D), q (B, D), p (B, D), theta (B, theta_dim).
+        """
+        B, T, D = context.shape
+        dt_eff = dt if dt is not None else self.dt
+
+        velocities = (context[:, 1:] - context[:, :-1]) / dt_eff  # (B, T-1, D)
+        q_seq = context[:, :-1]                                    # (B, T-1, D)
+
+        if context_actions is None:
+            act_emb_seq = torch.zeros(
+                B, T - 1, self.act_emb.embedding_dim,
+                device=context.device, dtype=context.dtype,
+            )
+        else:
+            act_emb_seq = self.act_emb(context_actions)  # (B, T-1, act_emb_dim)
+
+        theta, p_0 = self.sid(q_seq, velocities, act_emb_seq)
+
+        return {
+            "z": context[:, -1],
+            "q": context[:, -1],
+            "p": p_0,
+            "theta": theta,
+        }
+
+    @torch.enable_grad()
+    def step(self, state, action, dt=None):
+        if self.integrator == "implicit_midpoint":
+            return self._step_implicit_midpoint(state, action, dt)
+        return self._step_semi_implicit_euler(state, action, dt)
+
+    def _step_semi_implicit_euler(self, state, action, dt=None):
+        """Semi-implicit Euler on full port-Hamiltonian system with theta."""
+        q = _require_grad(state["q"])
+        p = _require_grad(state["p"])
+        theta = state["theta"]
+        dt_eff = dt if dt is not None else self.dt
+
+        damping = F.softplus(self.damping_net(theta))  # (B, 1)
+
+        act_emb = self.act_emb(action)
+        ag_input = torch.cat([act_emb, theta], dim=-1)
+        G_u = self.G_net(ag_input)
+
+        # First autograd pass: dH/d(q, p) at (q, p, theta)
+        phase = torch.cat([q, p], dim=-1)
+        inp = torch.cat([phase, theta], dim=-1)
+        H = self.H_net(inp).sum()
+        dH_dphase = torch.autograd.grad(H, phase, create_graph=self.training)[0]
+        dH_dq = dH_dphase[:, : self.q_dim]
+        dH_dp = dH_dphase[:, self.q_dim :]
+
+        p_new = p + dt_eff * (-dH_dq - damping * dH_dp + G_u)
+
+        # Second autograd pass: dH/dp at (q, p_new, theta)
+        phase_mid = torch.cat([q, p_new], dim=-1)
+        inp_mid = torch.cat([phase_mid, theta], dim=-1)
+        H_mid = self.H_net(inp_mid).sum()
+        dH_dphase_mid = torch.autograd.grad(H_mid, phase_mid, create_graph=self.training)[0]
+        dH_dp_new = dH_dphase_mid[:, self.q_dim :]
+
+        q_new = q + dt_eff * dH_dp_new
+
+        new_state = {
+            "z": q_new,
+            "q": q_new,
+            "p": p_new,
+            "theta": theta,
+        }
+        return new_state, q_new
+
+    def _step_implicit_midpoint(self, state, action, dt=None):
+        """Implicit midpoint iteration on the full port-Hamiltonian system."""
+        q_n = _require_grad(state["q"])
+        p_n = _require_grad(state["p"])
+        theta = state["theta"]
+        dt_eff = dt if dt is not None else self.dt
+
+        damping = F.softplus(self.damping_net(theta))
+        act_emb = self.act_emb(action)
+        ag_input = torch.cat([act_emb, theta], dim=-1)
+        G_u = self.G_net(ag_input)
+
+        q_new = q_n
+        p_new = p_n
+
+        for _ in range(self.midpoint_iters):
+            q_mid = (q_n + q_new) / 2
+            p_mid = (p_n + p_new) / 2
+
+            phase_mid = torch.cat([q_mid, p_mid], dim=-1)
+            inp_mid = torch.cat([phase_mid, theta], dim=-1)
+            H = self.H_net(inp_mid).sum()
+            dH = torch.autograd.grad(H, phase_mid, create_graph=self.training)[0]
+            dH_dq = dH[:, : self.q_dim]
+            dH_dp = dH[:, self.q_dim :]
+
+            q_new = q_n + dt_eff * dH_dp
+            p_new = p_n + dt_eff * (-dH_dq - damping * dH_dp + G_u)
+
+        new_state = {
+            "z": q_new,
+            "q": q_new,
+            "p": p_new,
+            "theta": theta,
+        }
+        return new_state, q_new
