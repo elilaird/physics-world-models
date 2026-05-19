@@ -255,3 +255,194 @@ class ImplicitMidpointIntegrator(nn.Module):
             p_new = p_n + dt * (-dV_dq - gamma * dT_dp + force)
 
         return q_new, p_new
+
+
+class HGNModel(nn.Module):
+    """Faithful HGN model with port-Hamiltonian extensions for forced+damped envs.
+
+    Components:
+        encoder    : HGNEncoder      — sequence ConvNet over T_ctx frames.
+        f_psi      : FPsi            — z -> (q_0, p_0).
+        T_net,V_net: separable H     — H(q, p) = T(p) + V(q).
+        G_net      : GNet            — action -> momentum force.
+        act_emb    : nn.Embedding    — discrete action -> embedding.
+        log_damping: nn.Parameter    — global learned scalar; gamma = softplus(.).
+        integrator : leapfrog OR implicit_midpoint per config.
+        decoder    : VisionDecoder   — reused from visual.py, takes q only.
+
+    Exposes:
+        forward(images_ctx, actions, horizon) -> dict with mu_z, logvar_z,
+            z_sample, pred_q (B, horizon+1, D), pred_p (B, horizon+1, D),
+            pred_images (B, horizon+1, C, H, W).
+
+    The +1 in horizon+1 is the decoded q_0 frame (the frame the encoder
+    saw at the END of the context window) — included per HGN's per-timestep
+    reconstruction sum.
+    """
+
+    def __init__(
+        self,
+        channels=3,
+        latent_channels=64,
+        hidden_channels=512,
+        hidden_dim=256,
+        action_dim=3,
+        action_embedding_dim=8,
+        infer_context_length=8,
+        integrator="leapfrog",
+        midpoint_iters=4,
+        dt=0.4,
+        damping_init=-1.0,
+        name="hgn",
+        **kwargs,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.latent_channels = latent_channels
+        self.hidden_channels = hidden_channels
+        self.hidden_dim = hidden_dim
+        self.action_dim = action_dim
+        self.action_embedding_dim = action_embedding_dim
+        self.infer_context_length = infer_context_length
+        self.dt = dt
+        self.observation_dt = dt  # mirror VisualWorldModel attribute for eval reuse
+
+        self.encoder = HGNEncoder(
+            channels=channels,
+            latent_channels=latent_channels,
+            t_ctx=infer_context_length,
+            hidden_channels=hidden_channels,
+        )
+        self.f_psi = FPsi(
+            latent_channels=latent_channels,
+            hidden_channels=hidden_channels,
+        )
+        self.T_net = TNet(latent_channels=latent_channels, hidden_dim=hidden_dim)
+        self.V_net = VNet(latent_channels=latent_channels, hidden_dim=hidden_dim)
+        self.G_net = GNet(
+            action_embedding_dim=action_embedding_dim,
+            latent_channels=latent_channels,
+        )
+        self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
+        self.log_damping = nn.Parameter(torch.tensor(damping_init))
+
+        self.decoder = VisionDecoder(
+            channels=channels,
+            latent_channels=latent_channels,
+            hidden_channels=hidden_channels,
+        )
+
+        if integrator == "leapfrog":
+            self.integrator = LeapfrogIntegrator()
+        elif integrator == "implicit_midpoint":
+            self.integrator = ImplicitMidpointIntegrator(n_iters=midpoint_iters)
+        else:
+            raise ValueError(f"Unknown integrator: {integrator!r}")
+        self.integrator_name = integrator
+
+    def encode_context(self, images_ctx):
+        """images_ctx: (B, T_ctx, C, H, W). Returns (mu_z, logvar_z)."""
+        B, T_ctx, C, H, W = images_ctx.shape
+        if T_ctx != self.infer_context_length:
+            raise ValueError(
+                f"Expected T_ctx={self.infer_context_length}, got {T_ctx}. "
+                f"HGN encoder is sized for fixed context length."
+            )
+        x = images_ctx.reshape(B, T_ctx * C, H, W)
+        return self.encoder(x)
+
+    def reparameterize(self, mu_z, logvar_z):
+        """Sample z = mu + sigma * eps via reparameterization."""
+        std = (0.5 * logvar_z).exp()
+        eps = torch.randn_like(std)
+        return mu_z + std * eps
+
+    def decode(self, q):
+        """q: (B, D) or (B*T, D). Returns decoded images."""
+        return self.decoder(q)
+
+    @torch.enable_grad()
+    def integrate(self, q_0, p_0, actions, horizon):
+        """Roll out the integrator for `horizon` steps from (q_0, p_0).
+
+        Returns q_seq (B, horizon+1, D) and p_seq (B, horizon+1, D),
+        including q_0/p_0 as the first entry.
+        """
+        B, D = q_0.shape
+        q_seq = [q_0]
+        p_seq = [p_0]
+        q, p = q_0, p_0
+        for t in range(horizon):
+            a_t = actions[:, t]
+            force = self.G_net(self.act_emb(a_t))
+            q, p = self.integrator.step(
+                q, p, force, self.log_damping, self.T_net, self.V_net, dt=self.dt,
+            )
+            q_seq.append(q)
+            p_seq.append(p)
+        return torch.stack(q_seq, dim=1), torch.stack(p_seq, dim=1)
+
+    def forward(self, images_ctx, actions, horizon):
+        """Full forward pass.
+
+        Args:
+            images_ctx: (B, T_ctx, C, H, W) — context frames.
+            actions:    (B, horizon)        — actions driving each rollout step.
+            horizon:    int                 — number of integration steps.
+
+        Returns dict with mu_z, logvar_z, z_sample, pred_q, pred_p, pred_images.
+        """
+        mu_z, logvar_z = self.encode_context(images_ctx)
+        z_sample = self.reparameterize(mu_z, logvar_z)
+        q_0, p_0 = self.f_psi(z_sample)
+        q_seq, p_seq = self.integrate(q_0, p_0, actions, horizon)
+
+        B, Tp1, D = q_seq.shape
+        flat_q = q_seq.reshape(B * Tp1, D)
+        decoded = self.decoder(flat_q)
+        C, H, W = decoded.shape[1:]
+        pred_images = decoded.reshape(B, Tp1, C, H, W)
+
+        return {
+            "mu_z":        mu_z,
+            "logvar_z":    logvar_z,
+            "z_sample":    z_sample,
+            "pred_q":      q_seq,
+            "pred_p":      p_seq,
+            "pred_images": pred_images,
+        }
+
+
+def compute_elbo_loss(model_out, recon_target, beta_kl=1.0):
+    """ELBO loss: (1/T_total) * sum_t MSE(d_theta(q_t), x_t) + beta_kl * KL.
+
+    Args:
+        model_out:    dict from HGNModel.forward — contains mu_z, logvar_z,
+                      pred_images of shape (B, horizon+1, C, H, W).
+        recon_target: (B, horizon+1, C, H, W) — GT frames aligned with
+                      pred_images. Caller is responsible for the alignment
+                      (typically images_full[:, T_ctx-1:]).
+        beta_kl:      KL weight (default 1.0; >1 for beta-VAE-style sweeps).
+
+    Returns:
+        (loss, components) where components dict has 'recon' and 'kl' scalars.
+    """
+    pred_images = model_out["pred_images"]
+    mu_z = model_out["mu_z"]
+    logvar_z = model_out["logvar_z"]
+
+    if pred_images.shape != recon_target.shape:
+        raise ValueError(
+            f"pred_images {tuple(pred_images.shape)} != "
+            f"recon_target {tuple(recon_target.shape)}. Caller must align."
+        )
+
+    # Per-frame mean MSE, averaged over frames.
+    recon = ((pred_images - recon_target) ** 2).mean()
+
+    # Closed-form Gaussian KL vs N(0, I), summed over latent dim, mean over batch.
+    kl = 0.5 * (mu_z.pow(2) + logvar_z.exp() - 1 - logvar_z).sum(dim=-1).mean()
+
+    loss = recon + beta_kl * kl
+    components = {"recon": recon.detach(), "kl": kl.detach()}
+    return loss, components
