@@ -658,6 +658,13 @@ def main(cfg: DictConfig):
             "substeps":      eval_substeps,
             "horizon_override": cfg.eval.get("horizon", None),
             "save_curves":   cfg.eval.get("save_curves", True),
+            # Distinguish paired (canonical eval dataset) from iid runs in
+            # the wandb Config tab. None = runtime-sampled iid; a path = the
+            # specific dataset all rollouts read from. Filter or group by
+            # this in the wandb UI to keep paired and iid comparisons
+            # separate (the metric/image keys are identical for both kinds,
+            # which would otherwise let them overlay silently).
+            "eval_dataset_dir": cfg.eval.get("eval_dataset_dir", None),
         }
         wandb_mod.init(
             project=cfg.wandb.project,
