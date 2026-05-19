@@ -123,7 +123,8 @@ def _run_hgn_basic_eval(model, images, actions, output_dir, cfg, train_cfg, ckpt
 
     # Latent error figure (fixed-dt only — no dt-gen for HGN in this PR).
     fixed_horizon = fixed_dt_curves["latent_mse"].shape[1]
-    training_dt = train_cfg.dataset.get("dt", train_cfg.model.observation_dt)
+    # Direct access; HGN configs don't have model.observation_dt (only model.dt).
+    training_dt = train_cfg.dataset.dt
     latent_error_path = os.path.join(output_dir, "latent_error_curve.png")
     latent_error_img = make_latent_error_plot(
         fixed_dt_curves,

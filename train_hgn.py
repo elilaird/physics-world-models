@@ -124,7 +124,12 @@ def main(cfg: DictConfig):
     dt_values = list(cfg.eval.dt_values)
     dt_seq_len = cfg.eval.get("dt_seq_len", None) or (t_ctx + horizon)
     dt_gen_every = cfg.eval.get("dt_gen_every_n_epochs", 5)
-    training_dt = cfg.dataset.get("dt", cfg.model.observation_dt)
+    # OmegaConf's .get() evaluates the default arg eagerly, so we can't write
+    # `cfg.dataset.get("dt", cfg.model.observation_dt)` — cfg.model has no
+    # observation_dt key in the HGN config (only `dt`), so the default would
+    # raise before .get() ever checks for "dt". Every dataset config sets dt,
+    # so we just access it directly.
+    training_dt = cfg.dataset.dt
 
     # Lazy-init curves logger (need horizon from first rollout).
     save_curves = cfg.eval.get("save_curves", True)
