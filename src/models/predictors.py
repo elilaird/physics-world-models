@@ -752,3 +752,110 @@ class LatentHamiltonianPredictor(BasePredictor):
             p_new = p_n + dt_eff * (-dH_dq - gamma * dH_dp + G_u)
 
         return {"z": q_new, "q": q_new, "p": p_new, "theta": theta}, q_new
+
+
+# ---------------------------------------------------------------------------
+# Transformer-backbone system identification (lh-transformer-sid branch)
+# ---------------------------------------------------------------------------
+
+
+class SIDTransformer(nn.Module):
+    """Small causal transformer for system identification.
+
+    Replaces the GRU in LatentHamiltonianPredictor's infer() branch.
+    Input: per-transition triples (q_t, v_t, act_emb_t) of length T_trans.
+    Output: (theta, p_0) via two learned CLS query tokens appended at the
+    end of the sequence (required for causal attention to see transitions).
+
+    Design discipline:
+    - CLS tokens MUST be at the END for causal masking to let them see all
+      transitions. If a future contributor moves them to the front (matching
+      BERT/ViT convention), the causal mask will make them blind to all
+      transitions and theta/p_0 will collapse to learned biases.
+    - Two distinct learned positional embeddings (cls_pos_emb_theta and
+      cls_pos_emb_p) are required to break permutation symmetry between
+      the two CLS query tokens at initialization.
+    """
+
+    def __init__(
+        self,
+        q_dim: int,
+        act_emb_dim: int,
+        d_model: int = 128,
+        n_layers: int = 2,
+        n_heads: int = 4,
+        dim_feedforward: int = 256,
+        max_context_len: int = 32,
+        theta_dim: int = 8,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.q_dim = q_dim
+        self.theta_dim = theta_dim
+        self.max_context_len = max_context_len
+
+        input_dim = 2 * q_dim + act_emb_dim
+        self.input_proj = nn.Linear(input_dim, d_model)
+
+        self.pos_emb = nn.Parameter(torch.zeros(max_context_len, d_model))
+        nn.init.trunc_normal_(self.pos_emb, std=0.02)
+
+        self.cls_theta = nn.Parameter(torch.zeros(d_model))
+        self.cls_p = nn.Parameter(torch.zeros(d_model))
+        self.cls_pos_emb_theta = nn.Parameter(torch.zeros(d_model))
+        self.cls_pos_emb_p = nn.Parameter(torch.zeros(d_model))
+        nn.init.trunc_normal_(self.cls_theta, std=0.02)
+        nn.init.trunc_normal_(self.cls_p, std=0.02)
+        nn.init.trunc_normal_(self.cls_pos_emb_theta, std=0.02)
+        nn.init.trunc_normal_(self.cls_pos_emb_p, std=0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            norm_first=True,
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        self.theta_head = nn.Linear(d_model, theta_dim)
+        self.p_head = nn.Linear(d_model, q_dim)
+
+    def forward(self, q_seq, velocities, act_emb):
+        """Returns (theta, p_0) of shapes (B, theta_dim), (B, q_dim).
+
+        Args:
+            q_seq:      (B, T_trans, q_dim) — position at transition starts.
+            velocities: (B, T_trans, q_dim) — dt-normalized velocities.
+            act_emb:    (B, T_trans, act_emb_dim) — action embeddings.
+        """
+        B, T_trans, _ = q_seq.shape
+        assert T_trans <= self.max_context_len, (
+            f"T_trans={T_trans} exceeds max_context_len={self.max_context_len}; "
+            f"increase sid_max_context_len in the predictor config."
+        )
+
+        tokens = torch.cat([q_seq, velocities, act_emb], dim=-1)
+        tokens = self.input_proj(tokens)
+        tokens = tokens + self.pos_emb[:T_trans].unsqueeze(0)
+
+        cls_theta = (self.cls_theta + self.cls_pos_emb_theta).unsqueeze(0).unsqueeze(0).expand(B, 1, -1)
+        cls_p = (self.cls_p + self.cls_pos_emb_p).unsqueeze(0).unsqueeze(0).expand(B, 1, -1)
+        seq = torch.cat([tokens, cls_theta, cls_p], dim=1)
+
+        T_full = T_trans + 2
+        causal_mask = torch.triu(
+            torch.ones(T_full, T_full, device=tokens.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        out = self.encoder(seq, mask=causal_mask)
+
+        theta_repr = out[:, T_trans]
+        p_repr = out[:, T_trans + 1]
+
+        theta = self.theta_head(theta_repr)
+        p_0 = self.p_head(p_repr)
+        return theta, p_0
