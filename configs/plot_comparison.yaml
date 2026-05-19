@@ -40,3 +40,4 @@ predictor_colors:
   hamiltonian:        "#2ca02c"
   latent_neural_ode:  "#d62728"
   latent_hamiltonian: "#9467bd"
+  hgn:                "#17becf"
