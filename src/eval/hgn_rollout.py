@@ -101,11 +101,61 @@ def hgn_open_loop_rollout(model, images, actions, dt=None):
     decoded = model.decoder(flat)
     pred_images = decoded.reshape(B, horizon, C, H, W)
 
+    # Also decode q_0 so callers building rollout grids can show every state
+    # (including the initial one at frame index T_ctx-1). q_0 corresponds to
+    # the last context frame.
+    q_0_image = model.decoder(q_0)                         # (B, C, H, W)
+
     return {
-        "pred_latents": pred_latents,
-        "true_latents": true_latents,
-        "pred_images":  pred_images,
+        "pred_latents":  pred_latents,
+        "true_latents":  true_latents,
+        "pred_images":   pred_images,
+        "q_0_latent":    q_0,             # (B, D) — initial state, NOT a prediction
+        "q_0_image":     q_0_image,       # (B, C, H, W) — decoded q_0
     }
+
+
+def _build_hgn_full_rollout_grid(images, q_0_image, pred_images, T_ctx, n_show):
+    """Build a single GT|RECON|ERROR wandb.Image grid showing the full
+    integrated trajectory (q_0 decoded plus all rolled-forward q_t decoded).
+
+    Layout per sample (3 rows):
+        GT:    full sequence (N frames, indices 0..N-1).
+        RECON: [T_ctx-1 blanks] + [decoded q_0] + [horizon decoded predictions]
+               = T_ctx-1 + 1 + horizon = N frames. Decoded q_0 sits at frame
+               index T_ctx-1 (the last context frame, which q_0 represents).
+        ERROR: [T_ctx-1 blanks] + [q_0 vs frame T_ctx-1] + [horizon prediction
+               errors vs frames T_ctx..N-1].
+
+    Args:
+        images:      (B, N, C, H, W) — GT frames.
+        q_0_image:   (B, C, H, W) — decoded q_0.
+        pred_images: (B, horizon, C, H, W) — decoded q_1..q_horizon.
+        T_ctx:       int — context length.
+        n_show:      int — number of sample rows to render.
+
+    Returns:
+        torch.Tensor of shape (C, n_show*3*H, N*W) on CPU, values in [0, 1].
+    """
+    B, N, C, H, W = images.shape
+    horizon = pred_images.shape[1]
+    device = images.device
+    blank = torch.zeros(C, H, W, device=device)
+
+    rows = []
+    for i in range(n_show):
+        gt_row = torch.cat([images[i, t] for t in range(N)], dim=-1)
+        lead_blanks = [blank] * (T_ctx - 1)
+        # Decoded q_0 at slot T_ctx-1, then horizon decoded predictions.
+        recon_seq = [q_0_image[i]] + [pred_images[i, t] for t in range(horizon)]
+        recon_row = torch.cat(lead_blanks + recon_seq, dim=-1)
+        err_seq = (
+            [(q_0_image[i] - images[i, T_ctx - 1]).abs()]
+            + [(pred_images[i, t] - images[i, T_ctx + t]).abs() for t in range(horizon)]
+        )
+        err_row = torch.cat(lead_blanks + err_seq, dim=-1)
+        rows.extend([gt_row, recon_row, err_row])
+    return torch.cat(rows, dim=-2).clamp(0, 1).cpu()
 
 
 @torch.no_grad()
@@ -166,27 +216,19 @@ def compute_hgn_rollout_metrics(model, batch, n_samples=4):
         if D % 2 == 0 else None
     )
 
-    # ---- Build rollout grid ----
-    # Layout per sample: 3 rows.
-    #   GT:    full sequence (N frames, indices 0..N-1).
-    #   PRED:  [T_ctx blanks] + [horizon decoded predictions].
-    #          HGN has no per-frame context recon (encoder is sequence-level),
-    #          so we leave the first T_ctx slots blank.
-    #   ERROR: [T_ctx blanks] + [horizon |pred - gt| frames].
+    # ---- Build rollout grid (paper-faithful: decode every integrated state) ----
+    # HGN's design: encode context, integrate from s_0, decode every q_t.
+    # The grid shows the full decoded trajectory including q_0 (which represents
+    # the last context frame at index T_ctx-1).
     n_show = min(n_samples, B)
-    device = images.device
-    blank = torch.zeros(C, H, W, device=device)
-    rows = []
-    for i in range(n_show):
-        gt_row = torch.cat([images[i, t] for t in range(N)], dim=-1)
-        lead_blanks = [blank] * T_ctx
-        pred_frames = [pred_images[i, t] for t in range(horizon)]
-        pred_row = torch.cat(lead_blanks + pred_frames, dim=-1)
-        err_frames = [(pred_images[i, t] - gt_images[i, t]).abs() for t in range(horizon)]
-        err_row = torch.cat(lead_blanks + err_frames, dim=-1)
-        rows.extend([gt_row, pred_row, err_row])
-    grid = torch.cat(rows, dim=-2).clamp(0, 1).cpu()
-    grid_img = wandb.Image(grid, caption="GT | Pred (rollout) | |Error|")
+    grid = _build_hgn_full_rollout_grid(
+        images=images,
+        q_0_image=result["q_0_image"],
+        pred_images=pred_images,
+        T_ctx=T_ctx,
+        n_show=n_show,
+    )
+    grid_img = wandb.Image(grid, caption="GT | Recon (decoded q_0..q_horizon) | |Error|")
 
     return {
         "latent_mse":     latent_mse,
@@ -205,66 +247,40 @@ def compute_hgn_rollout_metrics(model, batch, n_samples=4):
 
 @torch.no_grad()
 def make_hgn_recon_grid(model, batch, n_samples=4):
-    """HGN analog of train_visual.make_recon_grid — full-sequence reconstruction.
+    """HGN analog of train_visual.make_recon_grid — paper-faithful "decode all
+    states from the integrated rollout."
 
-    For each frame index t in [T_ctx-1, N-1], slide the HGN encoder window
-    to [t-T_ctx+1, t], take q = f_psi(mu_z).q, decode. This gives one
-    reconstructed frame per encodable index, spanning the whole sequence —
-    a per-frame "can the encoder/decoder pair round-trip this image" view,
-    analogous to VWM's per-frame encode→decode roundtrip.
+    HGN's design: encode context, integrate from s_0 to get s_0..s_T, decode
+    every q_t. The "reconstruction" view IS this full integrated trajectory —
+    there is no separate per-frame encode/decode operation for HGN (the
+    encoder is sequence-level, not per-frame).
 
-    Layout per sample (3 rows):
-        GT:    full sequence (N frames).
-        RECON: [T_ctx-1 blanks] + [N - T_ctx + 1 sliding-window reconstructions].
-        ERROR: [T_ctx-1 blanks] + [N - T_ctx + 1 |recon - gt| frames].
-
-    Distinct from compute_hgn_rollout_metrics' rollout grid: the rollout
-    grid integrates forward from ONE encoded context; this grid does
-    INDEPENDENT encodings per frame. Comparing the two separates
-    encoder/decoder roundtrip quality (this grid) from integrator
-    quality (the rollout grid).
+    Operationally this is the same operation as compute_hgn_rollout_metrics'
+    grid; this function is a lightweight variant that returns ONLY the
+    wandb.Image (no pixel/latent metrics), suitable for calling on a train
+    batch where we don't need the metrics computed.
     """
     import wandb
 
     images = batch["images"]
+    actions = batch["actions"]
     B, N, C, H, W = images.shape
     T_ctx = model.infer_context_length
     n = min(n_samples, B)
-    if N < T_ctx:
+    if N <= T_ctx:
         return None
 
-    # Sliding-window encoder pass: one forward per frame index t in [T_ctx-1, N-1].
-    # Each window produces a q (via f_psi mean); decode it back to pixels.
-    recon_list = []
-    for t_end in range(T_ctx - 1, N):
-        window = images[:n, t_end - T_ctx + 1 : t_end + 1]
-        mu_z, _ = model.encode_context(window)
-        q_t, _ = model.f_psi(mu_z)
-        recon_frame = model.decoder(q_t)                 # (n, C, H, W)
-        recon_list.append(recon_frame)
-    recon = torch.stack(recon_list, dim=1)               # (n, N - T_ctx + 1, C, H, W)
-
-    n_recon = recon.shape[1]
-    device = images.device
-    blank = torch.zeros(C, H, W, device=device)
-
-    rows = []
-    for i in range(n):
-        gt_row = torch.cat([images[i, t] for t in range(N)], dim=-1)
-        lead_blanks = [blank] * (T_ctx - 1)
-        recon_frames = [recon[i, t] for t in range(n_recon)]
-        recon_row = torch.cat(lead_blanks + recon_frames, dim=-1)
-        err_frames = [
-            (recon[i, t] - images[i, T_ctx - 1 + t]).abs()
-            for t in range(n_recon)
-        ]
-        err_row = torch.cat(lead_blanks + err_frames, dim=-1)
-        rows.extend([gt_row, recon_row, err_row])
-
-    grid = torch.cat(rows, dim=-2).clamp(0, 1).cpu()
+    result = hgn_open_loop_rollout(model, images[:n], actions[:n])
+    grid = _build_hgn_full_rollout_grid(
+        images=images[:n],
+        q_0_image=result["q_0_image"],
+        pred_images=result["pred_images"],
+        T_ctx=T_ctx,
+        n_show=n,
+    )
     return wandb.Image(
         grid,
-        caption="GT | Sliding-window recon (encode -> f_psi -> decode) | |Error|",
+        caption="GT | Recon (decoded q_0..q_horizon) | |Error|",
     )
 
 
@@ -383,23 +399,16 @@ def hgn_dt_generalization_test(model, env, dt_values, cfg, n_seqs=8, seq_len=Non
         )
 
         # Rollout grid (raw tensor, not wandb.Image — caller decides whether to
-        # wrap. Matches visual_dt_generalization_test's contract).
-        C = images_batch.shape[2]
-        H = images_batch.shape[3]
-        W = images_batch.shape[4]
+        # wrap). Paper-faithful layout: decode every integrated state including
+        # q_0 (which represents frame index T_ctx-1).
         n_show = min(4, n_seqs)
-        device_grid = images_batch.device
-        blank = torch.zeros(C, H, W, device=device_grid)
-        rows = []
-        for i in range(n_show):
-            gt_row = torch.cat([images_batch[i, t] for t in range(N)], dim=-1)
-            lead_blanks = [blank] * T_ctx
-            pred_frames = [pred_images[i, t] for t in range(horizon)]
-            pred_row = torch.cat(lead_blanks + pred_frames, dim=-1)
-            err_frames = [(pred_images[i, t] - gt_images[i, t]).abs() for t in range(horizon)]
-            err_row = torch.cat(lead_blanks + err_frames, dim=-1)
-            rows.extend([gt_row, pred_row, err_row])
-        rollout_grid = torch.cat(rows, dim=-2).clamp(0, 1).cpu()
+        rollout_grid = _build_hgn_full_rollout_grid(
+            images=images_batch,
+            q_0_image=result["q_0_image"],
+            pred_images=pred_images,
+            T_ctx=T_ctx,
+            n_show=n_show,
+        )
 
         results[dt] = {
             "pred_images":   pred_images,
