@@ -13,7 +13,7 @@ env:
   action_dim: 3
   params:
     m: 0.5
-    L: 2.0
+    L: 1.0
     g: 9.81
     c: 0.1 # slightly damped
   variable_params: {} # no variability for now; just want to test on a single deterministic system
