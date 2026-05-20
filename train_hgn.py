@@ -32,33 +32,46 @@ from src.eval.utils import rebuild_env
 log = logging.getLogger(__name__)
 
 
-def build_hgn_batch(images_full, actions_full, t_ctx, horizon):
+def build_hgn_batch(images_full, actions_full, t_ctx):
     """Slice (images_full, actions_full) into HGN's expected inputs.
 
+    Paper-faithful alignment per HGN Sec 3.2: the encoder consumes a sequence
+    of frames and the posterior z corresponds to the FIRST frame. f_psi(z) =
+    s_0 = state at frame 0. The integrator then rolls forward for N-1 steps
+    to produce s_1, ..., s_{N-1} at frames 1..N-1. The reconstruction loss
+    compares the decoded q_t against x_t for EVERY frame t in [0, N-1] — full
+    sequence coverage.
+
     Args:
-        images_full:  (B, T_seq, C, H, W) — full GT image sequence.
-        actions_full: (B, T_seq - 1)      — full action sequence.
-        t_ctx:        encoder context length.
-        horizon:      number of integration steps.
+        images_full:  (B, N, C, H, W) — full GT image sequence (N = seq_len + 1).
+        actions_full: (B, N - 1)      — full action sequence. actions[t] drives
+                                        q_t -> q_{t+1} (state at frame t to
+                                        state at frame t+1).
+        t_ctx:        encoder context length (number of frames the encoder
+                      consumes to produce z).
 
     Returns:
-        images_ctx:           (B, t_ctx, C, H, W)
-        actions_for_rollout:  (B, horizon)
-        recon_target:         (B, horizon + 1, C, H, W) — last context frame
-                              followed by `horizon` future frames.
+        images_ctx:           (B, t_ctx, C, H, W) — encoder input (first t_ctx frames).
+        actions_for_rollout:  (B, N - 1)         — all N-1 transitions; drives
+                                                    q_0 -> q_1 -> ... -> q_{N-1}.
+        recon_target:         (B, N, C, H, W)    — every frame is a recon target.
+        horizon:              int (= N - 1)      — number of integrator steps.
     """
-    T_seq = images_full.shape[1]
-    if T_seq < t_ctx + horizon:
+    N = images_full.shape[1]
+    if N < t_ctx + 1:
         raise ValueError(
-            f"Sequence length {T_seq} too short for t_ctx={t_ctx} + horizon={horizon}."
+            f"Sequence length {N} too short for t_ctx={t_ctx} (need at least t_ctx+1)."
         )
+    if actions_full.shape[1] < N - 1:
+        raise ValueError(
+            f"actions_full has {actions_full.shape[1]} entries but a full-sequence "
+            f"rollout from frame 0 needs N - 1 = {N - 1} actions."
+        )
+    horizon = N - 1
     images_ctx = images_full[:, :t_ctx]
-    # actions[t] drives q_t -> q_{t+1}. q_0 corresponds to the last context frame
-    # (index t_ctx - 1). So the rollout actions are actions_full[:, t_ctx-1 : t_ctx-1+horizon].
-    actions_for_rollout = actions_full[:, t_ctx - 1 : t_ctx - 1 + horizon].long()
-    # recon_target spans the last context frame and horizon future frames.
-    recon_target = images_full[:, t_ctx - 1 : t_ctx - 1 + horizon + 1]
-    return images_ctx, actions_for_rollout, recon_target
+    actions_for_rollout = actions_full[:, :horizon].long()
+    recon_target = images_full           # all N frames
+    return images_ctx, actions_for_rollout, recon_target, horizon
 
 
 def _cosine_lr(base_lr, min_lr, epoch, total_epochs):
@@ -115,14 +128,24 @@ def main(cfg: DictConfig):
     ckpt_dir = cfg.checkpoint_dir
     os.makedirs(ckpt_dir, exist_ok=True)
     t_ctx = cfg.model.infer_context_length
-    horizon = cfg.model.pred_length
+    # Paper-faithful HGN integrates over the FULL sequence (s_0 at frame 0
+    # rolled forward N-1 steps to s_{N-1} at the last frame). The training
+    # horizon is therefore derived per-batch from the actual sequence length.
+    # cfg.model.pred_length is retained in the config for backward
+    # compatibility but is no longer consulted.
     beta_kl = cfg.training.get("beta_kl", 1.0)
 
     # ----- Validation rollout config -----
     n_rollouts = cfg.eval.get("n_rollouts", 8)
     n_log_images = cfg.wandb.get("n_log_images", 4)
     dt_values = list(cfg.eval.dt_values)
-    dt_seq_len = cfg.eval.get("dt_seq_len", None) or (t_ctx + horizon)
+    # dt-gen trajectory length. Default: match the training dataset's seq_len
+    # so dt-gen rollouts are full-sequence too. Falls back to a sensible
+    # minimum if dataset.seq_len is unavailable.
+    dt_seq_len = (
+        cfg.eval.get("dt_seq_len", None)
+        or cfg.dataset.get("seq_len", t_ctx + 10)
+    )
     dt_gen_every = cfg.eval.get("dt_gen_every_n_epochs", 5)
     # OmegaConf's .get() evaluates the default arg eagerly, so we can't write
     # `cfg.dataset.get("dt", cfg.model.observation_dt)` — cfg.model has no
@@ -171,8 +194,8 @@ def main(cfg: DictConfig):
             actions_full = batch["actions"].to(device)
             if first_train_batch is None:
                 first_train_batch = {"images": images_full, "actions": actions_full}
-            images_ctx, actions_rollout, recon_target = build_hgn_batch(
-                images_full, actions_full, t_ctx=t_ctx, horizon=horizon,
+            images_ctx, actions_rollout, recon_target, horizon = build_hgn_batch(
+                images_full, actions_full, t_ctx=t_ctx,
             )
             out = model.forward(images_ctx, actions_rollout, horizon=horizon)
             loss, components = compute_elbo_loss(out, recon_target, beta_kl=beta_kl)
@@ -209,8 +232,8 @@ def main(cfg: DictConfig):
                 images_full = batch["images"].to(device)
                 actions_full = batch["actions"].to(device)
                 last_val_batch = {"images": images_full, "actions": actions_full}
-                images_ctx, actions_rollout, recon_target = build_hgn_batch(
-                    images_full, actions_full, t_ctx=t_ctx, horizon=horizon,
+                images_ctx, actions_rollout, recon_target, horizon = build_hgn_batch(
+                    images_full, actions_full, t_ctx=t_ctx,
                 )
                 out = model.forward(images_ctx, actions_rollout, horizon=horizon)
                 loss, components = compute_elbo_loss(out, recon_target, beta_kl=beta_kl)

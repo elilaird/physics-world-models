@@ -65,45 +65,46 @@ def _run_hgn_basic_eval(model, images, actions, output_dir, cfg, train_cfg, ckpt
     result = hgn_open_loop_rollout(model, images, actions)
     pred_latents = result["pred_latents"]   # (B, horizon, D)
     true_latents = result["true_latents"]   # (B, N - T_ctx + 1, D)
-    pred_images = result["pred_images"]     # (B, horizon, C, H, W)
-    horizon = pred_latents.shape[1]
+    pred_images = result["pred_images"]     # (B, N, C, H, W) — every frame decoded
+    # Paper-faithful HGN: pred_latents aligned with frames 0..N-1; latent
+    # metrics are computed on the OVERLAP with sliding-window GT
+    # (frames T_ctx-1..N-1).
+    pred_for_metric = pred_latents[:, T_ctx - 1 :]         # (B, N - T_ctx + 1, D)
+    gt_for_metric = true_latents                            # (B, N - T_ctx + 1, D)
+    horizon_metric = pred_for_metric.shape[1]              # length over which latent metrics apply
 
-    # HGN alignment: pred_latents starts at frame index T_ctx (one step beyond q_0).
-    # true_latents starts at frame T_ctx-1 (the q_0 frame), so the gt for predictions
-    # is true_latents[:, 1:].
-    gt_latents = true_latents[:, 1:]                       # (B, horizon, D)
-    gt_images = images[:, T_ctx:]                          # (B, horizon, C, H, W)
-
-    # Latent MSE
-    latent_mse_per_step = ((pred_latents - gt_latents) ** 2).flatten(2).mean(dim=(0, 2))
+    # Latent MSE over the metric overlap.
+    latent_mse_per_step = (
+        (pred_for_metric - gt_for_metric) ** 2
+    ).flatten(2).mean(dim=(0, 2))
     latent_mse = latent_mse_per_step.mean().item()
-    log.info(f"Latent MSE (mean): {latent_mse:.6f}")
+    log.info(f"Latent MSE (mean over metric overlap): {latent_mse:.6f}")
 
     # Per-step latent divergence + persistence baseline.
-    # z_context_last is the q at the last context frame — which is true_latents[:, 0]
-    # (= q_0 from f_psi). Use it as the persistence baseline.
+    # Persistence baseline = q at frame T_ctx-1 (= true_latents[:, 0]).
     z_context_last = true_latents[:, 0]
     fixed_dt_curves = compute_latent_divergence_metrics(
-        pred_latents, gt_latents, z_context_last
+        pred_for_metric, gt_for_metric, z_context_last
     )
     D = pred_latents.shape[-1]
     if D % 2 == 0:
         fixed_dt_curves.update(
-            compute_qp_divergence_metrics(pred_latents, gt_latents, z_context_last)
+            compute_qp_divergence_metrics(pred_for_metric, gt_for_metric, z_context_last)
         )
     fixed_dt_curves = {k: v.detach().cpu() for k, v in fixed_dt_curves.items()}
 
-    # Visual metrics
-    log.info("Computing visual metrics (MAE, PSNR, SSIM, LPIPS)...")
-    vis_metrics = compute_visual_metrics(pred_images, gt_images)
+    # Visual metrics over the FULL sequence (every frame reconstructed).
+    log.info("Computing visual metrics (MAE, PSNR, SSIM, LPIPS) over the full sequence...")
+    vis_metrics = compute_visual_metrics(pred_images, images)
     log.info(f"MAE:   {vis_metrics['mae']:.4f}")
     log.info(f"PSNR:  {vis_metrics['psnr']:.2f} dB")
     log.info(f"SSIM:  {vis_metrics['ssim']:.4f}")
     log.info(f"LPIPS: {vis_metrics['lpips']:.4f}")
 
-    # Per-step metrics plot
+    # Per-step metrics plot over the full sequence (every frame reconstructed).
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    steps = range(1, horizon + 1)
+    n_pred_steps = pred_images.shape[1]
+    steps = range(1, n_pred_steps + 1)
     for ax, key, label in zip(
         axes.flat,
         ["mae_per_step", "psnr_per_step", "ssim_per_step", "lpips_per_step"],
@@ -142,7 +143,7 @@ def _run_hgn_basic_eval(model, images, actions, output_dir, cfg, train_cfg, ckpt
         "predictor": train_cfg.model.name,  # HGN has no separate predictor cfg
         "env": train_cfg.env.name,
         "context_length": T_ctx,
-        "horizon": horizon,
+        "horizon": horizon_metric,
         "n_rollouts": n_rollouts,
         "latent_mse": latent_mse,
         "latent_mse_per_step": latent_mse_per_step.cpu().numpy().tolist(),
@@ -160,7 +161,7 @@ def _run_hgn_basic_eval(model, images, actions, output_dir, cfg, train_cfg, ckpt
             predictor=train_cfg.model.name,  # HGN uses model.name in place of predictor.name
             env=train_cfg.env.name,
             training_dt=training_dt,
-            horizon=horizon,
+            horizon=horizon_metric,
             ctx_len=T_ctx,
             n_seqs=n_rollouts,
             dt_values=[training_dt],  # single dt; no dt-gen for HGN

@@ -29,43 +29,55 @@ log = logging.getLogger(__name__)
 
 @torch.no_grad()
 def hgn_open_loop_rollout(model, images, actions, dt=None):
-    """Open-loop HGN rollout.
+    """Open-loop HGN rollout — paper-faithful alignment.
+
+    Per the HGN paper (Sec 3.2): "z ~ q_phi(z | x_0, ..., x_T), corresponding
+    to the system's coordinates in phase space **at the first frame of the
+    sequence**." So f_psi(z) = s_0 = (q_0, p_0) represents the state at
+    frame index 0 (the FIRST encoder-input frame, not the last). The
+    integrator rolls forward N-1 steps to produce q_1, ..., q_{N-1}
+    corresponding to frames 1..N-1. Every frame has a decoded reconstruction;
+    no blanks in the recon grid.
 
     Args:
         model: HGNModel.
         images: (B, N, C, H, W) ground-truth image sequence.
-        actions: (B, N-1) discrete action indices.
+        actions: (B, N-1) discrete action indices. actions[:, t] drives
+                 q_t -> q_{t+1} (state at frame t -> state at frame t+1).
         dt: optional timestep override. None uses model.dt.
 
     Returns:
         dict with:
-            pred_latents: (B, horizon, D) — predicted q_t for t = 1..horizon.
-                          q_0 (the encoder's initial state) is NOT included
-                          in pred_latents; it corresponds to the last
-                          context frame and is a "given" not a "prediction".
-            true_latents: (B, N_eff, D) where N_eff = N - T_ctx + 1 — the
-                          per-frame mean-posterior latents from sliding-
-                          window HGN encoding (used by latent-divergence
-                          metrics as the "GT" latent).
-            pred_images:  (B, horizon, C, H, W) decoded predicted frames.
+            pred_latents: (B, N, D) — q_0..q_{N-1} aligned with frames 0..N-1.
+                          Full sequence coverage; q_0 represents frame 0 per
+                          the paper.
+            pred_images:  (B, N, C, H, W) — decoded q_t for every frame.
+            true_latents: (B, N - T_ctx + 1, D) — sliding-window per-frame
+                          HGN latents for frames T_ctx-1..N-1. Used by
+                          latent-divergence metrics as the "GT" latent.
+                          Frames 0..T_ctx-2 don't have enough preceding
+                          context to slide the encoder window, so they are
+                          omitted from true_latents.
     """
     B, N, C, H, W = images.shape
     T_ctx = model.infer_context_length
     D = model.latent_channels
-    device = next(model.parameters()).device
     dt_eff = dt if dt is not None else model.dt
 
-    if N < T_ctx + 1:
+    if N < T_ctx:
         raise ValueError(
-            f"Sequence length {N} too short for T_ctx={T_ctx} (need at least T_ctx+1)."
+            f"Sequence length {N} too short for T_ctx={T_ctx}."
+        )
+    if actions.shape[1] < N - 1:
+        raise ValueError(
+            f"actions has {actions.shape[1]} entries but rollout needs {N - 1} "
+            f"(one per frame transition q_t -> q_{{t+1}})."
         )
 
     # ----- Sliding-window per-frame "GT" latents -----
-    # For each frame index t (0-indexed) with t >= T_ctx-1, encode the
-    # window [t-T_ctx+1, t] and take f_psi(mean_z).split()[0] as the
-    # per-frame q. This is the natural HGN analog of a per-frame latent.
-    # Earlier frames (t < T_ctx-1) don't have enough preceding context;
-    # we skip them (so the returned true_latents has length N - T_ctx + 1).
+    # For each frame index t with t >= T_ctx-1, encode the window
+    # [t-T_ctx+1, t] and take q from f_psi(mean_z) as the per-frame "GT" q.
+    # Frames 0..T_ctx-2 don't have enough preceding context — skipped.
     true_latents_list = []
     for t_end in range(T_ctx - 1, N):
         window = images[:, t_end - T_ctx + 1 : t_end + 1]
@@ -74,86 +86,72 @@ def hgn_open_loop_rollout(model, images, actions, dt=None):
         true_latents_list.append(q_t)
     true_latents = torch.stack(true_latents_list, dim=1)  # (B, N - T_ctx + 1, D)
 
-    # ----- Initial state from context -----
+    # ----- Initial state from context (encode FIRST T_ctx frames -> q_0 = state at frame 0) -----
     images_ctx = images[:, :T_ctx]
     mu_z, _ = model.encode_context(images_ctx)
     q_0, p_0 = model.f_psi(mu_z)
 
-    # ----- Roll out -----
-    horizon = N - T_ctx
-    actions_rollout = actions[:, T_ctx - 1 : T_ctx - 1 + horizon].long()
+    # ----- Roll out for N-1 steps (full sequence) -----
+    horizon = N - 1
+    actions_rollout = actions[:, :horizon].long()
 
-    # Use HGN's integrate. Override dt by stashing it on the model — HGNModel.integrate
-    # reads self.dt. Save/restore so this function is side-effect-free.
     saved_dt = model.dt
     model.dt = dt_eff
     try:
         q_seq, _ = model.integrate(q_0, p_0, actions_rollout, horizon)
     finally:
         model.dt = saved_dt
+    # q_seq has shape (B, horizon+1, D) = (B, N, D), aligned with frames 0..N-1.
+    pred_latents = q_seq                                   # (B, N, D)
 
-    # q_seq has shape (B, horizon+1, D); the first entry is q_0 (the initial
-    # state, not a prediction). pred_latents are q_1..q_horizon.
-    pred_latents = q_seq[:, 1:]
-
-    # ----- Decode predicted frames -----
-    flat = pred_latents.reshape(B * horizon, D)
+    # ----- Decode every frame -----
+    flat = pred_latents.reshape(B * N, D)
     decoded = model.decoder(flat)
-    pred_images = decoded.reshape(B, horizon, C, H, W)
-
-    # Also decode q_0 so callers building rollout grids can show every state
-    # (including the initial one at frame index T_ctx-1). q_0 corresponds to
-    # the last context frame.
-    q_0_image = model.decoder(q_0)                         # (B, C, H, W)
+    pred_images = decoded.reshape(B, N, C, H, W)
 
     return {
-        "pred_latents":  pred_latents,
-        "true_latents":  true_latents,
-        "pred_images":   pred_images,
-        "q_0_latent":    q_0,             # (B, D) — initial state, NOT a prediction
-        "q_0_image":     q_0_image,       # (B, C, H, W) — decoded q_0
+        "pred_latents": pred_latents,
+        "true_latents": true_latents,
+        "pred_images":  pred_images,
     }
 
 
-def _build_hgn_full_rollout_grid(images, q_0_image, pred_images, T_ctx, n_show):
+def _build_hgn_full_rollout_grid(images, pred_images, n_show):
     """Build a single GT|RECON|ERROR wandb.Image grid showing the full
-    integrated trajectory (q_0 decoded plus all rolled-forward q_t decoded).
+    integrated trajectory.
 
-    Layout per sample (3 rows):
-        GT:    full sequence (N frames, indices 0..N-1).
-        RECON: [T_ctx-1 blanks] + [decoded q_0] + [horizon decoded predictions]
-               = T_ctx-1 + 1 + horizon = N frames. Decoded q_0 sits at frame
-               index T_ctx-1 (the last context frame, which q_0 represents).
-        ERROR: [T_ctx-1 blanks] + [q_0 vs frame T_ctx-1] + [horizon prediction
-               errors vs frames T_ctx..N-1].
+    Paper-faithful alignment: q_0 represents frame 0, q_t represents frame t.
+    Every frame has a decoded reconstruction; the recon row has no blanks.
+
+    Layout per sample (3 rows, N frames per row):
+        GT:    images[i, 0..N-1].
+        RECON: pred_images[i, 0..N-1] — decoded q_0..q_{N-1}.
+        ERROR: |pred_images[i, t] - images[i, t]| for t in 0..N-1.
 
     Args:
         images:      (B, N, C, H, W) — GT frames.
-        q_0_image:   (B, C, H, W) — decoded q_0.
-        pred_images: (B, horizon, C, H, W) — decoded q_1..q_horizon.
-        T_ctx:       int — context length.
+        pred_images: (B, N, C, H, W) — decoded q_0..q_{N-1}, paper-faithful
+                     alignment with images[:, 0..N-1].
         n_show:      int — number of sample rows to render.
 
     Returns:
         torch.Tensor of shape (C, n_show*3*H, N*W) on CPU, values in [0, 1].
     """
     B, N, C, H, W = images.shape
-    horizon = pred_images.shape[1]
-    device = images.device
-    blank = torch.zeros(C, H, W, device=device)
+    if pred_images.shape != images.shape[:1] + (N, C, H, W):
+        raise ValueError(
+            f"pred_images shape {tuple(pred_images.shape)} must match images "
+            f"shape {tuple(images.shape)} — paper-faithful HGN decodes every frame."
+        )
 
     rows = []
     for i in range(n_show):
         gt_row = torch.cat([images[i, t] for t in range(N)], dim=-1)
-        lead_blanks = [blank] * (T_ctx - 1)
-        # Decoded q_0 at slot T_ctx-1, then horizon decoded predictions.
-        recon_seq = [q_0_image[i]] + [pred_images[i, t] for t in range(horizon)]
-        recon_row = torch.cat(lead_blanks + recon_seq, dim=-1)
-        err_seq = (
-            [(q_0_image[i] - images[i, T_ctx - 1]).abs()]
-            + [(pred_images[i, t] - images[i, T_ctx + t]).abs() for t in range(horizon)]
+        recon_row = torch.cat([pred_images[i, t] for t in range(N)], dim=-1)
+        err_row = torch.cat(
+            [(pred_images[i, t] - images[i, t]).abs() for t in range(N)],
+            dim=-1,
         )
-        err_row = torch.cat(lead_blanks + err_seq, dim=-1)
         rows.extend([gt_row, recon_row, err_row])
     return torch.cat(rows, dim=-2).clamp(0, 1).cpu()
 
@@ -190,45 +188,43 @@ def compute_hgn_rollout_metrics(model, batch, n_samples=4):
         return None
 
     result = hgn_open_loop_rollout(model, images, actions)
-    pred_latents = result["pred_latents"]   # (B, horizon, D)
-    true_latents = result["true_latents"]   # (B, N - T_ctx + 1, D)
-    pred_images = result["pred_images"]     # (B, horizon, C, H, W)
-    horizon = pred_latents.shape[1]
+    pred_latents = result["pred_latents"]   # (B, N, D) — full sequence, aligned with frames 0..N-1
+    true_latents = result["true_latents"]   # (B, N - T_ctx + 1, D) — sliding-window GT for frames T_ctx-1..N-1
+    pred_images = result["pred_images"]     # (B, N, C, H, W) — every frame decoded
 
-    # HGN alignment: pred_latents are q_1..q_horizon (frames T_ctx..N-1).
-    # true_latents[:, 0] corresponds to q_0 (last context frame); true_latents[:, 1:]
-    # corresponds to frames T_ctx..N-1, aligned with pred_latents.
-    gt_latents = true_latents[:, 1:]                       # (B, horizon, D)
-    gt_images = images[:, T_ctx:]                          # (B, horizon, C, H, W)
+    # Visual metrics: full sequence (every frame reconstructed).
+    vis_metrics = compute_visual_metrics(pred_images, images)
 
-    latent_mse = ((pred_latents - gt_latents) ** 2).mean().item()
-    vis_metrics = compute_visual_metrics(pred_images, gt_images)
+    # Latent metrics: compare predicted latents and sliding-window GT latents
+    # over their OVERLAP. true_latents covers frames T_ctx-1..N-1 (length
+    # N - T_ctx + 1); slice pred_latents to the same frame range.
+    pred_for_metric = pred_latents[:, T_ctx - 1 :]         # (B, N - T_ctx + 1, D)
+    gt_for_metric = true_latents                            # (B, N - T_ctx + 1, D)
 
-    # Per-step latent divergence + persistence baseline. The "context-last"
-    # latent for the persistence baseline is q_0 (true_latents[:, 0]).
+    latent_mse = ((pred_for_metric - gt_for_metric) ** 2).mean().item()
+
+    # Persistence baseline: the GT latent at the FIRST frame of the metric
+    # overlap window (= frame T_ctx-1 = the q_0 frame).
     z_context_last = true_latents[:, 0]                    # (B, D)
     latent_curves = compute_latent_divergence_metrics(
-        pred_latents, gt_latents, z_context_last
+        pred_for_metric, gt_for_metric, z_context_last
     )
     D = pred_latents.shape[-1]
     qp_curves = (
-        compute_qp_divergence_metrics(pred_latents, gt_latents, z_context_last)
+        compute_qp_divergence_metrics(pred_for_metric, gt_for_metric, z_context_last)
         if D % 2 == 0 else None
     )
 
     # ---- Build rollout grid (paper-faithful: decode every integrated state) ----
-    # HGN's design: encode context, integrate from s_0, decode every q_t.
-    # The grid shows the full decoded trajectory including q_0 (which represents
-    # the last context frame at index T_ctx-1).
+    # HGN's design: encode context, integrate from s_0 = state-at-frame-0,
+    # decode every q_t. Every frame has a decoded reconstruction; no blanks.
     n_show = min(n_samples, B)
     grid = _build_hgn_full_rollout_grid(
         images=images,
-        q_0_image=result["q_0_image"],
         pred_images=pred_images,
-        T_ctx=T_ctx,
         n_show=n_show,
     )
-    grid_img = wandb.Image(grid, caption="GT | Recon (decoded q_0..q_horizon) | |Error|")
+    grid_img = wandb.Image(grid, caption="GT | Recon (decoded q_0..q_{N-1}) | |Error|")
 
     return {
         "latent_mse":     latent_mse,
@@ -273,14 +269,12 @@ def make_hgn_recon_grid(model, batch, n_samples=4):
     result = hgn_open_loop_rollout(model, images[:n], actions[:n])
     grid = _build_hgn_full_rollout_grid(
         images=images[:n],
-        q_0_image=result["q_0_image"],
         pred_images=result["pred_images"],
-        T_ctx=T_ctx,
         n_show=n,
     )
     return wandb.Image(
         grid,
-        caption="GT | Recon (decoded q_0..q_horizon) | |Error|",
+        caption="GT | Recon (decoded q_0..q_{N-1}) | |Error|",
     )
 
 
@@ -378,41 +372,40 @@ def hgn_dt_generalization_test(model, env, dt_values, cfg, n_seqs=8, seq_len=Non
             continue
 
         result = hgn_open_loop_rollout(model, images_batch, actions_batch, dt=dt)
-        pred_latents = result["pred_latents"]    # (B, horizon, D)
+        pred_latents = result["pred_latents"]    # (B, N, D) — full sequence
         true_latents = result["true_latents"]    # (B, N - T_ctx + 1, D)
-        pred_images = result["pred_images"]      # (B, horizon, C, H, W)
-        horizon = pred_latents.shape[1]
+        pred_images = result["pred_images"]      # (B, N, C, H, W) — every frame
 
-        gt_latents = true_latents[:, 1:]                  # (B, horizon, D)
-        gt_images = images_batch[:, T_ctx:]               # (B, horizon, C, H, W)
+        # Visual metrics: full sequence comparison.
+        vis_metrics = compute_visual_metrics(pred_images, images_batch)
 
-        vis_metrics = compute_visual_metrics(pred_images, gt_images)
-        latent_mse = ((pred_latents - gt_latents) ** 2).mean().item()
+        # Latent metrics: overlap of pred_latents and sliding-window GT
+        # (frames T_ctx-1..N-1).
+        pred_for_metric = pred_latents[:, T_ctx - 1 :]    # (B, N - T_ctx + 1, D)
+        gt_for_metric = true_latents
+        latent_mse = ((pred_for_metric - gt_for_metric) ** 2).mean().item()
         z_context_last = true_latents[:, 0]
         latent_curves = compute_latent_divergence_metrics(
-            pred_latents, gt_latents, z_context_last
+            pred_for_metric, gt_for_metric, z_context_last
         )
         D = pred_latents.shape[-1]
         qp_curves = (
-            compute_qp_divergence_metrics(pred_latents, gt_latents, z_context_last)
+            compute_qp_divergence_metrics(pred_for_metric, gt_for_metric, z_context_last)
             if D % 2 == 0 else None
         )
 
         # Rollout grid (raw tensor, not wandb.Image — caller decides whether to
-        # wrap). Paper-faithful layout: decode every integrated state including
-        # q_0 (which represents frame index T_ctx-1).
+        # wrap). Paper-faithful: every frame has a decoded reconstruction.
         n_show = min(4, n_seqs)
         rollout_grid = _build_hgn_full_rollout_grid(
             images=images_batch,
-            q_0_image=result["q_0_image"],
             pred_images=pred_images,
-            T_ctx=T_ctx,
             n_show=n_show,
         )
 
         results[dt] = {
             "pred_images":   pred_images,
-            "true_images":   gt_images,
+            "true_images":   images_batch,
             "metrics":       vis_metrics,
             "latent_mse":    latent_mse,
             "latent_curves": {k: v.detach().cpu() for k, v in latent_curves.items()},
