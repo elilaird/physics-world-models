@@ -205,15 +205,24 @@ def compute_hgn_rollout_metrics(model, batch, n_samples=4):
 
 @torch.no_grad()
 def make_hgn_recon_grid(model, batch, n_samples=4):
-    """HGN analog of train_visual.make_recon_grid.
+    """HGN analog of train_visual.make_recon_grid — full-sequence reconstruction.
 
-    For each batch example, encode the first T_ctx frames as context, decode
-    q_0 = f_psi(mu_z).split()[0], and compare to the LAST context frame
-    (which is what q_0 is supposed to represent).
+    For each frame index t in [T_ctx-1, N-1], slide the HGN encoder window
+    to [t-T_ctx+1, t], take q = f_psi(mu_z).q, decode. This gives one
+    reconstructed frame per encodable index, spanning the whole sequence —
+    a per-frame "can the encoder/decoder pair round-trip this image" view,
+    analogous to VWM's per-frame encode→decode roundtrip.
 
-    Returns:
-        wandb.Image with rows of [GT_last_ctx | Decoded q_0 | |Error|], one
-        row per sample.
+    Layout per sample (3 rows):
+        GT:    full sequence (N frames).
+        RECON: [T_ctx-1 blanks] + [N - T_ctx + 1 sliding-window reconstructions].
+        ERROR: [T_ctx-1 blanks] + [N - T_ctx + 1 |recon - gt| frames].
+
+    Distinct from compute_hgn_rollout_metrics' rollout grid: the rollout
+    grid integrates forward from ONE encoded context; this grid does
+    INDEPENDENT encodings per frame. Comparing the two separates
+    encoder/decoder roundtrip quality (this grid) from integrator
+    quality (the rollout grid).
     """
     import wandb
 
@@ -224,23 +233,38 @@ def make_hgn_recon_grid(model, batch, n_samples=4):
     if N < T_ctx:
         return None
 
-    images_ctx = images[:n, :T_ctx]
-    mu_z, _ = model.encode_context(images_ctx)
-    q_0, _ = model.f_psi(mu_z)
-    decoded = model.decoder(q_0)                             # (n, C, H, W)
-    gt = images[:n, T_ctx - 1]                                # (n, C, H, W) — last ctx frame
+    # Sliding-window encoder pass: one forward per frame index t in [T_ctx-1, N-1].
+    # Each window produces a q (via f_psi mean); decode it back to pixels.
+    recon_list = []
+    for t_end in range(T_ctx - 1, N):
+        window = images[:n, t_end - T_ctx + 1 : t_end + 1]
+        mu_z, _ = model.encode_context(window)
+        q_t, _ = model.f_psi(mu_z)
+        recon_frame = model.decoder(q_t)                 # (n, C, H, W)
+        recon_list.append(recon_frame)
+    recon = torch.stack(recon_list, dim=1)               # (n, N - T_ctx + 1, C, H, W)
+
+    n_recon = recon.shape[1]
+    device = images.device
+    blank = torch.zeros(C, H, W, device=device)
 
     rows = []
     for i in range(n):
-        gt_frame = gt[i]
-        recon_frame = decoded[i]
-        err_frame = (recon_frame - gt_frame).abs()
-        row = torch.cat([gt_frame, recon_frame, err_frame], dim=-1)
-        rows.append(row)
+        gt_row = torch.cat([images[i, t] for t in range(N)], dim=-1)
+        lead_blanks = [blank] * (T_ctx - 1)
+        recon_frames = [recon[i, t] for t in range(n_recon)]
+        recon_row = torch.cat(lead_blanks + recon_frames, dim=-1)
+        err_frames = [
+            (recon[i, t] - images[i, T_ctx - 1 + t]).abs()
+            for t in range(n_recon)
+        ]
+        err_row = torch.cat(lead_blanks + err_frames, dim=-1)
+        rows.extend([gt_row, recon_row, err_row])
+
     grid = torch.cat(rows, dim=-2).clamp(0, 1).cpu()
     return wandb.Image(
         grid,
-        caption="GT (last ctx frame) | Decoded q_0 | |Error|",
+        caption="GT | Sliding-window recon (encode -> f_psi -> decode) | |Error|",
     )
 
 
