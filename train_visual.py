@@ -73,6 +73,21 @@ def build_predictor(cfg):
 def build_model(cfg):
     model_cls = MODEL_REGISTRY[cfg.model.name]
     predictor = build_predictor(cfg)
+    # Validate predictor/VWM pairing: predictors that declare
+    # requires_rich_features=True (e.g., RichSIDLatentHamiltonianPredictor)
+    # must be paired with a VWM that exposes encode_features_sequence
+    # (e.g., RichSIDVisualWorldModel). Catching this at build time gives a
+    # clear error rather than failing deep in the training loop with an
+    # AttributeError on the first batch.
+    if getattr(predictor, "requires_rich_features", False) and not hasattr(
+        model_cls, "encode_features_sequence"
+    ):
+        raise TypeError(
+            f"{type(predictor).__name__} requires a VWM with "
+            f"encode_features_sequence (e.g., RichSIDVisualWorldModel); "
+            f"got model_cls={model_cls.__name__}. Set "
+            f"`model=visual_world_model_rich_sid` in your Hydra overrides."
+        )
     return model_cls(
         predictor=predictor,
         latent_channels=cfg.model.latent_channels,
