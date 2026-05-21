@@ -64,7 +64,7 @@ class BasePredictor(nn.Module):
 
     _warned_legacy = False
 
-    def infer(self, context, context_actions=None, dt=None):
+    def infer(self, context, context_actions=None, dt=None, **kwargs):
         raise NotImplementedError
 
     def step(self, state, action, dt=None):
@@ -189,7 +189,7 @@ class MLPPredictor(BasePredictor):
             nn.Linear(hidden_dim, latent_dim),
         )
 
-    def infer(self, context, context_actions=None, dt=None):
+    def infer(self, context, context_actions=None, dt=None, **kwargs):
         return {"z": context[:, -1]}
 
     def step(self, state, action, dt=None):
@@ -231,7 +231,7 @@ class LSTMPredictor(BasePredictor):
         )
         self.output = nn.Linear(hidden_dim, latent_dim)
 
-    def infer(self, context, context_actions=None, dt=None):
+    def infer(self, context, context_actions=None, dt=None, **kwargs):
         B, T, _ = context.shape
         if context_actions is None:
             ctx_acts = torch.zeros(
@@ -323,7 +323,7 @@ class HamiltonianPredictor(BasePredictor):
         """
         return self.H_net(z)
 
-    def infer(self, context, context_actions=None, dt=None):
+    def infer(self, context, context_actions=None, dt=None, **kwargs):
         return {"z": context[:, -1]}
 
     @torch.enable_grad()
@@ -457,7 +457,7 @@ class LatentNeuralODEPredictor(BasePredictor):
             nn.Linear(hidden_dim, latent_dim),
         )
 
-    def infer(self, context, context_actions=None, dt=None):
+    def infer(self, context, context_actions=None, dt=None, **kwargs):
         B, T, D = context.shape
         dt_eff = dt if dt is not None else self.dt
 
@@ -622,7 +622,7 @@ class LatentHamiltonianPredictor(BasePredictor):
             inp = torch.cat([phase, theta], dim=-1)
             return self.H_net(inp)
 
-    def infer(self, context, context_actions=None, dt=None):
+    def infer(self, context, context_actions=None, dt=None, **kwargs):
         B, T, D = context.shape
         dt_eff = dt if dt is not None else self.dt
 
@@ -878,7 +878,7 @@ class SeparableLatentHamiltonianPredictor(BasePredictor):
                 torch.cat([p, theta], dim=-1)
             )
 
-    def infer(self, context, context_actions=None, dt=None):
+    def infer(self, context, context_actions=None, dt=None, **kwargs):
         """SID branch identical to LatentHamiltonianPredictor.infer."""
         B, T, D = context.shape
         dt_eff = dt if dt is not None else self.dt

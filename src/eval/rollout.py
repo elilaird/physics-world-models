@@ -60,6 +60,13 @@ def visual_open_loop_rollout(model, images, actions, dt=None):
         :, infer_ctx - 1 : infer_ctx - 1 + horizon
     ].long()
 
+    # Rich-features hook (mirrors train_visual.py). Predictors that declare
+    # requires_rich_features=True consume (B, T, 64, 16, 16) backbone features
+    # from RichSIDVisualWorldModel.encode_features_sequence.
+    rich_features_seq = None
+    if getattr(model.predictor, "requires_rich_features", False):
+        rich_features_seq = model.encode_features_sequence(images)
+
     # Infer initial state (runs GRU once for Latent-* predictors). The
     # @torch.no_grad() decorator on this function disables grad globally,
     # but LatentHamiltonianPredictor.step has @torch.enable_grad() locally
@@ -67,6 +74,7 @@ def visual_open_loop_rollout(model, images, actions, dt=None):
     state = model.predictor.infer(
         context, context_actions=context_actions,
         dt=dt or model.observation_dt,
+        rich_features=rich_features_seq[:, :infer_ctx] if rich_features_seq is not None else None,
     )
     pred_latents = model.predictor.unroll(state, unroll_actions, horizon, dt=dt)
 
