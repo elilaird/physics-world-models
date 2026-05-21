@@ -1141,7 +1141,7 @@ class RichSIDLatentHamiltonianPredictor(BasePredictor):
             inp = torch.cat([phase, theta], dim=-1)
             return self.H_net(inp)
 
-    def infer(self, context, rich_features=None, context_actions=None, dt=None, **kwargs):
+    def infer(self, context, context_actions=None, dt=None, *, rich_features=None, **kwargs):
         """Infer (p_0, theta) from the rich-feature 3D CNN; take q_0 = context[:, -1].
 
         Args:
@@ -1149,13 +1149,16 @@ class RichSIDLatentHamiltonianPredictor(BasePredictor):
                             Used to extract q_0 = context[:, -1], matching
                             LatentHamiltonianPredictor's convention so the
                             JEPA latent-target structure is preserved.
-            rich_features:  (B, T_ctx, 64, 16, 16) rich features per frame from
-                            RichSIDVisualWorldModel.encode_features_sequence.
-                            REQUIRED — raises ValueError if None.
             context_actions: ignored (3D CNN doesn't consume actions for state
                              inference; included for uniformity with sibling
                              predictors' infer() signatures).
             dt: ignored (no dt-normalization here; the integrator handles dt).
+            rich_features:  (B, T_ctx, 64, 16, 16) rich features per frame from
+                            RichSIDVisualWorldModel.encode_features_sequence.
+                            REQUIRED — raises ValueError if None. Keyword-only
+                            to avoid positional misrouting with sibling
+                            predictors whose 2nd positional arg is
+                            context_actions.
             **kwargs: ignored.
 
         Returns:
