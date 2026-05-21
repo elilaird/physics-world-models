@@ -42,3 +42,4 @@ predictor_colors:
   latent_hamiltonian:           "#9467bd"
   hgn:                          "#17becf"
   latent_hamiltonian_separable: "#bcbd22"
+  latent_hamiltonian_rich_sid:  "#7f7f7f"
