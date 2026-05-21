@@ -1,0 +1,26 @@
+# Rich-SID variant of latent_hamiltonian: same Hamilton's-equations dynamics
+# (non-separable H, damping, G), but the GRU SID branch is replaced by a
+# 3D CNN over rich (B, T, 64, 16, 16) features from
+# RichSIDVisualWorldModel.encode_features_sequence.
+#
+# Requires model=visual_world_model_rich_sid (which exposes the rich features).
+#
+# Use:
+#   python train_visual.py model=visual_world_model_rich_sid \
+#     predictor=latent_hamiltonian_rich_sid
+
+_target_: src.models.predictors.RichSIDLatentHamiltonianPredictor
+name: latent_hamiltonian_rich_sid
+latent_dim: ${model.latent_channels}
+action_dim: ${env.action_dim}
+action_embedding_dim: ${model.action_embedding_dim}
+hidden_dim: 256
+theta_dim: 8
+dt: ${dataset.dt}
+integrator: implicit_midpoint
+midpoint_iters: 4
+
+# 3D CNN SID branch channel widths.
+sid_channels_1: 128
+sid_channels_2: 128
+sid_channels_3: 256
