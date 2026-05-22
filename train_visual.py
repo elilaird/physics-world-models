@@ -60,8 +60,20 @@ def batch_to_device(batch, device):
 
 
 def build_env(cfg):
-    env_cls = ENV_REGISTRY[cfg.env.name]
-    params = OmegaConf.to_container(cfg.env.params, resolve=True)
+    # Prefer cfg.dataset.env.params — that's the block that generated the
+    # training data. cfg.env is the fallback default and can drift from
+    # the dataset (e.g., pendulum dataset uses m=0.5 while configs/env/
+    # pendulum_visual.yaml has m=1.0). Mismatched mass changes both
+    # dynamics AND the default ball_radius (= self.m / space_res in
+    # ForcedPendulum.render_state), so rollout grids visibly diverge from
+    # the dataset frames. Matches the cfg.dataset.env preference already
+    # used by visual_dt_generalization_test for render opts.
+    if "dataset" in cfg and "env" in cfg.dataset:
+        env_cfg = cfg.dataset.env
+    else:
+        env_cfg = cfg.env
+    env_cls = ENV_REGISTRY[env_cfg.name]
+    params = OmegaConf.to_container(env_cfg.params, resolve=True)
     return env_cls(**params)
 
 
