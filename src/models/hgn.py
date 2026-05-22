@@ -5,7 +5,10 @@ f_psi expansion -> separable Hamiltonian (T(p) + V(q)) -> leapfrog integrator
 -> decoder reused from visual.py. ELBO training (frame-wise pixel MSE + KL on z).
 
 Minimal port-Hamiltonian extensions for this project's forced+damped environments:
-  - Global learned scalar damping gamma = softplus(log_damping)
+  - Damping gamma >= 0 in one of two modes:
+      * damping_mode='global'   — single learned scalar gamma = softplus(log_damping).
+      * damping_mode='adaptive' — per-trajectory gamma(z) = softplus(damping_net(z)),
+        where damping_net is a Linear(D, 1) over the posterior sample z.
   - Action force G(a) on momentum (per-step, symmetric across leapfrog half-steps)
 
 Spec: docs/superpowers/specs/2026-05-19-hgn-baseline-design.md
@@ -260,7 +263,10 @@ class HGNModel(nn.Module):
         T_net,V_net: separable H     — H(q, p) = T(p) + V(q).
         G_net      : GNet            — action -> momentum force.
         act_emb    : nn.Embedding    — discrete action -> embedding.
-        log_damping: nn.Parameter    — global learned scalar; gamma = softplus(.).
+        log_damping (global mode)  OR  damping_net (adaptive mode):
+            * damping_mode='global'   — nn.Parameter scalar; gamma = softplus(log_damping).
+            * damping_mode='adaptive' — nn.Linear(D, 1) over posterior sample z;
+              gamma(z) = softplus(damping_net(z)) in (B, 1).
         integrator : leapfrog OR implicit_midpoint per config.
         decoder    : VisionDecoder   — reused from visual.py, takes q only.
 
@@ -320,6 +326,11 @@ class HGNModel(nn.Module):
             latent_channels=latent_channels,
         )
         self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
+        # Checkpoint-compat note: 'global' and 'adaptive' modes register DIFFERENT
+        # parameter names (log_damping vs damping_net). Loading a global-mode
+        # checkpoint into an adaptive-mode model (or vice versa) will silently
+        # produce a freshly-initialized damping module — there is no automatic
+        # conversion. Caller owns checkpoint hygiene (match damping_mode at load).
         if damping_mode == "global":
             self.log_damping = nn.Parameter(torch.tensor(damping_init))
         elif damping_mode == "adaptive":
@@ -385,7 +396,6 @@ class HGNModel(nn.Module):
             q_seq, p_seq: (B, horizon+1, D) including q_0, p_0 as the first entry.
             gamma:        scalar or (B, 1) — the resolved damping used for this rollout.
         """
-        B, D = q_0.shape
         horizon = actions.shape[1]
 
         if self.damping_mode == "global":
