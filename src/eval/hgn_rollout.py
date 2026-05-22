@@ -98,7 +98,7 @@ def hgn_open_loop_rollout(model, images, actions, dt=None):
     saved_dt = model.dt
     model.dt = dt_eff
     try:
-        q_seq, _ = model.integrate(q_0, p_0, actions_rollout, horizon)
+        q_seq, _, _ = model.integrate(q_0, p_0, actions_rollout, z=mu_z)
     finally:
         model.dt = saved_dt
     # q_seq has shape (B, horizon+1, D) = (B, N, D), aligned with frames 0..N-1.

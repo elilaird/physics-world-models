@@ -172,25 +172,23 @@ class LeapfrogIntegrator(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def step(self, q, p, force, log_damping, T_net, V_net, dt):
+    def step(self, q, p, force, gamma, T_net, V_net, dt):
         """One leapfrog step.
 
         Args:
             q, p:        (B, D) — current state.
             force:       (B, D) — precomputed G(a_t), applied to momentum.
-            log_damping: scalar tensor — gamma = softplus(log_damping).
+            gamma:       scalar OR (B, 1) tensor — resolved damping (>= 0).
+                         Resolution (global vs adaptive) happens at the caller.
             T_net, V_net: the kinetic/potential nets.
             dt:          float — timestep.
 
         Returns:
             q_new, p_new: (B, D) each.
         """
-        gamma = F.softplus(log_damping)
-
         q_t = _ensure_grad(q)
         p_t = _ensure_grad(p)
 
-        # First autograd: dV/dq(q_t) and dT/dp(p_t).
         V_t = V_net(q_t).sum()
         dV_dq_t = _grad(V_t, q_t, create_graph=q_t.requires_grad)
         T_t = T_net(p_t).sum()
@@ -198,15 +196,12 @@ class LeapfrogIntegrator(nn.Module):
 
         p_half = p_t + (dt / 2.0) * (-dV_dq_t - gamma * dT_dp_t + force)
 
-        # Second autograd: dT/dp(p_half).
         p_half_g = _ensure_grad(p_half)
         T_half = T_net(p_half_g).sum()
         dT_dp_half = _grad(T_half, p_half_g, create_graph=p_half_g.requires_grad)
 
         q_new = q_t + dt * dT_dp_half
 
-        # Third autograd: dV/dq(q_new). Reuse dT/dp(p_half) for the damping
-        # term in the second half-step (p_half has not changed between half-steps).
         q_new_g = _ensure_grad(q_new)
         V_new = V_net(q_new_g).sum()
         dV_dq_new = _grad(V_new, q_new_g, create_graph=q_new_g.requires_grad)
@@ -234,8 +229,7 @@ class ImplicitMidpointIntegrator(nn.Module):
         super().__init__()
         self.n_iters = n_iters
 
-    def step(self, q, p, force, log_damping, T_net, V_net, dt):
-        gamma = F.softplus(log_damping)
+    def step(self, q, p, force, gamma, T_net, V_net, dt):
         q_n = _ensure_grad(q)
         p_n = _ensure_grad(p)
 
@@ -293,6 +287,7 @@ class HGNModel(nn.Module):
         midpoint_iters=4,
         dt=0.4,
         damping_init=-1.0,
+        damping_mode="global",   # 'global' (scalar Parameter) or 'adaptive' (Linear(D, 1))
         name="hgn",
         **kwargs,
     ):
@@ -306,6 +301,7 @@ class HGNModel(nn.Module):
         self.infer_context_length = infer_context_length
         self.dt = dt
         self.observation_dt = dt  # mirror VisualWorldModel attribute for eval reuse
+        self.damping_mode = damping_mode
 
         self.encoder = HGNEncoder(
             channels=channels,
@@ -324,7 +320,17 @@ class HGNModel(nn.Module):
             latent_channels=latent_channels,
         )
         self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
-        self.log_damping = nn.Parameter(torch.tensor(damping_init))
+        if damping_mode == "global":
+            self.log_damping = nn.Parameter(torch.tensor(damping_init))
+        elif damping_mode == "adaptive":
+            # Per-trajectory γ(z) = softplus(damping_net(z)). Mirrors the
+            # damping_net pattern in LatentHamiltonianPredictor.
+            self.damping_net = nn.Linear(latent_channels, 1)
+            # Bias-init so initial γ ≈ softplus(damping_init), matching global mode.
+            nn.init.zeros_(self.damping_net.weight)
+            nn.init.constant_(self.damping_net.bias, damping_init)
+        else:
+            raise ValueError(f"Unknown damping_mode: {damping_mode!r}")
 
         self.decoder = VisionDecoder(
             channels=channels,
@@ -362,13 +368,39 @@ class HGNModel(nn.Module):
         return self.decoder(q)
 
     @torch.enable_grad()
-    def integrate(self, q_0, p_0, actions, horizon):
-        """Roll out the integrator for `horizon` steps from (q_0, p_0).
+    def integrate(self, q_0, p_0, actions, z=None):
+        """Roll out the integrator for `horizon = actions.shape[1]` steps from (q_0, p_0).
 
-        Returns q_seq (B, horizon+1, D) and p_seq (B, horizon+1, D),
-        including q_0/p_0 as the first entry.
+        Resolves gamma (global vs adaptive) ONCE per sequence and passes it to
+        every step. Resolution happens here, not in the integrator, so the
+        integrator step stays mode-agnostic.
+
+        Args:
+            q_0, p_0: (B, D) initial state.
+            actions:  (B, horizon) discrete action indices.
+            z:        (B, latent_channels) posterior sample (or mu at eval).
+                      Required when damping_mode='adaptive'; ignored otherwise.
+
+        Returns:
+            q_seq, p_seq: (B, horizon+1, D) including q_0, p_0 as the first entry.
+            gamma:        scalar or (B, 1) — the resolved damping used for this rollout.
         """
         B, D = q_0.shape
+        horizon = actions.shape[1]
+
+        if self.damping_mode == "global":
+            gamma = F.softplus(self.log_damping)               # scalar
+        elif self.damping_mode == "adaptive":
+            if z is None:
+                raise ValueError(
+                    "damping_mode='adaptive' requires z (the posterior sample) "
+                    "to be passed to integrate(). The caller (HGNModel.forward) "
+                    "should pass z_sample."
+                )
+            gamma = F.softplus(self.damping_net(z))            # (B, 1)
+        else:
+            raise ValueError(f"Unknown damping_mode: {self.damping_mode!r}")
+
         q_seq = [q_0]
         p_seq = [p_0]
         q, p = q_0, p_0
@@ -376,11 +408,11 @@ class HGNModel(nn.Module):
             a_t = actions[:, t]
             force = self.G_net(self.act_emb(a_t))
             q, p = self.integrator.step(
-                q, p, force, self.log_damping, self.T_net, self.V_net, dt=self.dt,
+                q, p, force, gamma, self.T_net, self.V_net, dt=self.dt,
             )
             q_seq.append(q)
             p_seq.append(p)
-        return torch.stack(q_seq, dim=1), torch.stack(p_seq, dim=1)
+        return torch.stack(q_seq, dim=1), torch.stack(p_seq, dim=1), gamma
 
     def forward(self, images_ctx, actions, horizon):
         """Full forward pass.
@@ -390,12 +422,16 @@ class HGNModel(nn.Module):
             actions:    (B, horizon)        — actions driving each rollout step.
             horizon:    int                 — number of integration steps.
 
-        Returns dict with mu_z, logvar_z, z_sample, pred_q, pred_p, pred_images.
+        Returns dict with mu_z, logvar_z, z_sample, pred_q, pred_p, pred_images,
+        gamma. gamma is included for downstream diagnostic logging.
         """
         mu_z, logvar_z = self.encode_context(images_ctx)
         z_sample = self.reparameterize(mu_z, logvar_z)
         q_0, p_0 = self.f_psi(z_sample)
-        q_seq, p_seq = self.integrate(q_0, p_0, actions, horizon)
+
+        # actions sometimes carries horizon+ entries upstream; slice defensively.
+        actions_h = actions[:, :horizon]
+        q_seq, p_seq, gamma = self.integrate(q_0, p_0, actions_h, z=z_sample)
 
         B, Tp1, D = q_seq.shape
         flat_q = q_seq.reshape(B * Tp1, D)
@@ -410,6 +446,7 @@ class HGNModel(nn.Module):
             "pred_q":      q_seq,
             "pred_p":      p_seq,
             "pred_images": pred_images,
+            "gamma":       gamma,
         }
 
 
