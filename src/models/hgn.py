@@ -131,18 +131,60 @@ class VNet(nn.Module):
 
 
 class GNet(nn.Module):
-    """Action force G(a): linear map from action embedding to momentum increment.
+    """Action force G(a) — or G(a, z) — from action embedding to momentum increment.
 
-    Matches the existing HamiltonianPredictor.G_net convention (linear, no
-    activation).
+    Modes:
+        'linear':       nn.Linear(action_embedding_dim, latent_channels).
+                        Faithful to the existing HGN port extension. No activation
+                        (force is signed; softplus would break action symmetry).
+        'spectral_mlp': 2-layer MLP with LeakyReLU + spectral_norm on each Linear,
+                        scaled by a learnable scalar G_scale. Bounds the operator
+                        norm of G_net, which caps per-step momentum injection
+                        magnitude — targets failure mechanism M3 (G-net alignment
+                        with the integrator's unstable subspace past dt > 2/ω).
+                        Optionally concatenates z (the posterior sample) to the
+                        input, giving per-trajectory G(a, z).
     """
 
-    def __init__(self, action_embedding_dim=8, latent_channels=64):
+    def __init__(self, action_embedding_dim=8, latent_channels=64, hidden_dim=256,
+                 g_mode="linear", cond_dim=0):
         super().__init__()
-        self.net = nn.Linear(action_embedding_dim, latent_channels)
+        self.g_mode = g_mode
+        self.cond_dim = cond_dim
+        in_dim = action_embedding_dim + cond_dim
 
-    def forward(self, a_emb):
-        return self.net(a_emb)
+        if g_mode == "linear":
+            if cond_dim != 0:
+                raise ValueError(
+                    "g_mode='linear' does not support conditioning (cond_dim must be 0). "
+                    "Use g_mode='spectral_mlp' for z-conditioned forces."
+                )
+            self.net = nn.Linear(action_embedding_dim, latent_channels)
+        elif g_mode == "spectral_mlp":
+            self.net = nn.Sequential(
+                nn.utils.spectral_norm(nn.Linear(in_dim, hidden_dim // 2)),
+                nn.LeakyReLU(0.2),
+                nn.utils.spectral_norm(nn.Linear(hidden_dim // 2, latent_channels)),
+            )
+            # Learnable scalar that recovers representational scale (spectral_norm
+            # caps sigma_max <= 1 per layer; total operator norm <= |G_scale|).
+            self.G_scale = nn.Parameter(torch.tensor(1.0))
+        else:
+            raise ValueError(f"Unknown g_mode: {g_mode!r}")
+
+    def forward(self, a_emb, z=None):
+        if self.g_mode == "linear":
+            return self.net(a_emb)
+        # spectral_mlp
+        if self.cond_dim > 0:
+            if z is None:
+                raise ValueError(
+                    "g_mode='spectral_mlp' with cond_dim > 0 requires z to be passed."
+                )
+            x = torch.cat([a_emb, z], dim=-1)
+        else:
+            x = a_emb
+        return self.G_scale * self.net(x)
 
 
 def _grad(scalar_sum, x, create_graph):
@@ -294,6 +336,8 @@ class HGNModel(nn.Module):
         dt=0.4,
         damping_init=-1.0,
         damping_mode="global",   # 'global' (scalar Parameter) or 'adaptive' (Linear(D, 1))
+        g_mode="linear",
+        g_cond_on_z=False,
         name="hgn",
         **kwargs,
     ):
@@ -308,6 +352,8 @@ class HGNModel(nn.Module):
         self.dt = dt
         self.observation_dt = dt  # mirror VisualWorldModel attribute for eval reuse
         self.damping_mode = damping_mode
+        self.g_mode = g_mode
+        self.g_cond_on_z = g_cond_on_z
 
         self.encoder = HGNEncoder(
             channels=channels,
@@ -324,6 +370,9 @@ class HGNModel(nn.Module):
         self.G_net = GNet(
             action_embedding_dim=action_embedding_dim,
             latent_channels=latent_channels,
+            hidden_dim=hidden_dim,
+            g_mode=g_mode,
+            cond_dim=(latent_channels if (g_mode == "spectral_mlp" and g_cond_on_z) else 0),
         )
         self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
         # Checkpoint-compat note: 'global' and 'adaptive' modes register DIFFERENT
@@ -416,7 +465,8 @@ class HGNModel(nn.Module):
         q, p = q_0, p_0
         for t in range(horizon):
             a_t = actions[:, t]
-            force = self.G_net(self.act_emb(a_t))
+            a_emb = self.act_emb(a_t)
+            force = self.G_net(a_emb, z=z) if self.g_cond_on_z else self.G_net(a_emb)
             q, p = self.integrator.step(
                 q, p, force, gamma, self.T_net, self.V_net, dt=self.dt,
             )
