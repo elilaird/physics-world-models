@@ -1,0 +1,13 @@
+# HGN ablation variant: spectral-norm-constrained MLP G only (leapfrog, global gamma).
+# Isolates failure mechanism M3 (G-net alignment with the integrator's unstable
+# subspace at large dt).
+#
+# Use: python train_hgn.py model=hgn_specg
+
+defaults:
+  - hgn
+  - _self_
+
+name: hgn_specg
+g_mode: spectral_mlp
+g_cond_on_z: true

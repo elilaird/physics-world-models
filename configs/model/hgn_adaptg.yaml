@@ -1,0 +1,12 @@
+# HGN ablation variant: adaptive gamma(z) only (leapfrog integrator, linear G).
+# Isolates failure mechanism M2 (gamma*dt > 2 explicit-damping overshoot) under
+# the otherwise-faithful HGN.
+#
+# Use: python train_hgn.py model=hgn_adaptg
+
+defaults:
+  - hgn
+  - _self_
+
+name: hgn_adaptg
+damping_mode: adaptive
