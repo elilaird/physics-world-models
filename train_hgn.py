@@ -80,6 +80,41 @@ def _cosine_lr(base_lr, min_lr, epoch, total_epochs):
     return min_lr + 0.5 * (base_lr - min_lr) * (1 + math.cos(math.pi * frac))
 
 
+def _port_diagnostics(model, model_out, actions_for_rollout):
+    """Extract scalar diagnostics for the port-Hamiltonian extensions.
+
+    Returns:
+        gamma_mean: float — mean of gamma across the batch.
+        g_u_norm:   float — mean ||G(a)||_2 across the rollout's actions.
+        g_scale:    float — |G_scale| in spectral_mlp mode; nan in linear mode.
+    """
+    gamma = model_out.get("gamma")
+    if gamma is None:
+        gamma_mean = float("nan")
+    else:
+        gamma_mean = float(gamma.detach().mean().item())
+
+    # ||G_u||: compute G across the actual action sequence used in this rollout.
+    # Mirrors HGNModel.integrate's per-step force computation.
+    with torch.no_grad():
+        a_emb = model.act_emb(actions_for_rollout)             # (B, H, D_emb)
+        B, H, D_emb = a_emb.shape
+        a_flat = a_emb.reshape(B * H, D_emb)
+        if getattr(model, "g_cond_on_z", False):
+            z = model_out["z_sample"].unsqueeze(1).expand(B, H, -1).reshape(B * H, -1)
+            g_u = model.G_net(a_flat, z=z)
+        else:
+            g_u = model.G_net(a_flat)
+        g_u_norm = float(g_u.norm(dim=-1).mean().item())
+
+    # G_scale: only present in spectral_mlp mode. Use float('nan') as sentinel
+    # in linear mode so the wandb panel renders a clean gap rather than a 0.
+    g_scale = float(model.G_net.G_scale.detach().abs().item()) \
+        if hasattr(model.G_net, "G_scale") else float("nan")
+
+    return gamma_mean, g_u_norm, g_scale
+
+
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig):
     log.info(f"HGN training | model={cfg.model.name} | dataset={cfg.dataset.name}")
@@ -188,6 +223,7 @@ def main(cfg: DictConfig):
         # ----- train -----
         model.train()
         train_loss_sum, train_recon_sum, train_kl_sum, n_batches = 0.0, 0.0, 0.0, 0
+        train_gamma_sum, train_g_norm_sum, train_g_scale_sum = 0.0, 0.0, 0.0
         first_train_batch = None
         for batch in train_loader:
             images_full = batch["images"].to(device)
@@ -198,6 +234,10 @@ def main(cfg: DictConfig):
                 images_full, actions_full, t_ctx=t_ctx,
             )
             out = model.forward(images_ctx, actions_rollout, horizon=horizon)
+            _gamma_b, _g_norm_b, _g_scale_b = _port_diagnostics(model, out, actions_rollout)
+            train_gamma_sum += _gamma_b
+            train_g_norm_sum += _g_norm_b
+            train_g_scale_sum += _g_scale_b
             loss, components = compute_elbo_loss(out, recon_target, beta_kl=beta_kl)
 
             if not torch.isfinite(loss):
@@ -222,10 +262,14 @@ def main(cfg: DictConfig):
         train_loss = train_loss_sum / max(1, n_batches)
         train_recon = train_recon_sum / max(1, n_batches)
         train_kl = train_kl_sum / max(1, n_batches)
+        train_gamma = train_gamma_sum / max(1, n_batches)
+        train_g_norm = train_g_norm_sum / max(1, n_batches)
+        train_g_scale = train_g_scale_sum / max(1, n_batches)
 
         # ----- validate (scalar ELBO) -----
         model.eval()
         val_loss_sum, val_recon_sum, val_kl_sum, n_val_batches = 0.0, 0.0, 0.0, 0
+        val_gamma_sum, val_g_norm_sum, val_g_scale_sum = 0.0, 0.0, 0.0
         last_val_batch = None
         with torch.no_grad():
             for batch in val_loader:
@@ -236,6 +280,10 @@ def main(cfg: DictConfig):
                     images_full, actions_full, t_ctx=t_ctx,
                 )
                 out = model.forward(images_ctx, actions_rollout, horizon=horizon)
+                _gamma_b, _g_norm_b, _g_scale_b = _port_diagnostics(model, out, actions_rollout)
+                val_gamma_sum += _gamma_b
+                val_g_norm_sum += _g_norm_b
+                val_g_scale_sum += _g_scale_b
                 loss, components = compute_elbo_loss(out, recon_target, beta_kl=beta_kl)
                 val_loss_sum += loss.item()
                 val_recon_sum += components["recon"].item()
@@ -245,6 +293,9 @@ def main(cfg: DictConfig):
         val_loss = val_loss_sum / max(1, n_val_batches)
         val_recon = val_recon_sum / max(1, n_val_batches)
         val_kl = val_kl_sum / max(1, n_val_batches)
+        val_gamma = val_gamma_sum / max(1, n_val_batches)
+        val_g_norm = val_g_norm_sum / max(1, n_val_batches)
+        val_g_scale = val_g_scale_sum / max(1, n_val_batches)
 
         log.info(
             f"Epoch {epoch:3d} | lr={lr:.2e} | "
@@ -287,9 +338,15 @@ def main(cfg: DictConfig):
                 "train/loss": train_loss,
                 "train/recon": train_recon,
                 "train/kl": train_kl,
+                "train/gamma_mean": train_gamma,
+                "train/G_u_norm": train_g_norm,
+                "train/G_scale": train_g_scale,
                 "val/loss": val_loss,
                 "val/recon": val_recon,
                 "val/kl": val_kl,
+                "val/gamma_mean": val_gamma,
+                "val/G_u_norm": val_g_norm,
+                "val/G_scale": val_g_scale,
             }
 
             # Reconstruction grids (HGN: encode context, decode q_0).
@@ -373,6 +430,12 @@ def main(cfg: DictConfig):
                     dt_gen_log[f"val/dt_gen/dt={dt_val}/mae"] = m["mae"]
                     dt_gen_log[f"val/dt_gen/dt={dt_val}/ssim"] = m["ssim"]
                     dt_gen_log[f"val/dt_gen/dt={dt_val}/lpips"] = m["lpips"]
+                    # Diagnostic carry-overs: gamma, ||G_u||, and G_scale at this dt.
+                    # Computed from the last val batch as a representative — stable
+                    # for global modes, representative for adaptive modes.
+                    dt_gen_log[f"val/dt_gen/dt={dt_val}/gamma_mean"] = val_gamma
+                    dt_gen_log[f"val/dt_gen/dt={dt_val}/G_u_norm"] = val_g_norm
+                    dt_gen_log[f"val/dt_gen/dt={dt_val}/G_scale"] = val_g_scale
                     dt_gen_log[f"val/dt_gen/dt={dt_val}/latent_mse"] = dt_results[dt_val]["latent_mse"]
                     dt_gen_log[f"val/dt_gen/dt={dt_val}/rollout_grid"] = wandb_mod.Image(
                         dt_results[dt_val]["rollout_grid"].clamp(0, 1),
