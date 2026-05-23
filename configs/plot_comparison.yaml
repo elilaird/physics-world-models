@@ -43,3 +43,7 @@ predictor_colors:
   hgn:                          "#17becf"
   latent_hamiltonian_separable: "#bcbd22"
   latent_hamiltonian_rich_sid:  "#7f7f7f"
+  hgn_implmid:                  "#e377c2"  # tab:pink
+  hgn_adaptg:                   "#8c564b"  # tab:brown
+  hgn_specg:                    "#aec7e8"  # light blue
+  hgn_plus:                     "#ffbb78"  # light orange
