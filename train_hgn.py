@@ -234,10 +234,9 @@ def main(cfg: DictConfig):
                 images_full, actions_full, t_ctx=t_ctx,
             )
             out = model.forward(images_ctx, actions_rollout, horizon=horizon)
+            # Compute port diagnostics every batch (fires spectral_norm power-iteration
+            # on G_net) but only accumulate on COUNTED batches — see below.
             _gamma_b, _g_norm_b, _g_scale_b = _port_diagnostics(model, out, actions_rollout)
-            train_gamma_sum += _gamma_b
-            train_g_norm_sum += _g_norm_b
-            train_g_scale_sum += _g_scale_b
             loss, components = compute_elbo_loss(out, recon_target, beta_kl=beta_kl)
 
             if not torch.isfinite(loss):
@@ -258,6 +257,16 @@ def main(cfg: DictConfig):
             train_recon_sum += components["recon"].item()
             train_kl_sum += components["kl"].item()
             n_batches += 1
+            # Accumulate diagnostics only on counted batches so epoch means aren't
+            # biased by skipped (non-finite-loss / non-finite-grad) batches. The
+            # skip path is anti-correlated with normal behavior — skipped batches
+            # are exactly the ones where the integrator went unstable, i.e., where
+            # gamma / ||G_u|| / G_scale are most diagnostically interesting. Letting
+            # those grow the numerator without growing the divisor would bias the
+            # mean high in the direction that hides the failure mode.
+            train_gamma_sum += _gamma_b
+            train_g_norm_sum += _g_norm_b
+            train_g_scale_sum += _g_scale_b
 
         train_loss = train_loss_sum / max(1, n_batches)
         train_recon = train_recon_sum / max(1, n_batches)
@@ -280,15 +289,18 @@ def main(cfg: DictConfig):
                     images_full, actions_full, t_ctx=t_ctx,
                 )
                 out = model.forward(images_ctx, actions_rollout, horizon=horizon)
+                # Compute diagnostics every batch; accumulate only on counted batches
+                # (mirrors the train loop for symmetry — val has no skip path today,
+                # but ordering matters if one is ever added).
                 _gamma_b, _g_norm_b, _g_scale_b = _port_diagnostics(model, out, actions_rollout)
-                val_gamma_sum += _gamma_b
-                val_g_norm_sum += _g_norm_b
-                val_g_scale_sum += _g_scale_b
                 loss, components = compute_elbo_loss(out, recon_target, beta_kl=beta_kl)
                 val_loss_sum += loss.item()
                 val_recon_sum += components["recon"].item()
                 val_kl_sum += components["kl"].item()
                 n_val_batches += 1
+                val_gamma_sum += _gamma_b
+                val_g_norm_sum += _g_norm_b
+                val_g_scale_sum += _g_scale_b
 
         val_loss = val_loss_sum / max(1, n_val_batches)
         val_recon = val_recon_sum / max(1, n_val_batches)
@@ -430,9 +442,9 @@ def main(cfg: DictConfig):
                     dt_gen_log[f"val/dt_gen/dt={dt_val}/mae"] = m["mae"]
                     dt_gen_log[f"val/dt_gen/dt={dt_val}/ssim"] = m["ssim"]
                     dt_gen_log[f"val/dt_gen/dt={dt_val}/lpips"] = m["lpips"]
-                    # Diagnostic carry-overs: gamma, ||G_u||, and G_scale at this dt.
-                    # Computed from the last val batch as a representative — stable
-                    # for global modes, representative for adaptive modes.
+                    # Epoch-mean diagnostics replicated across every dt entry — diagnostics are
+                    # model-level, not dt-level. (When dt-gen tests are upgraded to compute
+                    # per-dt gamma/G_u_norm intrinsically, replace these lines.)
                     dt_gen_log[f"val/dt_gen/dt={dt_val}/gamma_mean"] = val_gamma
                     dt_gen_log[f"val/dt_gen/dt={dt_val}/G_u_norm"] = val_g_norm
                     dt_gen_log[f"val/dt_gen/dt={dt_val}/G_scale"] = val_g_scale
