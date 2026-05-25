@@ -145,6 +145,34 @@ def main(cfg: DictConfig):
     # ----- Optimizer -----
     optim = torch.optim.Adam(model.parameters(), lr=cfg.training.lr)
 
+    # ----- Resume (optional) -----
+    # resume_checkpoint restores full training state (model + optimizer + epoch)
+    # so the cosine LR schedule and Adam moments continue from where a killed run
+    # left off. Distinct from pretrained_checkpoint (weights-only init). The epoch
+    # loop below starts at start_epoch; _cosine_lr is a pure function of epoch, so
+    # the schedule resumes correctly once start_epoch is set.
+    start_epoch = 0
+    resume_ckpt = None
+    resume_path = cfg.get("resume_checkpoint", None)
+    if resume_path:
+        log.info(f"Resuming from checkpoint: {resume_path}")
+        resume_ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        model.load_state_dict(resume_ckpt["model_state_dict"])
+        if "optimizer_state_dict" in resume_ckpt:
+            optim.load_state_dict(resume_ckpt["optimizer_state_dict"])
+            log.info("  Restored optimizer state.")
+        else:
+            log.warning(
+                "  Checkpoint has no optimizer_state_dict (saved before resume "
+                "support existed). Adam restarts from zero moment estimates — "
+                "acceptable for low-LR endgame resumes, suboptimal mid-anneal."
+            )
+        start_epoch = resume_ckpt["epoch"] + 1
+        log.info(
+            f"  Resuming at epoch {start_epoch} "
+            f"(checkpoint was epoch {resume_ckpt['epoch']})."
+        )
+
     # ----- wandb -----
     use_wandb = cfg.wandb.enabled
     if use_wandb:
@@ -211,10 +239,16 @@ def main(cfg: DictConfig):
     # Env for dt-generalization rollout (fresh trajectories sampled from env).
     env = rebuild_env(cfg)
 
-    best_dt_gen_psnr = -float("inf")
-    best_val_loss = float("inf")
+    # Restore best-trackers on resume so the resumed run only overwrites
+    # best_model.pt when it genuinely beats the pre-resume best. Without this,
+    # the first resumed epoch always re-saves best_model.pt (the ±inf init
+    # always loses), which would clobber a better pre-resume checkpoint when
+    # resuming mid-anneal. Falls back to ±inf for checkpoints saved before
+    # these fields existed.
+    best_dt_gen_psnr = resume_ckpt.get("best_dt_gen_psnr", -float("inf")) if resume_ckpt else -float("inf")
+    best_val_loss = resume_ckpt.get("best_val_loss", float("inf")) if resume_ckpt else float("inf")
 
-    for epoch in range(cfg.training.epochs):
+    for epoch in range(start_epoch, cfg.training.epochs):
         # LR schedule
         lr = _cosine_lr(cfg.training.lr, cfg.training.lr_min, epoch, cfg.training.epochs)
         for g in optim.param_groups:
@@ -490,9 +524,12 @@ def main(cfg: DictConfig):
         # ----- checkpoint -----
         ckpt = {
             "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optim.state_dict(),
             "epoch": epoch,
             "val_loss": val_loss,
             "rollout_psnr": rollout_psnr,
+            "best_dt_gen_psnr": best_dt_gen_psnr,
+            "best_val_loss": best_val_loss,
             "config": OmegaConf.to_container(cfg, resolve=True),
         }
         torch.save(ckpt, os.path.join(ckpt_dir, f"model_epoch_{epoch}.pt"))
@@ -503,6 +540,10 @@ def main(cfg: DictConfig):
         if training_dt_psnr is not None:
             if training_dt_psnr > best_dt_gen_psnr:
                 best_dt_gen_psnr = training_dt_psnr
+                # Reflect the just-updated best in the saved dict so a resume
+                # from best_model.pt restores the correct best-tracker (the dict
+                # was built above with the pre-update value).
+                ckpt["best_dt_gen_psnr"] = best_dt_gen_psnr
                 torch.save(ckpt, os.path.join(ckpt_dir, "best_model.pt"))
                 log.info(
                     f"  New best dt-gen PSNR @ dt={training_dt}: "
@@ -510,6 +551,7 @@ def main(cfg: DictConfig):
                 )
         elif val_loss < best_val_loss:
             best_val_loss = val_loss
+            ckpt["best_val_loss"] = best_val_loss
             torch.save(ckpt, os.path.join(ckpt_dir, "best_model.pt"))
             log.info(f"  New best val_loss={val_loss:.4f} (pre-dt-gen) — saving best_model.pt")
 
