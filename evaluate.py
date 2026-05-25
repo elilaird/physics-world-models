@@ -397,8 +397,16 @@ def main(cfg: DictConfig):
     # Use infer_context_length because visual_open_loop_rollout seeds its
     # infer() call from the first infer_ctx latents. Grid alignment depends
     # on matching this constant throughout the script.
-    ctx_len = getattr(model, "infer_context_length", model.context_length)
-    K = model.encoder_frames
+    # NB: avoid getattr(model, "infer_context_length", model.context_length) —
+    # the default arg is evaluated eagerly, and HGNModel has infer_context_length
+    # but NO context_length/encoder_frames (those are JEPA-encoder concepts), so
+    # the eager default would AttributeError on HGN. HGN doesn't use ctx_len/K/
+    # horizon anyway (it dispatches to _run_hgn_basic_eval below, which does
+    # full-sequence rollout with its own T_ctx), so the K=1 fallback is harmless.
+    ctx_len = getattr(model, "infer_context_length", None)
+    if ctx_len is None:
+        ctx_len = model.context_length
+    K = getattr(model, "encoder_frames", 1)
     N_latents = N - K + 1
     horizon = N_latents - ctx_len
 
