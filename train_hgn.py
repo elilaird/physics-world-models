@@ -129,6 +129,19 @@ def main(cfg: DictConfig):
     n_params = sum(p.numel() for p in model.parameters())
     log.info(f"HGN parameter count: {n_params:,}")
 
+    # Eval-time integrator substepping (diagnostic). At eval/dt-gen, each
+    # observation step at dt is split into N internal substeps of dt/N (same
+    # action across all N). HGNModel.integrate reads model._eval_substeps,
+    # gated on `not self.training` (so training always uses a single step at
+    # the training dt). Default 1 = unchanged. Mirrors evaluate.py's wiring of
+    # the JEPA predictors' _eval_substeps.
+    model._eval_substeps = int(cfg.eval.get("substeps", 1))
+    if model._eval_substeps > 1:
+        log.info(
+            f"Eval substeps: {model._eval_substeps} (each observation dt split "
+            f"into {model._eval_substeps} internal integration steps at eval/dt-gen)"
+        )
+
     # ----- Dataset -----
     dataset_version = os.path.join(cfg.dataset.name, cfg.dataset.version)
     train_path = os.path.join(cfg.data_root, dataset_version, "train.npz")

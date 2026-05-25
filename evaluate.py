@@ -256,7 +256,15 @@ def main(cfg: DictConfig):
     # at large dt?" — isolates integrator step size from theta inference
     # and other downstream causes. Default 1 = unchanged behavior.
     eval_substeps = int(cfg.eval.get("substeps", 1))
-    model.predictor._eval_substeps = eval_substeps
+    # HGN has no .predictor — the substep knob lives on the model itself
+    # (HGNModel.integrate reads model._eval_substeps). JEPA models carry it on
+    # the predictor (BasePredictor.unroll reads predictor._eval_substeps).
+    # Unconditional model.predictor access here would AttributeError on HGN
+    # checkpoints before reaching the is_hgn branch below.
+    if is_hgn:
+        model._eval_substeps = eval_substeps
+    else:
+        model.predictor._eval_substeps = eval_substeps
     if eval_substeps > 1:
         log.info(f"Eval substeps: {eval_substeps} (each observation dt is split "
                  f"into {eval_substeps} internal integration steps)")

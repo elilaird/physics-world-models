@@ -460,6 +460,23 @@ class HGNModel(nn.Module):
         else:
             raise ValueError(f"Unknown damping_mode: {self.damping_mode!r}")
 
+        # Eval-time substepping: split each observation step (dt = self.dt) into
+        # n_substeps internal integration steps of dt/n_substeps, applying the
+        # same action force across all substeps. Only the post-substep (q, p) is
+        # emitted per observation, so q_seq/p_seq still align 1:1 with GT frames.
+        # Training always uses n_substeps=1 (single step at the training dt).
+        # Mirrors BasePredictor.unroll's _eval_substeps in predictors.py.
+        # Diagnostic for "is the dt-gen failure due to integrator step size, or
+        # learned-H extrapolation?": finer integration at large dt isolates
+        # truncation error (substepping fixes it) from phase-space coverage
+        # (substepping does not — the trajectory visits the same far-out (q,p)).
+        # Action impulse is preserved: n_substeps * (dt/n_substeps) * force =
+        # dt * force; damping is integrated finer (more accurate), not rescaled.
+        n_substeps = 1
+        if not self.training:
+            n_substeps = max(1, int(getattr(self, "_eval_substeps", 1)))
+        sub_dt = self.dt / n_substeps
+
         q_seq = [q_0]
         p_seq = [p_0]
         q, p = q_0, p_0
@@ -467,9 +484,10 @@ class HGNModel(nn.Module):
             a_t = actions[:, t]
             a_emb = self.act_emb(a_t)
             force = self.G_net(a_emb, z=z) if self.g_cond_on_z else self.G_net(a_emb)
-            q, p = self.integrator.step(
-                q, p, force, gamma, self.T_net, self.V_net, dt=self.dt,
-            )
+            for _ in range(n_substeps):
+                q, p = self.integrator.step(
+                    q, p, force, gamma, self.T_net, self.V_net, dt=sub_dt,
+                )
             q_seq.append(q)
             p_seq.append(p)
         return torch.stack(q_seq, dim=1), torch.stack(p_seq, dim=1), gamma
