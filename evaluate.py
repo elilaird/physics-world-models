@@ -317,8 +317,17 @@ def main(cfg: DictConfig):
 
     ckpt, train_cfg = load_checkpoint(cfg.checkpoint)
 
-    # Rebuild model from training config
-    model = rebuild_model(train_cfg)
+    # Rebuild model from training config. HGN models use a different class
+    # (HGNModel) and rebuild path than the JEPA MODEL_REGISTRY models — detect
+    # from model.type ('hgn' for all HGN variants; set in configs/model/hgn.yaml
+    # and inherited by hgn_implmid/adaptg/specg/plus via defaults) and
+    # instantiate directly via hydra, mirroring train_hgn.py. rebuild_model
+    # would KeyError on MODEL_REGISTRY[cfg.model.name] since HGN variant names
+    # (hgn, hgn_specg, ...) aren't registered there.
+    if train_cfg.model.get("type", None) == "hgn":
+        model = hydra.utils.instantiate(train_cfg.model)
+    else:
+        model = rebuild_model(train_cfg)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
@@ -344,7 +353,10 @@ def main(cfg: DictConfig):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-    log.info(f"Loaded {train_cfg.model.name} / {train_cfg.predictor.name} "
+    # HGN configs have no `predictor` block (the model IS the predictor); fall
+    # back to model.name so this log line doesn't AttributeError on HGN.
+    predictor_name = train_cfg.predictor.name if "predictor" in train_cfg else train_cfg.model.name
+    log.info(f"Loaded {train_cfg.model.name} / {predictor_name} "
              f"(epoch {ckpt['epoch']}, val_loss={ckpt.get('val_loss', 'N/A')})")
 
     output_dir = cfg.checkpoint_dir
