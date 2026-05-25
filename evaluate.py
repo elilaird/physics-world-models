@@ -41,7 +41,7 @@ from src.data.precomputed import PrecomputedDataset
 # for HGN because they internally call visual_open_loop_rollout which assumes
 # the VisualWorldModel encoder API.
 from src.models.hgn import HGNModel
-from src.eval.hgn_rollout import hgn_open_loop_rollout
+from src.eval.hgn_rollout import hgn_open_loop_rollout, hgn_dt_generalization_test
 
 log = logging.getLogger(__name__)
 
@@ -137,6 +137,78 @@ def _run_hgn_basic_eval(model, images, actions, output_dir, cfg, train_cfg, ckpt
     )
     log.info(f"Saved: {latent_error_path}")
 
+    # ----- dt-generalization -----
+    # HGN analog of the VisualWorldModel dt-gen block. Reuses the existing
+    # hgn_dt_generalization_test (the same function train_hgn.py logs every
+    # dt_gen_every epochs), so eval-job dt-gen matches the in-training panel.
+    # Substepping is already wired: model._eval_substeps was set from
+    # cfg.eval.substeps before this function was called, and HGNModel.integrate
+    # reads it — so the rollouts here honor the substep count.
+    #
+    # SCOPED OUT (flagged, not silently dropped): energy-stratified and
+    # fixed-init dt-gen (the VisualWorldModel path's
+    # visual_energy_stratified_test / visual_fixed_init_stratified_test). Those
+    # are separate, heavier features not needed for the substepping diagnostic;
+    # add them here if a later analysis needs per-band HGN curves.
+    dt_values = list(cfg.eval.dt_values)
+    dt_seq_len = cfg.eval.get("dt_seq_len", None) or train_cfg.dataset.get("seq_len", T_ctx + 10)
+    n_substeps = int(getattr(model, "_eval_substeps", 1))
+    env = rebuild_env(train_cfg)
+    log.info(
+        f"HGN dt-generalization: dt_values={dt_values} "
+        f"(seq_len={dt_seq_len}, substeps={n_substeps})"
+    )
+    dt_results = hgn_dt_generalization_test(
+        model, env, dt_values, train_cfg, n_seqs=n_rollouts, seq_len=dt_seq_len,
+    )
+    dt_sorted = sorted(dt_results.keys())
+    for dt_val in dt_sorted:
+        m = dt_results[dt_val]["metrics"]
+        log.info(
+            f"  dt={dt_val}: MAE={m['mae']:.4f} | PSNR={m['psnr']:.2f} | "
+            f"SSIM={m['ssim']:.4f} | LPIPS={m['lpips']:.4f} | "
+            f"Latent MSE={dt_results[dt_val]['latent_mse']:.6f}"
+        )
+
+    # Per-dt rollout grids (mirrors the VisualWorldModel dt-gen grid save).
+    for dt_val in dt_sorted:
+        dt_grid = dt_results[dt_val]["rollout_grid"]
+        C_grid = dt_grid.shape[0]
+        dt_grid_path = os.path.join(output_dir, f"dt_rollout_{dt_val}.png")
+        plt.figure(figsize=(max(16, dt_grid.shape[-1] // 32), dt_grid.shape[-2] // 16))
+        if C_grid == 1:
+            plt.imshow(dt_grid.squeeze(0).numpy(), cmap="gray")
+        else:
+            plt.imshow(dt_grid.permute(1, 2, 0).numpy())
+        plt.axis("off")
+        plt.title(f"dt={dt_val} (substeps={n_substeps}) — GT | Pred | |Error|")
+        plt.tight_layout()
+        plt.savefig(dt_grid_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        log.info(f"Saved: {dt_grid_path}")
+
+    # dt-gen bar charts.
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    dt_labels = [str(d) for d in dt_sorted]
+    for ax, metric_key, label in zip(
+        axes.flat,
+        ["mae", "psnr", "ssim", "lpips"],
+        ["MAE (lower=better)", "PSNR dB (higher=better)",
+         "SSIM (higher=better)", "LPIPS (lower=better)"],
+    ):
+        vals = [dt_results[d]["metrics"][metric_key] for d in dt_sorted]
+        ax.bar(dt_labels, vals, color="steelblue")
+        ax.set_xlabel("dt")
+        ax.set_ylabel(label)
+        ax.set_title(label)
+        ax.grid(True, alpha=0.3, axis="y")
+    fig.suptitle(f"{train_cfg.model.name} (HGN) — dt Generalization (substeps={n_substeps})")
+    plt.tight_layout()
+    dt_plot_path = os.path.join(output_dir, "hgn_dt_generalization.png")
+    plt.savefig(dt_plot_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    log.info(f"Saved: {dt_plot_path}")
+
     # Save eval_metrics.pt
     all_metrics = {
         "model": train_cfg.model.name,
@@ -147,6 +219,17 @@ def _run_hgn_basic_eval(model, images, actions, output_dir, cfg, train_cfg, ckpt
         "n_rollouts": n_rollouts,
         "latent_mse": latent_mse,
         "latent_mse_per_step": latent_mse_per_step.cpu().numpy().tolist(),
+        "eval_substeps": n_substeps,
+        "dt_generalization": {
+            float(dt_val): {
+                "latent_mse": dt_results[dt_val]["latent_mse"],
+                "mae": dt_results[dt_val]["metrics"]["mae"],
+                "psnr": dt_results[dt_val]["metrics"]["psnr"],
+                "ssim": dt_results[dt_val]["metrics"]["ssim"],
+                "lpips": dt_results[dt_val]["metrics"]["lpips"],
+            }
+            for dt_val in dt_sorted
+        },
         **vis_metrics,
     }
     metrics_pt_path = os.path.join(output_dir, "eval_metrics.pt")
@@ -164,11 +247,18 @@ def _run_hgn_basic_eval(model, images, actions, output_dir, cfg, train_cfg, ckpt
             horizon=horizon_metric,
             ctx_len=T_ctx,
             n_seqs=n_rollouts,
-            dt_values=[training_dt],  # single dt; no dt-gen for HGN
+            dt_values=dt_values,
             latent_dim=train_cfg.model.latent_channels,
             eval_dataset_dir=cfg.eval.get("eval_dataset_dir", None),
         )
-        curves_logger.set_test_final(fixed_dt=fixed_dt_curves, per_dt={})
+        # Assemble per_dt from dt_results (mirrors the VisualWorldModel path).
+        test_per_dt = {}
+        for dt_val in dt_sorted:
+            entry = dict(dt_results[dt_val]["latent_curves"])
+            if dt_results[dt_val].get("qp_curves") is not None:
+                entry.update(dt_results[dt_val]["qp_curves"])
+            test_per_dt[dt_val] = entry
+        curves_logger.set_test_final(fixed_dt=fixed_dt_curves, per_dt=test_per_dt)
         log.info(f"Saved eval_curves.pt to: {curves_path}")
 
     # Optional wandb logging — minimal HGN payload.
@@ -202,6 +292,18 @@ def _run_hgn_basic_eval(model, images, actions, output_dir, cfg, train_cfg, ckpt
         }
         for k, v in fixed_dt_curves.items():
             wandb_log[f"eval/{k}_mean"] = float(v.mean().item())
+        # dt-generalization: per-dt scalars + rollout grids + the bar chart.
+        wandb_log["eval/dt_generalization_plot"] = wandb_mod.Image(dt_plot_path)
+        for dt_val in dt_sorted:
+            m = dt_results[dt_val]["metrics"]
+            wandb_log[f"eval_dt/dt={dt_val}/psnr"] = m["psnr"]
+            wandb_log[f"eval_dt/dt={dt_val}/mae"] = m["mae"]
+            wandb_log[f"eval_dt/dt={dt_val}/ssim"] = m["ssim"]
+            wandb_log[f"eval_dt/dt={dt_val}/lpips"] = m["lpips"]
+            wandb_log[f"eval_dt/dt={dt_val}/latent_mse"] = dt_results[dt_val]["latent_mse"]
+            wandb_log[f"eval_dt/dt={dt_val}/rollout_grid"] = wandb_mod.Image(
+                dt_results[dt_val]["rollout_grid"].clamp(0, 1)
+            )
         wandb_mod.log(wandb_log)
         wandb_mod.finish()
         log.info("Logged results to wandb")
