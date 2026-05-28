@@ -41,7 +41,11 @@ from src.data.precomputed import PrecomputedDataset
 # for HGN because they internally call visual_open_loop_rollout which assumes
 # the VisualWorldModel encoder API.
 from src.models.hgn import HGNModel
-from src.eval.hgn_rollout import hgn_open_loop_rollout, hgn_dt_generalization_test
+from src.eval.hgn_rollout import (
+    hgn_open_loop_rollout,
+    hgn_dt_generalization_test,
+    compute_hgn_energy_curve,
+)
 
 log = logging.getLogger(__name__)
 
@@ -63,9 +67,17 @@ def _run_hgn_basic_eval(model, images, actions, output_dir, cfg, train_cfg, ckpt
     )
 
     result = hgn_open_loop_rollout(model, images, actions)
-    pred_latents = result["pred_latents"]   # (B, horizon, D)
-    true_latents = result["true_latents"]   # (B, N - T_ctx + 1, D)
-    pred_images = result["pred_images"]     # (B, N, C, H, W) — every frame decoded
+    pred_latents  = result["pred_latents"]    # (B, horizon, D)
+    pred_momentum = result["pred_momentum"]   # (B, horizon, D)
+    true_latents  = result["true_latents"]    # (B, N - T_ctx + 1, D)
+    pred_images   = result["pred_images"]     # (B, N, C, H, W) — every frame decoded
+
+    # Hamiltonian energy along the rollout. H3 diagnostic: if H drifts/oscillates
+    # while reconstructions look ringy late, the learned ODE is wandering off the
+    # physical energy manifold (fix at the energy nets). If H is well-behaved but
+    # rendering still degrades, the decoder is failing on in-manifold q (fix at
+    # the encoder/decoder pair).
+    energy_curves = compute_hgn_energy_curve(model, pred_latents, pred_momentum)
     # Paper-faithful HGN: pred_latents aligned with frames 0..N-1; latent
     # metrics are computed on the OVERLAP with sliding-window GT
     # (frames T_ctx-1..N-1).
@@ -121,6 +133,33 @@ def _run_hgn_basic_eval(model, images, actions, output_dir, cfg, train_cfg, ckpt
     plt.savefig(metrics_path, dpi=150, bbox_inches="tight")
     plt.close()
     log.info(f"Saved: {metrics_path}")
+
+    # Energy diagnostic: H = T(p_t) + V(q_t), plus components. Plot mean ± std
+    # across the batch dim so deviation across trajectories is visible.
+    e_total     = energy_curves["energy"].numpy()       # (B, N)
+    e_kinetic   = energy_curves["kinetic"].numpy()      # (B, N)
+    e_potential = energy_curves["potential"].numpy()    # (B, N)
+    e_steps = range(e_total.shape[1])
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    for ax, curve, label in zip(
+        axes,
+        [e_total, e_kinetic, e_potential],
+        ["H = T(p) + V(q)", "Kinetic T(p)", "Potential V(q)"],
+    ):
+        mean = curve.mean(axis=0)
+        std  = curve.std(axis=0)
+        ax.plot(e_steps, mean, linewidth=2, color="steelblue")
+        ax.fill_between(e_steps, mean - std, mean + std, alpha=0.25, color="steelblue")
+        ax.set_xlabel("Rollout step")
+        ax.set_ylabel(label)
+        ax.set_title(label)
+        ax.grid(True, alpha=0.3)
+    fig.suptitle(f"{train_cfg.model.name} (HGN) — Hamiltonian energy along rollout")
+    plt.tight_layout()
+    energy_path = os.path.join(output_dir, "energy_curve.png")
+    plt.savefig(energy_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    log.info(f"Saved: {energy_path}")
 
     # Latent error figure (fixed-dt only — no dt-gen for HGN in this PR).
     fixed_horizon = fixed_dt_curves["latent_mse"].shape[1]
@@ -219,6 +258,10 @@ def _run_hgn_basic_eval(model, images, actions, output_dir, cfg, train_cfg, ckpt
         "n_rollouts": n_rollouts,
         "latent_mse": latent_mse,
         "latent_mse_per_step": latent_mse_per_step.cpu().numpy().tolist(),
+        "energy_mean":    e_total.mean(axis=0).tolist(),
+        "energy_std":     e_total.std(axis=0).tolist(),
+        "kinetic_mean":   e_kinetic.mean(axis=0).tolist(),
+        "potential_mean": e_potential.mean(axis=0).tolist(),
         "eval_substeps": n_substeps,
         "dt_generalization": {
             float(dt_val): {

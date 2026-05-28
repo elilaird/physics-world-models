@@ -48,16 +48,20 @@ def hgn_open_loop_rollout(model, images, actions, dt=None):
 
     Returns:
         dict with:
-            pred_latents: (B, N, D) — q_0..q_{N-1} aligned with frames 0..N-1.
-                          Full sequence coverage; q_0 represents frame 0 per
-                          the paper.
-            pred_images:  (B, N, C, H, W) — decoded q_t for every frame.
-            true_latents: (B, N - T_ctx + 1, D) — sliding-window per-frame
-                          HGN latents for frames T_ctx-1..N-1. Used by
-                          latent-divergence metrics as the "GT" latent.
-                          Frames 0..T_ctx-2 don't have enough preceding
-                          context to slide the encoder window, so they are
-                          omitted from true_latents.
+            pred_latents:  (B, N, D) — q_0..q_{N-1} aligned with frames 0..N-1.
+                           Full sequence coverage; q_0 represents frame 0 per
+                           the paper.
+            pred_momentum: (B, N, D) — p_0..p_{N-1} aligned with frames 0..N-1.
+                           Needed for the Hamiltonian-energy diagnostic
+                           H(q_t, p_t) = T(p_t) + V(q_t); see
+                           compute_hgn_energy_curve below.
+            pred_images:   (B, N, C, H, W) — decoded q_t for every frame.
+            true_latents:  (B, N - T_ctx + 1, D) — sliding-window per-frame
+                           HGN latents for frames T_ctx-1..N-1. Used by
+                           latent-divergence metrics as the "GT" latent.
+                           Frames 0..T_ctx-2 don't have enough preceding
+                           context to slide the encoder window, so they are
+                           omitted from true_latents.
     """
     B, N, C, H, W = images.shape
     T_ctx = model.infer_context_length
@@ -98,11 +102,12 @@ def hgn_open_loop_rollout(model, images, actions, dt=None):
     saved_dt = model.dt
     model.dt = dt_eff
     try:
-        q_seq, _, _ = model.integrate(q_0, p_0, actions_rollout, z=mu_z)
+        q_seq, p_seq, _ = model.integrate(q_0, p_0, actions_rollout, z=mu_z)
     finally:
         model.dt = saved_dt
-    # q_seq has shape (B, horizon+1, D) = (B, N, D), aligned with frames 0..N-1.
-    pred_latents = q_seq                                   # (B, N, D)
+    # q_seq, p_seq each (B, horizon+1, D) = (B, N, D), aligned with frames 0..N-1.
+    pred_latents  = q_seq                                  # (B, N, D)
+    pred_momentum = p_seq                                  # (B, N, D)
 
     # ----- Decode every frame -----
     flat = pred_latents.reshape(B * N, D)
@@ -110,9 +115,54 @@ def hgn_open_loop_rollout(model, images, actions, dt=None):
     pred_images = decoded.reshape(B, N, C, H, W)
 
     return {
-        "pred_latents": pred_latents,
-        "true_latents": true_latents,
-        "pred_images":  pred_images,
+        "pred_latents":  pred_latents,
+        "pred_momentum": pred_momentum,
+        "true_latents":  true_latents,
+        "pred_images":   pred_images,
+    }
+
+
+@torch.no_grad()
+def compute_hgn_energy_curve(model, pred_latents, pred_momentum):
+    """Hamiltonian energy H(q_t, p_t) = T_net(p_t) + V_net(q_t) along an HGN rollout.
+
+    Diagnostic for whether late-rollout decoder failures are caused by the
+    learned ODE drifting off the physical energy manifold, vs. the decoder
+    being unable to render in-manifold q. Pair with the rollout grid:
+
+    - Energy decays monotonically + images look ringy late
+        → ODE is fine on-trajectory; decoder fails on in-manifold q the
+          decoder didn't see enough of during training. Fix at the
+          encoder/decoder pair (e.g., input-noise augmentation on q).
+    - Energy oscillates or grows late
+        → learned H extrapolates poorly off-trajectory. Fix at the energy
+          nets (e.g., spectral norm on T_net/V_net, smoothness penalty).
+
+    Args:
+        model:         HGNModel with .T_net and .V_net.
+        pred_latents:  (B, N, D) — q_t along the rollout.
+        pred_momentum: (B, N, D) — p_t along the rollout (aligned with q_t).
+
+    Returns:
+        dict with CPU tensors of shape (B, N):
+            'energy':    H = T(p_t) + V(q_t).
+            'kinetic':   T(p_t).
+            'potential': V(q_t).
+    """
+    if pred_latents.shape != pred_momentum.shape:
+        raise ValueError(
+            f"pred_latents {tuple(pred_latents.shape)} must match "
+            f"pred_momentum {tuple(pred_momentum.shape)}."
+        )
+    B, N, D = pred_latents.shape
+    flat_q = pred_latents.reshape(B * N, D)
+    flat_p = pred_momentum.reshape(B * N, D)
+    T_vals = model.T_net(flat_p).reshape(B, N)
+    V_vals = model.V_net(flat_q).reshape(B, N)
+    return {
+        "energy":    (T_vals + V_vals).detach().cpu(),
+        "kinetic":   T_vals.detach().cpu(),
+        "potential": V_vals.detach().cpu(),
     }
 
 

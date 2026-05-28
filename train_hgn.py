@@ -146,13 +146,18 @@ def main(cfg: DictConfig):
     dataset_version = os.path.join(cfg.dataset.name, cfg.dataset.version)
     train_path = os.path.join(cfg.data_root, dataset_version, "train.npz")
     val_path = os.path.join(cfg.data_root, dataset_version, "val.npz")
+    test_path = os.path.join(cfg.data_root, dataset_version, "test.npz")
     train_data = PrecomputedDataset(train_path)
     val_data = PrecomputedDataset(val_path)
+    test_data = PrecomputedDataset(test_path)
     train_loader = DataLoader(
         train_data, batch_size=cfg.training.batch_size, shuffle=True, num_workers=2,
     )
     val_loader = DataLoader(
         val_data, batch_size=cfg.training.batch_size, shuffle=False, num_workers=2,
+    )
+    test_loader = DataLoader(
+        test_data, batch_size=cfg.training.batch_size, shuffle=False, num_workers=2,
     )
 
     # ----- Optimizer -----
@@ -567,6 +572,94 @@ def main(cfg: DictConfig):
             ckpt["best_val_loss"] = best_val_loss
             torch.save(ckpt, os.path.join(ckpt_dir, "best_model.pt"))
             log.info(f"  New best val_loss={val_loss:.4f} (pre-dt-gen) — saving best_model.pt")
+
+    # ----- Test-set evaluation (parallel of train_visual.py:988-1034) -----
+    # Use the FINAL-epoch weights (the live `model` object) rather than reloading
+    # best_model.pt. Rationale: with cosine LR + KL annealing, "best on val" is
+    # often an early-epoch checkpoint whose dynamics are still under-trained; the
+    # final-epoch model is what'd be deployed and is the apples-to-apples
+    # comparison to the val loss at the same epoch. Pass `cfg.eval.test_use_best=true`
+    # if you ever need the old behavior (reload best_model.pt before test).
+    if cfg.eval.get("test_use_best", False):
+        best_ckpt_path = os.path.join(ckpt_dir, "best_model.pt")
+        if os.path.exists(best_ckpt_path):
+            log.info(f"Loading best checkpoint for test eval: {best_ckpt_path}")
+            best_ckpt = torch.load(best_ckpt_path, map_location=device, weights_only=False)
+            model.load_state_dict(best_ckpt["model_state_dict"])
+            log.info(f"  Loaded epoch {best_ckpt['epoch']}.")
+        else:
+            log.warning(
+                f"test_use_best=true but no best_model.pt at {best_ckpt_path}; "
+                f"falling back to final-epoch weights."
+            )
+    else:
+        log.info("Running test eval on final-epoch weights (cfg.eval.test_use_best=false).")
+
+    model.eval()
+
+    # Scalar ELBO over the test split (same loss as train/val).
+    test_loss_sum, test_recon_sum, test_kl_sum, n_test_batches = 0.0, 0.0, 0.0, 0
+    for batch in test_loader:
+        images_full = batch["images"].to(device)
+        actions_full = batch["actions"].to(device)
+        images_ctx, actions_rollout, recon_target, horizon = build_hgn_batch(
+            images_full, actions_full, t_ctx=t_ctx,
+        )
+        out = model.forward(images_ctx, actions_rollout, horizon=horizon)
+        loss, components = compute_elbo_loss(out, recon_target, beta_kl=beta_kl)
+        if not torch.isfinite(loss):
+            continue
+        test_loss_sum  += loss.item()
+        test_recon_sum += components["recon"].item()
+        test_kl_sum    += components["kl"].item()
+        n_test_batches += 1
+
+    test_loss  = test_loss_sum  / max(1, n_test_batches)
+    test_recon = test_recon_sum / max(1, n_test_batches)
+    test_kl    = test_kl_sum    / max(1, n_test_batches)
+    log.info(
+        f"Test ELBO — loss: {test_loss:.4f} | recon: {test_recon:.4f} | "
+        f"kl: {test_kl:.4f}"
+    )
+
+    # Test rollout metrics + grid on a single batch (mirrors the val rollout
+    # panel — same compute_hgn_rollout_metrics path).
+    test_rollout = None
+    test_rollout_batch_raw = next(iter(
+        DataLoader(test_data, batch_size=n_rollouts, shuffle=False)
+    ))
+    test_rollout_batch = {
+        "images":  test_rollout_batch_raw["images"].to(device),
+        "actions": test_rollout_batch_raw["actions"].to(device),
+    }
+    test_rollout = compute_hgn_rollout_metrics(
+        model, test_rollout_batch, n_samples=n_log_images,
+    )
+    if test_rollout is not None:
+        log.info(
+            f"Test rollout — MAE: {test_rollout['mae']:.4f} | "
+            f"PSNR: {test_rollout['psnr']:.2f} | "
+            f"SSIM: {test_rollout['ssim']:.4f} | "
+            f"LPIPS: {test_rollout['lpips']:.4f} | "
+            f"Latent MSE: {test_rollout['latent_mse']:.6f}"
+        )
+
+    if use_wandb:
+        import wandb as wandb_mod
+        wandb_mod.log({
+            "test/loss":  test_loss,
+            "test/recon": test_recon,
+            "test/kl":    test_kl,
+        })
+        if test_rollout is not None:
+            wandb_mod.log({
+                "test/rollout_grid":       test_rollout["rollout_grid"],
+                "test/rollout_mae":        test_rollout["mae"],
+                "test/rollout_psnr":       test_rollout["psnr"],
+                "test/rollout_ssim":       test_rollout["ssim"],
+                "test/rollout_lpips":      test_rollout["lpips"],
+                "test/rollout_latent_mse": test_rollout["latent_mse"],
+            })
 
     if use_wandb:
         import wandb as wandb_mod
