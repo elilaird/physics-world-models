@@ -324,6 +324,16 @@ def _run_hgn_basic_eval(model, images, actions, output_dir, cfg, train_cfg, ckpt
             config=wandb_config,
             name=run_name,
         )
+        # Energy-drift summary scalars: useful for filtering runs in the wandb
+        # table without opening each plot. drift_pct = (H_T - H_0) / |H_0|;
+        # negative = dissipation (healthy on damped systems), positive = energy
+        # growth (off-manifold ODE).
+        e_mean = e_total.mean(axis=0)
+        energy_first = float(e_mean[0])
+        energy_last  = float(e_mean[-1])
+        energy_drift_pct = (
+            (energy_last - energy_first) / (abs(energy_first) + 1e-8)
+        )
         wandb_log = {
             "eval/latent_mse": latent_mse,
             "eval/mae":   vis_metrics["mae"],
@@ -332,6 +342,10 @@ def _run_hgn_basic_eval(model, images, actions, output_dir, cfg, train_cfg, ckpt
             "eval/lpips": vis_metrics["lpips"],
             "eval/metrics_plot": wandb_mod.Image(metrics_path),
             "eval/latent_error_curve": latent_error_img,
+            "eval/energy_curve":  wandb_mod.Image(energy_path),
+            "eval/energy_first":  energy_first,
+            "eval/energy_last":   energy_last,
+            "eval/energy_drift_pct": energy_drift_pct,
         }
         for k, v in fixed_dt_curves.items():
             wandb_log[f"eval/{k}_mean"] = float(v.mean().item())
