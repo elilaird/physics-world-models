@@ -248,6 +248,45 @@ def _run_hgn_basic_eval(model, images, actions, output_dir, cfg, train_cfg, ckpt
     plt.close()
     log.info(f"Saved: {dt_plot_path}")
 
+    # Per-dt latent error curves (mirrors train_hgn.py:484-526). The combined
+    # plot shows one line per dt across the three latent-divergence panels
+    # (MSE | cosine | norm-L2); the per-dt plots each include the persistence
+    # baseline for that dt. Previously omitted from the HGN eval path — only
+    # the fixed-dt plot was rendered — even though the underlying per-dt
+    # curves were already computed by hgn_dt_generalization_test.
+    per_dt_merged = {}
+    for dt_val in dt_sorted:
+        merged = dict(dt_results[dt_val]["latent_curves"])
+        if dt_results[dt_val].get("qp_curves") is not None:
+            merged.update(dt_results[dt_val]["qp_curves"])
+        per_dt_merged[dt_val] = merged
+    dt_horizon = per_dt_merged[dt_sorted[0]]["latent_mse"].shape[1]
+    dt_latent_path = os.path.join(output_dir, "dt_gen_latent_error_curves.png")
+    dt_latent_img = make_dt_latent_error_plot(
+        per_dt_merged,
+        epoch=ckpt["epoch"],
+        horizon=dt_horizon,
+        title_prefix="HGN test dt-gen latent divergence",
+        output_path=dt_latent_path,
+    )
+    log.info(f"Saved: {dt_latent_path}")
+
+    per_dt_latent_imgs = {}
+    for dt_val in dt_sorted:
+        single_dt_horizon = per_dt_merged[dt_val]["latent_mse"].shape[1]
+        single_path = os.path.join(
+            output_dir, f"dt_latent_error_curve_dt={dt_val}.png",
+        )
+        per_dt_latent_imgs[dt_val] = make_latent_error_plot(
+            per_dt_merged[dt_val],
+            epoch=ckpt["epoch"],
+            horizon=single_dt_horizon,
+            dt=dt_val,
+            title_prefix=f"HGN test latent divergence (dt={dt_val})",
+            output_path=single_path,
+        )
+        log.info(f"Saved: {single_path}")
+
     # Save eval_metrics.pt
     all_metrics = {
         "model": train_cfg.model.name,
@@ -361,6 +400,10 @@ def _run_hgn_basic_eval(model, images, actions, output_dir, cfg, train_cfg, ckpt
             wandb_log[f"eval_dt/dt={dt_val}/rollout_grid"] = wandb_mod.Image(
                 dt_results[dt_val]["rollout_grid"].clamp(0, 1)
             )
+            wandb_log[f"eval_dt/dt={dt_val}/latent_error_curve"] = (
+                per_dt_latent_imgs[dt_val]
+            )
+        wandb_log["eval/dt_gen_latent_error_curves"] = dt_latent_img
         wandb_mod.log(wandb_log)
         wandb_mod.finish()
         log.info("Logged results to wandb")
