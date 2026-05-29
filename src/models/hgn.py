@@ -93,11 +93,22 @@ class FPsi(nn.Module):
 class TNet(nn.Module):
     """Kinetic energy T(p): MLP, momentum-only input, scalar output.
 
-    Softplus activations for autograd-through-autograd compatibility.
+    Softplus activations on hidden layers for autograd-through-autograd
+    compatibility (leapfrog needs ∂²T/∂p²).
+
+    Args:
+        latent_channels: dim of p.
+        hidden_dim:      hidden width.
+        nonneg:          if True, apply Softplus to the final layer output so
+                         T(p) >= 0 (physical kinetic-energy constraint). Removes
+                         the "T grows in the wrong direction along p drift"
+                         pathology seen in run 448780. Default False preserves
+                         the original HGN parameterization.
     """
 
-    def __init__(self, latent_channels=64, hidden_dim=256):
+    def __init__(self, latent_channels=64, hidden_dim=256, nonneg=False):
         super().__init__()
+        self.nonneg = nonneg
         self.net = nn.Sequential(
             nn.Linear(latent_channels, hidden_dim),
             nn.Softplus(),
@@ -107,7 +118,10 @@ class TNet(nn.Module):
         )
 
     def forward(self, p):
-        return self.net(p)
+        out = self.net(p)
+        if self.nonneg:
+            out = F.softplus(out)
+        return out
 
 
 class VNet(nn.Module):
@@ -365,7 +379,11 @@ class HGNModel(nn.Module):
             latent_channels=latent_channels,
             hidden_channels=hidden_channels,
         )
-        self.T_net = TNet(latent_channels=latent_channels, hidden_dim=hidden_dim)
+        self.T_net = TNet(
+            latent_channels=latent_channels,
+            hidden_dim=hidden_dim,
+            nonneg=kwargs.get("t_nonneg", False),
+        )
         self.V_net = VNet(latent_channels=latent_channels, hidden_dim=hidden_dim)
         self.G_net = GNet(
             action_embedding_dim=action_embedding_dim,
