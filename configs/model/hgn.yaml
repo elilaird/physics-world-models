@@ -44,3 +44,23 @@ g_mode: linear
 # When g_mode='spectral_mlp', set true to concatenate z to G_net's input
 # (per-trajectory G(a, z) — mirrors LatentHamiltonianPredictor's G(a, theta)).
 g_cond_on_z: false
+
+# Option 1 (2026-05-29): if true, T_net's final layer is followed by Softplus so
+# T(p) >= 0 always (physical kinetic-energy constraint). Removes the "T can grow
+# negative or unboundedly along the wrong axis" pathology seen in run 448780.
+# Default false: preserves the original HGN parameterization for backward compat.
+t_nonneg: false
+
+# Option 2 (2026-05-29): if true, V_net.forward returns V_net.net(q) - V_net.net(0)
+# (per-call subtraction of V evaluated at the latent origin). Pins V(q=0) = 0,
+# removing the gauge freedom V -> V + C that's invisible to the integrator but
+# lets V drift to large negative values during training (run 448780 hit V ~ -120).
+# Default false.
+v_gauge_fix: false
+
+# Option 3 (2026-05-29): standard deviation of Gaussian noise added to q_t before
+# decoding, during training only (no-op at eval). Trains the decoder to be robust
+# to small off-trajectory perturbations of q, so late-rollout drift doesn't drop
+# the decoder onto its marginal-image fallback ("ringy" output). 0.0 = disabled.
+# Suggested sweep: 0.0, 0.05, 0.1. Larger values blur the decoder.
+decoder_input_noise: 0.0
