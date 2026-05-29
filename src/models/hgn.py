@@ -127,11 +127,25 @@ class TNet(nn.Module):
 class VNet(nn.Module):
     """Potential energy V(q): MLP, position-only input, scalar output.
 
-    Softplus activations for autograd-through-autograd compatibility.
+    Softplus activations on hidden layers for autograd-through-autograd
+    compatibility (leapfrog needs ∂²V/∂q²).
+
+    Args:
+        latent_channels: dim of q.
+        hidden_dim:      hidden width.
+        gauge_fix:       if True, forward returns net(q) - net(0), pinning
+                         V(q=0) = 0. The gauge transformation V -> V + C is
+                         invisible to the integrator (only ∂V/∂q matters), but
+                         without a fix V drifts to large magnitudes (run 448780
+                         hit V ≈ -120 at late rollout). Per-call evaluation of
+                         net(0) costs one extra MLP forward; cheap relative to
+                         the leapfrog autograd-of-autograd. Default False.
     """
 
-    def __init__(self, latent_channels=64, hidden_dim=256):
+    def __init__(self, latent_channels=64, hidden_dim=256, gauge_fix=False):
         super().__init__()
+        self.gauge_fix = gauge_fix
+        self.latent_channels = latent_channels
         self.net = nn.Sequential(
             nn.Linear(latent_channels, hidden_dim),
             nn.Softplus(),
@@ -141,7 +155,14 @@ class VNet(nn.Module):
         )
 
     def forward(self, q):
-        return self.net(q)
+        out = self.net(q)
+        if self.gauge_fix:
+            q_ref = torch.zeros(
+                1, self.latent_channels, device=q.device, dtype=q.dtype,
+            )
+            v_ref = self.net(q_ref)
+            out = out - v_ref
+        return out
 
 
 class GNet(nn.Module):
@@ -384,7 +405,11 @@ class HGNModel(nn.Module):
             hidden_dim=hidden_dim,
             nonneg=kwargs.get("t_nonneg", False),
         )
-        self.V_net = VNet(latent_channels=latent_channels, hidden_dim=hidden_dim)
+        self.V_net = VNet(
+            latent_channels=latent_channels,
+            hidden_dim=hidden_dim,
+            gauge_fix=kwargs.get("v_gauge_fix", False),
+        )
         self.G_net = GNet(
             action_embedding_dim=action_embedding_dim,
             latent_channels=latent_channels,
