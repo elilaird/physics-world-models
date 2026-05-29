@@ -373,6 +373,7 @@ class HGNModel(nn.Module):
         damping_mode="global",   # 'global' (scalar Parameter) or 'adaptive' (Linear(D, 1))
         g_mode="linear",
         g_cond_on_z=False,
+        decoder_input_noise=0.0,
         name="hgn",
         **kwargs,
     ):
@@ -389,6 +390,10 @@ class HGNModel(nn.Module):
         self.damping_mode = damping_mode
         self.g_mode = g_mode
         self.g_cond_on_z = g_cond_on_z
+        # Option 3 (2026-05-29): Gaussian noise std applied to q_t before decoding,
+        # at training only. 0.0 disables. See plan
+        # docs/superpowers/plans/2026-05-29-hgn-energy-net-constraints.md.
+        self.decoder_input_noise = float(decoder_input_noise)
 
         self.encoder = HGNEncoder(
             channels=channels,
@@ -556,6 +561,11 @@ class HGNModel(nn.Module):
 
         B, Tp1, D = q_seq.shape
         flat_q = q_seq.reshape(B * Tp1, D)
+        # Option 3: decoder-input noise (training only). Applied AFTER the
+        # integrator so pred_q is unchanged; the noisy tensor feeds the decoder
+        # but is not re-emitted. At eval, self.training is False -> no-op.
+        if self.training and self.decoder_input_noise > 0.0:
+            flat_q = flat_q + self.decoder_input_noise * torch.randn_like(flat_q)
         decoded = self.decoder(flat_q)
         C, H, W = decoded.shape[1:]
         pred_images = decoded.reshape(B, Tp1, C, H, W)
