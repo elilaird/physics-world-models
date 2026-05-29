@@ -287,6 +287,42 @@ def _run_hgn_basic_eval(model, images, actions, output_dir, cfg, train_cfg, ckpt
         )
         log.info(f"Saved: {single_path}")
 
+    # ---- Per-dt per-step VISUAL metric curves ----
+    # The right cross-predictor comparison for HGN: pixel-space metrics are
+    # architecture-blind, whereas latent error against sliding-window-encoded
+    # "GT" latents is HGN-specific (no per-frame encoder; the "GT" is a derived
+    # quantity, not directly comparable to JEPA predictors' per-frame latents).
+    # See 2026-05-29 session decision. The latent error plots above are retained
+    # as a diagnostic — useful for spotting encoder OOD — but the paper figure
+    # should be sourced from THESE visual curves.
+    viridis = plt.cm.viridis
+    n_dt = len(dt_sorted)
+    colors = [viridis(i / max(1, n_dt - 1)) for i in range(n_dt)]
+
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
+    visual_panels = [
+        ("mae_per_step",   "MAE (lower=better)"),
+        ("psnr_per_step",  "PSNR dB (higher=better)"),
+        ("ssim_per_step",  "SSIM (higher=better)"),
+        ("lpips_per_step", "LPIPS (lower=better)"),
+    ]
+    for ax, (key, label) in zip(axes, visual_panels):
+        for color, dt_val in zip(colors, dt_sorted):
+            per_step = dt_results[dt_val]["metrics"][key]
+            steps = range(1, len(per_step) + 1)
+            ax.plot(steps, per_step, linewidth=1.5, color=color, label=f"dt={dt_val}")
+        ax.set_xlabel("Prediction step")
+        ax.set_ylabel(label)
+        ax.set_title(label)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=7, loc="best", ncol=2)
+    fig.suptitle(f"{train_cfg.model.name} (HGN) — dt-gen visual metrics along rollout")
+    plt.tight_layout()
+    dt_visual_path = os.path.join(output_dir, "dt_gen_visual_metrics_curves.png")
+    plt.savefig(dt_visual_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    log.info(f"Saved: {dt_visual_path}")
+
     # Save eval_metrics.pt
     all_metrics = {
         "model": train_cfg.model.name,
@@ -403,7 +439,17 @@ def _run_hgn_basic_eval(model, images, actions, output_dir, cfg, train_cfg, ckpt
             wandb_log[f"eval_dt/dt={dt_val}/latent_error_curve"] = (
                 per_dt_latent_imgs[dt_val]
             )
+            # Late-rollout pixel-space scalars: final-step LPIPS and PSNR per
+            # dt. Sortable in the wandb runs table — the right cross-predictor
+            # summary statistic now that we're not relying on latent error.
+            wandb_log[f"eval_dt/dt={dt_val}/lpips_final"] = float(
+                dt_results[dt_val]["metrics"]["lpips_per_step"][-1]
+            )
+            wandb_log[f"eval_dt/dt={dt_val}/psnr_final"] = float(
+                dt_results[dt_val]["metrics"]["psnr_per_step"][-1]
+            )
         wandb_log["eval/dt_gen_latent_error_curves"] = dt_latent_img
+        wandb_log["eval/dt_gen_visual_metrics_curves"] = wandb_mod.Image(dt_visual_path)
         wandb_mod.log(wandb_log)
         wandb_mod.finish()
         log.info("Logged results to wandb")

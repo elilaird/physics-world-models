@@ -14,6 +14,7 @@ import math
 import os
 
 import hydra
+import matplotlib.pyplot as plt
 import torch
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
@@ -522,8 +523,49 @@ def main(cfg: DictConfig):
                             per_dt_merged, epoch=epoch, horizon=dt_h, dt=dt_val,
                         )
                     )
+                    # Late-rollout pixel-space scalars (per 2026-05-29 decision:
+                    # pixel-space metrics are the cross-predictor-comparable signal
+                    # for HGN, not latent error). Final-step LPIPS and PSNR per dt.
+                    dt_gen_log[f"val/dt_gen/dt={dt_val}/lpips_final"] = float(
+                        m["lpips_per_step"][-1]
+                    )
+                    dt_gen_log[f"val/dt_gen/dt={dt_val}/psnr_final"] = float(
+                        m["psnr_per_step"][-1]
+                    )
                 if dt_latent_plot is not None:
                     dt_gen_log["val/dt_gen/latent_error_curves"] = dt_latent_plot
+
+                # Per-dt per-step visual metric curves (4-panel: MAE | PSNR | SSIM
+                # | LPIPS, one line per dt). The right paper-figure source for HGN.
+                viridis = plt.cm.viridis
+                n_dt = len(dt_sorted)
+                colors = [viridis(i / max(1, n_dt - 1)) for i in range(n_dt)]
+                fig, axes = plt.subplots(1, 4, figsize=(20, 4))
+                vis_panels = [
+                    ("mae_per_step",   "MAE (lower=better)"),
+                    ("psnr_per_step",  "PSNR dB (higher=better)"),
+                    ("ssim_per_step",  "SSIM (higher=better)"),
+                    ("lpips_per_step", "LPIPS (lower=better)"),
+                ]
+                for ax, (key, label) in zip(axes, vis_panels):
+                    for color, dt_val in zip(colors, dt_sorted):
+                        per_step = dt_results[dt_val]["metrics"][key]
+                        steps = range(1, len(per_step) + 1)
+                        ax.plot(steps, per_step, linewidth=1.5, color=color,
+                                label=f"dt={dt_val}")
+                    ax.set_xlabel("Prediction step")
+                    ax.set_ylabel(label)
+                    ax.set_title(label)
+                    ax.grid(True, alpha=0.3)
+                    ax.legend(fontsize=7, loc="best", ncol=2)
+                fig.suptitle(
+                    f"{cfg.model.name} (HGN) — dt-gen visual metrics along "
+                    f"rollout (epoch {epoch})"
+                )
+                plt.tight_layout()
+                dt_gen_log["val/dt_gen/visual_metrics_curves"] = wandb_mod.Image(fig)
+                plt.close(fig)
+
                 wandb_mod.log(dt_gen_log)
 
             # Track best by dt-gen PSNR at training dt — captures the SHAPE of
