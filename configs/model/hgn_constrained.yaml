@@ -8,8 +8,8 @@
 #         dataset=pendulum_visual_50k_4Hz
 
 defaults:
-  - _self_
   - hgn
+  - _self_
 
 name: hgn_constrained
 t_nonneg: true
