@@ -355,6 +355,13 @@ def _run_hgn_basic_eval(model, images, actions, output_dir, cfg, train_cfg, ckpt
                 "psnr": dt_results[dt_val]["metrics"]["psnr"],
                 "ssim": dt_results[dt_val]["metrics"]["ssim"],
                 "lpips": dt_results[dt_val]["metrics"]["lpips"],
+                # Per-step arrays (per 2026-05-31 wiring): needed by
+                # plot_visual_comparison.py for cross-model figures grouped
+                # by (dt, metric). Each is a Python list of length=horizon.
+                "mae_per_step":   list(dt_results[dt_val]["metrics"]["mae_per_step"]),
+                "psnr_per_step":  list(dt_results[dt_val]["metrics"]["psnr_per_step"]),
+                "ssim_per_step":  list(dt_results[dt_val]["metrics"]["ssim_per_step"]),
+                "lpips_per_step": list(dt_results[dt_val]["metrics"]["lpips_per_step"]),
             }
             for dt_val in dt_sorted
         },
