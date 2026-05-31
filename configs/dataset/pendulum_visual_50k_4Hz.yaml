@@ -1,6 +1,6 @@
 
 name: pendulum_conservative
-version: 2026-05-20_16-10-00
+version: 2026-05-30_16-38-43 # 2026-05-20_16-10-00
 n_seqs: 50000
 seq_len: 50
 dt: 0.25
