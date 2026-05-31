@@ -329,20 +329,43 @@ def make_hgn_recon_grid(model, batch, n_samples=4):
 
 
 @torch.no_grad()
-def hgn_dt_generalization_test(model, env, dt_values, cfg, n_seqs=8, seq_len=None):
+def hgn_dt_generalization_test(
+    model, env, dt_values, cfg, n_seqs=8, seq_len=None,
+    eval_dataset_dir=None,
+    band_label=None,
+):
     """HGN analog of visual_dt_generalization_test.
 
-    For each dt, sample n_seqs fresh trajectories from `env` at that dt, run
-    HGN open-loop rollout, and compute pixel + latent metrics plus a rollout
-    grid. Sequences too short to seed inference are skipped with a warning.
+    For each dt, either sample n_seqs fresh trajectories from `env` at that dt
+    (default behavior) OR load pre-rendered canonical trajectories from disk
+    (when eval_dataset_dir is set), then run HGN open-loop rollout and compute
+    pixel + latent metrics plus a rollout grid. Sequences too short to seed
+    inference are skipped with a warning.
 
     Args:
         model: HGNModel.
         env: PhysicsControlEnv with sample_initial_state + render_state.
+              Ignored when eval_dataset_dir is set (canonical trajectories
+              are already rendered and don't need the env).
         dt_values: list of dt values to test.
         cfg: Hydra config (for env render settings and init_state_range).
         n_seqs: number of trajectories per dt.
         seq_len: number of env steps per trajectory. Default T_ctx + 10.
+                 Ignored when eval_dataset_dir is set (canonical seq_len
+                 is fixed by the generator).
+        eval_dataset_dir: optional path to a canonical eval dataset directory
+            (produced by generate_eval_dataset.py). When set, the per-dt loop
+            loads pre-rendered (images, actions) from
+            <eval_dataset_dir>/<band_label>/dt_<ms>.npz instead of sampling
+            at runtime. Mirrors the JEPA path's same-named arg in
+            visual_dt_generalization_test. Used by paired cross-predictor /
+            cross-variant comparison so every eval consumes identical
+            trajectories. Default None preserves existing runtime-sampling
+            behavior.
+        band_label: required when eval_dataset_dir is set; specifies which
+            band sub-directory to read ("low"/"med"/"high", or "all" for the
+            pooled un-stratified view, which maps to "med" under the hood).
+            Ignored when eval_dataset_dir is None.
 
     Returns:
         dict mapping dt -> {
@@ -395,22 +418,50 @@ def hgn_dt_generalization_test(model, env, dt_values, cfg, n_seqs=8, seq_len=Non
     device = next(model.parameters()).device
     results = {}
 
-    for dt in dt_values:
-        all_images = []
-        all_actions = []
-        for _ in range(n_seqs):
-            init_state = env.sample_initial_state(
-                sampling_mode=sampling_mode,
-                init_state_range=init_state_range,
-                energy_radius_range=energy_radius_range,
-                variable_params=None,
+    # Resolve where image/action batches come from for each dt:
+    #   - eval_dataset_dir set: load pre-rendered (images, actions) from disk.
+    #   - otherwise: sample trajectories at runtime (back-compat path).
+    # Mirrors visual_dt_generalization_test's same-named branching.
+    use_dataset = eval_dataset_dir is not None
+    if use_dataset:
+        from src.eval.eval_dataset_io import load_band_dt_npz
+        if band_label is None:
+            raise ValueError(
+                "eval_dataset_dir requires band_label (one of 'low', 'med', "
+                "'high', or 'all' for the pooled un-stratified view). HGN "
+                "doesn't currently emit per-band results, so callers typically "
+                "pass band_label='all'."
             )
-            actions = torch.randint(0, env.action_dim, (seq_len,))
-            imgs, _ = generate_visual_trajectory(env, init_state, actions, dt, render_opts)
-            all_images.append(imgs)
-            all_actions.append(actions)
-        images_batch = torch.stack(all_images).to(device)
-        actions_batch = torch.stack(all_actions).to(device)
+
+    for dt in dt_values:
+        if use_dataset:
+            loaded = load_band_dt_npz(eval_dataset_dir, band=band_label, dt=float(dt))
+            n_loaded = loaded["images"].shape[0]
+            if n_loaded < n_seqs:
+                raise ValueError(
+                    f"Eval dataset at {eval_dataset_dir} has only {n_loaded} "
+                    f"sequences in band={band_label} dt={dt}, but n_seqs={n_seqs} "
+                    f"was requested. Regenerate the dataset with eval_dataset.n_seqs"
+                    f"={n_seqs} or pass eval.n_rollouts={n_loaded}."
+                )
+            images_batch = torch.from_numpy(loaded["images"][:n_seqs]).to(device)
+            actions_batch = torch.from_numpy(loaded["actions"][:n_seqs]).to(device)
+        else:
+            all_images = []
+            all_actions = []
+            for _ in range(n_seqs):
+                init_state = env.sample_initial_state(
+                    sampling_mode=sampling_mode,
+                    init_state_range=init_state_range,
+                    energy_radius_range=energy_radius_range,
+                    variable_params=None,
+                )
+                actions = torch.randint(0, env.action_dim, (seq_len,))
+                imgs, _ = generate_visual_trajectory(env, init_state, actions, dt, render_opts)
+                all_images.append(imgs)
+                all_actions.append(actions)
+            images_batch = torch.stack(all_images).to(device)
+            actions_batch = torch.stack(all_actions).to(device)
 
         # Skip dts where the trajectory is too short to seed inference.
         N = images_batch.shape[1]

@@ -193,12 +193,22 @@ def _run_hgn_basic_eval(model, images, actions, output_dir, cfg, train_cfg, ckpt
     dt_seq_len = cfg.eval.get("dt_seq_len", None) or train_cfg.dataset.get("seq_len", T_ctx + 10)
     n_substeps = int(getattr(model, "_eval_substeps", 1))
     env = rebuild_env(train_cfg)
+    # Canonical eval dataset (per 2026-05-31 wiring): when cfg.eval.eval_dataset_dir
+    # is set, every model evaluated against this dataset sees IDENTICAL trajectories
+    # at every dt — necessary for cross-variant comparison since
+    # hgn_dt_generalization_test otherwise samples fresh trajectories at each call.
+    # band_label='all' is the pooled un-stratified view (loads from the 'med' band).
+    eval_dataset_dir = cfg.eval.get("eval_dataset_dir", None)
     log.info(
         f"HGN dt-generalization: dt_values={dt_values} "
-        f"(seq_len={dt_seq_len}, substeps={n_substeps})"
+        f"(seq_len={dt_seq_len}, substeps={n_substeps}, "
+        f"eval_dataset_dir={eval_dataset_dir})"
     )
     dt_results = hgn_dt_generalization_test(
-        model, env, dt_values, train_cfg, n_seqs=n_rollouts, seq_len=dt_seq_len,
+        model, env, dt_values, train_cfg,
+        n_seqs=n_rollouts, seq_len=dt_seq_len,
+        eval_dataset_dir=eval_dataset_dir,
+        band_label="all" if eval_dataset_dir is not None else None,
     )
     dt_sorted = sorted(dt_results.keys())
     for dt_val in dt_sorted:

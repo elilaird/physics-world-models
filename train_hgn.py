@@ -452,9 +452,16 @@ def main(cfg: DictConfig):
         training_dt_psnr = None
         if run_dt_gen:
             log.info(f"  Running dt-gen test at epoch {epoch}...")
+            # Canonical eval dataset (per 2026-05-31 wiring): when
+            # cfg.eval.eval_dataset_dir is set, every dt-gen epoch consumes the
+            # SAME trajectories — eliminates per-epoch sampling noise that would
+            # otherwise mask training signal.
+            _eval_dataset_dir = cfg.eval.get("eval_dataset_dir", None)
             dt_results = hgn_dt_generalization_test(
                 model, env, dt_values, cfg,
                 n_seqs=n_rollouts, seq_len=dt_seq_len,
+                eval_dataset_dir=_eval_dataset_dir,
+                band_label="all" if _eval_dataset_dir is not None else None,
             )
             dt_sorted = sorted(dt_results.keys())
             for dt_val in dt_sorted:
