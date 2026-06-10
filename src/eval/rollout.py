@@ -1,5 +1,9 @@
+import logging
+
 import numpy as np
 import torch
+
+log = logging.getLogger(__name__)
 
 
 @torch.no_grad()
@@ -56,6 +60,13 @@ def visual_open_loop_rollout(model, images, actions, dt=None):
         :, infer_ctx - 1 : infer_ctx - 1 + horizon
     ].long()
 
+    # Rich-features hook (mirrors train_visual.py). Predictors that declare
+    # requires_rich_features=True consume (B, T, 64, 16, 16) backbone features
+    # from RichSIDVisualWorldModel.encode_features_sequence.
+    rich_features_seq = None
+    if getattr(model.predictor, "requires_rich_features", False):
+        rich_features_seq = model.encode_features_sequence(images)
+
     # Infer initial state (runs GRU once for Latent-* predictors). The
     # @torch.no_grad() decorator on this function disables grad globally,
     # but LatentHamiltonianPredictor.step has @torch.enable_grad() locally
@@ -63,6 +74,7 @@ def visual_open_loop_rollout(model, images, actions, dt=None):
     state = model.predictor.infer(
         context, context_actions=context_actions,
         dt=dt or model.observation_dt,
+        rich_features=rich_features_seq[:, :infer_ctx] if rich_features_seq is not None else None,
     )
     pred_latents = model.predictor.unroll(state, unroll_actions, horizon, dt=dt)
 
@@ -111,6 +123,8 @@ def visual_dt_generalization_test(
     model, env, dt_values, cfg, n_seqs=8, seq_len=None,
     energy_radius_range_override=None,
     fixed_init_state=None,
+    eval_dataset_dir=None,
+    band_label=None,
 ):
     """Test visual model across different dt values.
 
@@ -135,6 +149,16 @@ def visual_dt_generalization_test(
             env.sample_initial_state). Used by visual_fixed_init_stratified_test
             to collapse within-band init heterogeneity so only action-sequence
             variance remains. Default None preserves all existing behavior.
+        eval_dataset_dir: optional path to a canonical eval dataset directory
+            (produced by generate_eval_dataset.py). When set, the per-rollout
+            loop loads pre-rendered (images, actions) from
+            <eval_dataset_dir>/<band_label>/dt={dt}.npz instead of sampling
+            at runtime. Used by paired cross-predictor comparison so every
+            eval consumes identical trajectories. Default None preserves
+            existing runtime-sampling behavior.
+        band_label: required when eval_dataset_dir is set; specifies which
+            band sub-directory to read ("low"/"med"/"high", or "all" for
+            un-stratified). Ignored when eval_dataset_dir is None.
 
     Returns:
         dict mapping dt -> {
@@ -207,35 +231,84 @@ def visual_dt_generalization_test(
     device = next(model.parameters()).device
     results = {}
 
+    # Resolve where image/action batches come from for each dt:
+    #   - eval_dataset_dir set: load pre-rendered (images, actions) from disk.
+    #     band_label decides which band sub-directory to read from.
+    #   - otherwise: sample trajectories at runtime (existing back-compat path).
+    use_dataset = eval_dataset_dir is not None
+
+    if use_dataset:
+        # Lazy import to keep the existing back-compat path free of new deps.
+        from src.eval.eval_dataset_io import load_band_dt_npz
+        if band_label is None:
+            raise ValueError(
+                "eval_dataset_dir requires band_label (one of 'low', 'med', 'high'). "
+                "Pass band_label='all' to load the 'med' band sub-directory as "
+                "a pooled un-stratified view (see load_band_dt_npz for the remap)."
+            )
+
     for dt in dt_values:
-        all_images = []
-        all_actions = []
-        for _ in range(n_seqs):
-            if fixed_init_state is not None:
-                # Caller (e.g., visual_fixed_init_stratified_test) wants every
-                # rollout to start from the SAME init. Clone so each rollout
-                # gets its own tensor object (defensive — generate_visual_trajectory
-                # treats init_state as immutable, but downstream callers shouldn't
-                # be coupled to that contract).
-                init_state = fixed_init_state.clone() if hasattr(fixed_init_state, "clone") else fixed_init_state
-            else:
-                init_state = env.sample_initial_state(
-                    sampling_mode=sampling_mode,
-                    init_state_range=init_state_range,
-                    energy_radius_range=energy_radius_range,
-                    variable_params=None,
+        if use_dataset:
+            loaded = load_band_dt_npz(eval_dataset_dir, band=band_label, dt=float(dt))
+            # Sanity-check that the dataset's batch size matches what the caller
+            # asked for. Slice down rather than crash; if the dataset has FEWER
+            # sequences than n_seqs the downstream metrics will be silently
+            # weaker — flag that loudly.
+            n_loaded = loaded["images"].shape[0]
+            if n_loaded < n_seqs:
+                raise ValueError(
+                    f"Eval dataset at {eval_dataset_dir} has only {n_loaded} "
+                    f"sequences in band={band_label} dt={dt}, but n_seqs={n_seqs} "
+                    f"was requested. Regenerate the dataset with eval_dataset.n_seqs"
+                    f"={n_seqs} or pass eval.n_rollouts={n_loaded}."
                 )
+            images_batch = torch.from_numpy(loaded["images"][:n_seqs]).to(device)
+            actions_batch = torch.from_numpy(loaded["actions"][:n_seqs]).to(device)
+        else:
+            all_images = []
+            all_actions = []
+            for _ in range(n_seqs):
+                if fixed_init_state is not None:
+                    # Caller (e.g., visual_fixed_init_stratified_test) wants every
+                    # rollout to start from the SAME init. Clone so each rollout
+                    # gets its own tensor object (defensive — generate_visual_trajectory
+                    # treats init_state as immutable, but downstream callers shouldn't
+                    # be coupled to that contract).
+                    init_state = fixed_init_state.clone() if hasattr(fixed_init_state, "clone") else fixed_init_state
+                else:
+                    init_state = env.sample_initial_state(
+                        sampling_mode=sampling_mode,
+                        init_state_range=init_state_range,
+                        energy_radius_range=energy_radius_range,
+                        variable_params=None,
+                    )
 
-            actions = torch.randint(0, env.action_dim, (seq_len,))
-            imgs, _ = generate_visual_trajectory(env, init_state, actions, dt, render_opts)
-            all_images.append(imgs)
-            all_actions.append(actions)
+                actions = torch.randint(0, env.action_dim, (seq_len,))
+                imgs, _ = generate_visual_trajectory(env, init_state, actions, dt, render_opts)
+                all_images.append(imgs)
+                all_actions.append(actions)
 
-        images_batch = torch.stack(all_images).to(device)
-        actions_batch = torch.stack(all_actions).to(device)
+            images_batch = torch.stack(all_images).to(device)
+            actions_batch = torch.stack(all_actions).to(device)
+
+        # Skip dts where the trajectory is too short to seed an inference.
+        # visual_open_loop_rollout would compute horizon = N_latents - infer_ctx;
+        # when that's non-positive the predictor.unroll loop runs 0 times and
+        # crashes on `torch.stack([], dim=1)`. Most common cause: large eval_dt
+        # divides total_T into fewer than infer_context_length frames.
+        K = model.encoder_frames
+        n_latents_available = images_batch.shape[1] - K + 1
+        if n_latents_available <= ctx_len:
+            log.warning(
+                f"Skipping dt={dt}: dataset has {images_batch.shape[1]} frames per "
+                f"sequence ({n_latents_available} latents after K={K} window), but "
+                f"infer_context_length={ctx_len} requires more. To include this dt, "
+                f"regenerate the dataset with a larger ref_seq_len so that "
+                f"ceil(ref_seq_len * ref_dt / {dt}) + 1 > {ctx_len}."
+            )
+            continue
 
         # Run visual rollout (pass dt so ODE-based predictors integrate correctly)
-        K = model.encoder_frames
         rollout = visual_open_loop_rollout(model, images_batch, actions_batch, dt=dt)
         pred_images = rollout["pred_images"]       # (n_seqs, horizon, C, H, W)
         true_latents = rollout["true_latents"]     # (n_seqs, N_latents, D)
@@ -313,6 +386,7 @@ def visual_dt_generalization_test(
 def visual_energy_stratified_test(
     model, env, dt_values, cfg, energy_radius_range,
     n_seqs=8, seq_len=None,
+    eval_dataset_dir=None,
 ):
     """Run visual_dt_generalization_test once per energy band.
 
@@ -356,6 +430,8 @@ def visual_energy_stratified_test(
             model, env, dt_values, cfg,
             n_seqs=n_seqs, seq_len=seq_len,
             energy_radius_range_override=band_range,
+            eval_dataset_dir=eval_dataset_dir,
+            band_label=band_name if eval_dataset_dir is not None else None,
         )
     return results
 
@@ -364,6 +440,7 @@ def visual_energy_stratified_test(
 def visual_fixed_init_stratified_test(
     model, env, dt_values, cfg, energy_radius_range,
     n_seqs=8, seq_len=None,
+    eval_dataset_dir=None,
 ):
     """Per-band fixed-init eval.
 
@@ -399,20 +476,38 @@ def visual_fixed_init_stratified_test(
         "high": (float(edges[2]), float(edges[3])),
     }
 
+    # When eval_dataset_dir is set, take the canonical "fixed init" as the
+    # first sequence's init_state from metadata.json. This makes the fixed-
+    # init eval paired across evals (same canonical init per band).
+    canonical_inits = {}
+    if eval_dataset_dir is not None:
+        from src.eval.eval_dataset_io import load_metadata
+        md = load_metadata(eval_dataset_dir)
+        for band_name in bands.keys():
+            anchor = md["anchors"][band_name]["0"]  # JSON keys are strings
+            canonical_inits[band_name] = torch.as_tensor(
+                anchor["init_state"]
+            ).float()
+
     results = {}
     for band_name, band_range in bands.items():
-        # Sample ONE init state from this band's sub-range.
-        init_state = env.sample_initial_state(
-            sampling_mode="energy_radius",
-            init_state_range=None,
-            energy_radius_range=list(band_range),
-            variable_params=None,
-        )
+        if eval_dataset_dir is not None:
+            init_state = canonical_inits[band_name]
+        else:
+            # Sample ONE init state from this band's sub-range.
+            init_state = env.sample_initial_state(
+                sampling_mode="energy_radius",
+                init_state_range=None,
+                energy_radius_range=list(band_range),
+                variable_params=None,
+            )
         # Run n_seqs trajectories from that fixed init (only actions vary).
         band_results = visual_dt_generalization_test(
             model, env, dt_values, cfg,
             n_seqs=n_seqs, seq_len=seq_len,
             fixed_init_state=init_state,
+            eval_dataset_dir=eval_dataset_dir,
+            band_label=band_name if eval_dataset_dir is not None else None,
         )
         results[band_name] = {
             "init_state": init_state,

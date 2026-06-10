@@ -8,6 +8,7 @@ The ``title_prefix`` kwarg lets callers distinguish train-time val vs
 eval-time test in the figure title without diverging the implementation.
 """
 import matplotlib.pyplot as plt
+import numpy as np
 import wandb
 
 
@@ -102,7 +103,11 @@ def make_dt_latent_error_plot(
     Returns:
         wandb.Image of the matplotlib figure (the figure is closed).
     """
-    steps = list(range(1, horizon + 1))
+    # Note: the `horizon` arg is unused — each dt's per-step curve has its
+    # own length (which can differ across dts when the eval uses a canonical
+    # dataset, since the same physical wall-clock window divides into
+    # different numbers of integration steps at different dts). The x-axis
+    # is computed per dt from the actual tensor length.
 
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
     panels = [
@@ -117,6 +122,7 @@ def make_dt_latent_error_plot(
             curves = per_dt_curves[dt]
             mean = curves[key].mean(dim=0).numpy()
             std  = curves[key].std(dim=0).numpy()
+            steps = np.arange(1, len(mean) + 1)
             color = cmap(i / max(len(dt_sorted) - 1, 1))
             ax.plot(steps, mean, label=f"dt={dt}", color=color, linewidth=2)
             ax.fill_between(steps, mean - std, mean + std, color=color, alpha=0.15)

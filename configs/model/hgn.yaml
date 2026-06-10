@@ -1,0 +1,66 @@
+# Faithful HGN baseline (Toth et al., ICLR 2020) with port-Hamiltonian extensions.
+# Spec: docs/superpowers/specs/2026-05-19-hgn-baseline-design.md
+#
+# Use: python train_hgn.py model=hgn
+
+defaults:
+  - _self_
+
+_target_: src.models.hgn.HGNModel
+name: hgn
+type: hgn   # distinct from "visual" so evaluate.py can dispatch
+
+# Model dims
+channels: 3
+latent_channels: 64
+hidden_channels: 512
+hidden_dim: 256
+action_dim: ${env.action_dim}
+action_embedding_dim: 8
+
+# Sequence-level inference window (number of context frames the encoder consumes).
+infer_context_length: 8
+# Rollout horizon used at training time.
+pred_length: 10
+
+# Integrator: 'leapfrog' (faithful HGN default) or 'implicit_midpoint' (ablation).
+integrator: leapfrog
+midpoint_iters: 4
+
+# Timestep: interpolated from dataset.dt (same convention as the JEPA models).
+dt: ${dataset.dt}
+
+# log_damping init: gamma = softplus(-1.0) ~= 0.31. Matches HamiltonianPredictor.
+damping_init: -1.0
+
+# Damping mode: 'global' (single scalar Parameter, faithful HGN port extension)
+# or 'adaptive' (damping_net = Linear(latent_channels, 1) -> gamma(z) = softplus(...)).
+damping_mode: global
+
+# G_net mode: 'linear' (faithful HGN, single Linear) or 'spectral_mlp' (2-layer
+# MLP with nn.utils.spectral_norm + LeakyReLU + learnable G_scale).
+g_mode: linear
+
+# When g_mode='spectral_mlp', set true to concatenate z to G_net's input
+# (per-trajectory G(a, z) — mirrors LatentHamiltonianPredictor's G(a, theta)).
+g_cond_on_z: false
+
+# Option 1 (2026-05-29): if true, T_net's final layer is followed by Softplus so
+# T(p) >= 0 always (physical kinetic-energy constraint). Removes the "T can grow
+# negative or unboundedly along the wrong axis" pathology seen in run 448780.
+# Default false: preserves the original HGN parameterization for backward compat.
+t_nonneg: false
+
+# Option 2 (2026-05-29): if true, V_net.forward returns V_net.net(q) - V_net.net(0)
+# (per-call subtraction of V evaluated at the latent origin). Pins V(q=0) = 0,
+# removing the gauge freedom V -> V + C that's invisible to the integrator but
+# lets V drift to large negative values during training (run 448780 hit V ~ -120).
+# Default false.
+v_gauge_fix: false
+
+# Option 3 (2026-05-29): standard deviation of Gaussian noise added to q_t before
+# decoding, during training only (no-op at eval). Trains the decoder to be robust
+# to small off-trajectory perturbations of q, so late-rollout drift doesn't drop
+# the decoder onto its marginal-image fallback ("ringy" output). 0.0 = disabled.
+# Suggested sweep: 0.0, 0.05, 0.1. Larger values blur the decoder.
+decoder_input_noise: 0.0

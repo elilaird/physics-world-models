@@ -1,0 +1,58 @@
+# Config for plot_visual_comparison.py — assembles cross-model figures from
+# per-run eval_metrics.pt files, grouped by (dt, visual_metric).
+#
+# Usage:
+#   python plot_visual_comparison.py \
+#       runs="['outputs/.../<variant1>/eval_metrics.pt', 'outputs/.../<variant2>/eval_metrics.pt', ...]"
+#
+#   python plot_visual_comparison.py \
+#       runs_glob="outputs/2026-05-31/*/eval_metrics.pt"
+
+defaults:
+  - _self_
+
+# List of paths to eval_metrics.pt files (or to directories containing one).
+runs: null
+
+# Glob pattern, expanded to find eval_metrics.pt files. Unioned with `runs`.
+runs_glob: null
+
+# Where to save the figures. Default: current Hydra run dir / plots.
+output_dir: ${hydra:runtime.output_dir}/plots
+
+# Include eval_substeps in the per-run label so the same model across different
+# substep settings is distinguishable. If false, runs that share `model` name
+# collide visually.
+label_with_substeps: true
+
+# Visual metrics to plot, one figure per entry. Each figure has N_dts subplots
+# arranged in a grid; each subplot has one curve per model variant.
+metrics:
+  - mae
+  - psnr
+  - ssim
+  - lpips
+
+# Subplot grid for the per-dt panels inside each figure. Should accommodate
+# the number of dts in eval_metrics["dt_generalization"]. For 11 dts a 3x4
+# grid (12 cells, 1 empty) is dense but readable.
+n_cols: 4
+
+# Figure cosmetics.
+figsize_per_subplot: [3.5, 2.8]
+fontsize: 9
+
+# Color per model name. Falls back to a viridis palette per-variant when the
+# model name isn't listed here.
+model_colors:
+  mlp:                          "#1f77b4"
+  lstm:                         "#ff7f0e"
+  hamiltonian:                  "#2ca02c"
+  latent_neural_ode:            "#d62728"
+  latent_hamiltonian:           "#9467bd"
+  hgn:                          "#17becf"
+  hgn_constrained:              "#bcbd22"
+  hgn_implmid:                  "#e377c2"
+  hgn_adaptg:                   "#8c564b"
+  hgn_specg:                    "#aec7e8"
+  hgn_plus:                     "#ffbb78"

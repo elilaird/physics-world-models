@@ -1,0 +1,17 @@
+# HGN baseline + all three energy-net / decoder-input constraints from the
+# 2026-05-29 energy-net-constraints plan. A/B vs the bare `hgn` baseline (run
+# 448780) to test whether the "T/V degenerate decomposition + decoder OOD on
+# late-rollout q" failure mode is mitigated.
+# Spec: docs/superpowers/plans/2026-05-29-hgn-energy-net-constraints.md
+#
+# Use: python train_hgn.py model=hgn_constrained env=pendulum_visual \
+#         dataset=pendulum_visual_50k_4Hz
+
+defaults:
+  - hgn
+  - _self_
+
+name: hgn_constrained
+t_nonneg: true
+v_gauge_fix: true
+decoder_input_noise: 0.05

@@ -1,0 +1,15 @@
+# HGN+: all three port-extension fixes on (implicit_midpoint + adaptive gamma(z)
+# + spectral-norm MLP G with z-conditioning). The combined variant for the
+# paper's headline row.
+#
+# Use: python train_hgn.py model=hgn_plus
+
+defaults:
+  - hgn
+  - _self_
+
+name: hgn_plus
+integrator: implicit_midpoint
+damping_mode: adaptive
+g_mode: spectral_mlp
+g_cond_on_z: true

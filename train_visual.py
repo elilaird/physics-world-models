@@ -60,8 +60,20 @@ def batch_to_device(batch, device):
 
 
 def build_env(cfg):
-    env_cls = ENV_REGISTRY[cfg.env.name]
-    params = OmegaConf.to_container(cfg.env.params, resolve=True)
+    # Prefer cfg.dataset.env.params — that's the block that generated the
+    # training data. cfg.env is the fallback default and can drift from
+    # the dataset (e.g., pendulum dataset uses m=0.5 while configs/env/
+    # pendulum_visual.yaml has m=1.0). Mismatched mass changes both
+    # dynamics AND the default ball_radius (= self.m / space_res in
+    # ForcedPendulum.render_state), so rollout grids visibly diverge from
+    # the dataset frames. Matches the cfg.dataset.env preference already
+    # used by visual_dt_generalization_test for render opts.
+    if "dataset" in cfg and "env" in cfg.dataset:
+        env_cfg = cfg.dataset.env
+    else:
+        env_cfg = cfg.env
+    env_cls = ENV_REGISTRY[env_cfg.name]
+    params = OmegaConf.to_container(env_cfg.params, resolve=True)
     return env_cls(**params)
 
 
@@ -73,6 +85,21 @@ def build_predictor(cfg):
 def build_model(cfg):
     model_cls = MODEL_REGISTRY[cfg.model.name]
     predictor = build_predictor(cfg)
+    # Validate predictor/VWM pairing: predictors that declare
+    # requires_rich_features=True (e.g., RichSIDLatentHamiltonianPredictor)
+    # must be paired with a VWM that exposes encode_features_sequence
+    # (e.g., RichSIDVisualWorldModel). Catching this at build time gives a
+    # clear error rather than failing deep in the training loop with an
+    # AttributeError on the first batch.
+    if getattr(predictor, "requires_rich_features", False) and not hasattr(
+        model_cls, "encode_features_sequence"
+    ):
+        raise TypeError(
+            f"{type(predictor).__name__} requires a VWM with "
+            f"encode_features_sequence (e.g., RichSIDVisualWorldModel); "
+            f"got model_cls={model_cls.__name__}. Set "
+            f"`model=visual_world_model_rich_sid` in your Hydra overrides."
+        )
     return model_cls(
         predictor=predictor,
         latent_channels=cfg.model.latent_channels,
@@ -90,7 +117,8 @@ def build_model(cfg):
 # JEPA training step
 # ---------------------------------------------------------------------------
 
-def _reseed_window(predictor, window_ctx, shared_state, context_actions=None, dt=None):
+def _reseed_window(predictor, window_ctx, shared_state, context_actions=None,
+                   dt=None, rich_features=None):
     """Re-seed dynamical variables from window_ctx, reuse shared static keys.
 
     Always routes through ``predictor.infer`` so every learned inference head
@@ -104,8 +132,16 @@ def _reseed_window(predictor, window_ctx, shared_state, context_actions=None, dt
     Latent-* predictors, ``h``/``c`` for LSTM) overwrite the per-window
     re-inferred values — those remain system-ID variables inferred once per
     sequence. Only the dynamical (q, p) are re-seeded per window.
+
+    ``rich_features`` is forwarded to predictor.infer for predictors that
+    declare ``requires_rich_features = True``
+    (RichSIDLatentHamiltonianPredictor). Other predictors ignore it via
+    their **kwargs catch-all.
     """
-    new_state = predictor.infer(window_ctx, context_actions=context_actions, dt=dt)
+    new_state = predictor.infer(
+        window_ctx, context_actions=context_actions, dt=dt,
+        rich_features=rich_features,
+    )
     for key in ("theta", "h", "c"):
         if key in shared_state:
             new_state[key] = shared_state[key]
@@ -169,9 +205,20 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
     #    and contributes nothing static.
     transition_actions = actions[:, K - 1:]  # (B, N_lat - 1)
     full_ctx_actions = transition_actions[:, : max(ctx_len - 1, 0)].long()
+
+    # Rich-features hook: predictors that declare requires_rich_features=True
+    # (RichSIDLatentHamiltonianPredictor) consume the (B, T, 64, 16, 16)
+    # backbone features from RichSIDVisualWorldModel.encode_features_sequence
+    # in addition to the per-frame latents. Other predictors ignore the kwarg
+    # via **kwargs.
+    rich_features_seq = None
+    if getattr(model.predictor, "requires_rich_features", False):
+        rich_features_seq = model.encode_features_sequence(images)
+
     shared_state = model.predictor.infer(
         all_states[:, :ctx_len], context_actions=full_ctx_actions,
         dt=model.observation_dt,
+        rich_features=rich_features_seq[:, :ctx_len] if rich_features_seq is not None else None,
     )
 
     # 4. Sliding window unroll. Each window re-seeds (q, p) from its own
@@ -206,6 +253,10 @@ def jepa_train_step(model, batch, optimizer, sigreg, cfg):
             model.predictor, window_ctx, shared_state,
             context_actions=window_ctx_actions,
             dt=model.observation_dt,
+            rich_features=(
+                rich_features_seq[:, start:start + ctx_len]
+                if rich_features_seq is not None else None
+            ),
         )
         pred_z = model.predictor.unroll(window_state, unroll_actions, n_pred)
 
@@ -321,9 +372,20 @@ def jepa_eval_step(model, batch, cfg):
 
     transition_actions = actions[:, K - 1:]
     full_ctx_actions = transition_actions[:, : max(ctx_len - 1, 0)].long()
+
+    # Rich-features hook: predictors that declare requires_rich_features=True
+    # (RichSIDLatentHamiltonianPredictor) consume the (B, T, 64, 16, 16)
+    # backbone features from RichSIDVisualWorldModel.encode_features_sequence
+    # in addition to the per-frame latents. Other predictors ignore the kwarg
+    # via **kwargs.
+    rich_features_seq = None
+    if getattr(model.predictor, "requires_rich_features", False):
+        rich_features_seq = model.encode_features_sequence(images)
+
     shared_state = model.predictor.infer(
         all_states[:, :ctx_len], context_actions=full_ctx_actions,
         dt=model.observation_dt,
+        rich_features=rich_features_seq[:, :ctx_len] if rich_features_seq is not None else None,
     )
 
     window_size = ctx_len + pred_len
@@ -352,6 +414,10 @@ def jepa_eval_step(model, batch, cfg):
             model.predictor, window_ctx, shared_state,
             context_actions=window_ctx_actions,
             dt=model.observation_dt,
+            rich_features=(
+                rich_features_seq[:, start:start + ctx_len]
+                if rich_features_seq is not None else None
+            ),
         )
         pred_z = model.predictor.unroll(window_state, unroll_actions, n_pred)
 

@@ -1,0 +1,12 @@
+# HGN ablation variant: implicit_midpoint integrator only.
+# Isolates failure mechanisms M1 (homogeneous integrator stability) and M2
+# (explicit-damping overshoot resolved by midpoint averaging of damping).
+#
+# Use: python train_hgn.py model=hgn_implmid
+
+defaults:
+  - hgn
+  - _self_
+
+name: hgn_implmid
+integrator: implicit_midpoint

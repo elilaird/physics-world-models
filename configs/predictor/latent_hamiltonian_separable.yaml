@@ -1,0 +1,26 @@
+# Latent-Hamiltonian with a SEPARABLE Hamiltonian H = T(p, theta) + V(q, theta).
+#
+# Direct ablation cell against configs/predictor/latent_hamiltonian.yaml:
+# identical encoder, GRU SID branch, theta-conditioned damping/G, integrator
+# family; ONLY the Hamiltonian topology differs (two MLPs T+V vs one MLP H).
+#
+# Default integrator is leapfrog (matches HGN's faithful design). Separability
+# is what makes leapfrog symplectic on this Hamiltonian — no q/p coupling
+# in the partial derivatives.
+#
+# Use: python train_visual.py predictor=latent_hamiltonian_separable
+
+_target_: src.models.predictors.SeparableLatentHamiltonianPredictor
+name: latent_hamiltonian_separable
+latent_dim: ${model.latent_channels}
+action_dim: ${env.action_dim}
+action_embedding_dim: ${model.action_embedding_dim}
+hidden_dim: 256
+gru_hidden: 128
+theta_dim: 8
+dt: ${dataset.dt}
+# Integrator: 'leapfrog' (faithful HGN default; symplectic on separable H),
+# 'implicit_midpoint' (2nd-order, symplectic in conservative limit), or
+# 'euler' (semi-implicit, 1st-order).
+integrator: leapfrog
+midpoint_iters: 4

@@ -1,0 +1,22 @@
+# RichSID variant of VisualWorldModel — uses RichSIDVisionEncoder which
+# exposes intermediate (B, 64, 16, 16) features alongside per-frame latents,
+# for the RichSIDLatentHamiltonianPredictor's 3D-CNN SID branch.
+#
+# encoder_frames is fixed to 1 (the 3D CNN does the temporal mixing).
+# All other knobs match visual_world_model.yaml for capacity parity.
+
+defaults:
+  - _self_
+
+_target_: src.models.rich_sid.RichSIDVisualWorldModel
+
+name: visual_world_model_rich_sid
+type: visual
+latent_channels: 64
+hidden_channels: 512
+action_embedding_dim: 8
+context_length: 3
+infer_context_length: 8
+pred_length: 10
+observation_dt: ${dataset.dt}
+encoder_frames: 1  # MUST be 1 — RichSIDVisualWorldModel asserts this.

@@ -64,7 +64,7 @@ class BasePredictor(nn.Module):
 
     _warned_legacy = False
 
-    def infer(self, context, context_actions=None, dt=None):
+    def infer(self, context, context_actions=None, dt=None, **kwargs):
         raise NotImplementedError
 
     def step(self, state, action, dt=None):
@@ -189,7 +189,7 @@ class MLPPredictor(BasePredictor):
             nn.Linear(hidden_dim, latent_dim),
         )
 
-    def infer(self, context, context_actions=None, dt=None):
+    def infer(self, context, context_actions=None, dt=None, **kwargs):
         return {"z": context[:, -1]}
 
     def step(self, state, action, dt=None):
@@ -231,7 +231,7 @@ class LSTMPredictor(BasePredictor):
         )
         self.output = nn.Linear(hidden_dim, latent_dim)
 
-    def infer(self, context, context_actions=None, dt=None):
+    def infer(self, context, context_actions=None, dt=None, **kwargs):
         B, T, _ = context.shape
         if context_actions is None:
             ctx_acts = torch.zeros(
@@ -323,7 +323,7 @@ class HamiltonianPredictor(BasePredictor):
         """
         return self.H_net(z)
 
-    def infer(self, context, context_actions=None, dt=None):
+    def infer(self, context, context_actions=None, dt=None, **kwargs):
         return {"z": context[:, -1]}
 
     @torch.enable_grad()
@@ -457,7 +457,7 @@ class LatentNeuralODEPredictor(BasePredictor):
             nn.Linear(hidden_dim, latent_dim),
         )
 
-    def infer(self, context, context_actions=None, dt=None):
+    def infer(self, context, context_actions=None, dt=None, **kwargs):
         B, T, D = context.shape
         dt_eff = dt if dt is not None else self.dt
 
@@ -622,7 +622,7 @@ class LatentHamiltonianPredictor(BasePredictor):
             inp = torch.cat([phase, theta], dim=-1)
             return self.H_net(inp)
 
-    def infer(self, context, context_actions=None, dt=None):
+    def infer(self, context, context_actions=None, dt=None, **kwargs):
         B, T, D = context.shape
         dt_eff = dt if dt is not None else self.dt
 
@@ -732,6 +732,508 @@ class LatentHamiltonianPredictor(BasePredictor):
         # Initialize with the trivial guess (q_new, p_new) = (q_n, p_n).
         # First iteration's midpoint = (q_n, p_n), giving an explicit Euler
         # update; subsequent iterations refine toward the true midpoint.
+        q_new = q_n
+        p_new = p_n
+
+        for _ in range(self.midpoint_iters):
+            q_mid = (q_n + q_new) / 2
+            p_mid = (p_n + p_new) / 2
+
+            z_phase_mid = torch.cat([q_mid, p_mid], dim=-1)
+            inp_mid = torch.cat([z_phase_mid, theta], dim=-1)
+            H = self.H_net(inp_mid).sum()
+            dH = torch.autograd.grad(
+                H, z_phase_mid, create_graph=self.training
+            )[0]
+            dH_dq = dH[:, : self.q_dim]
+            dH_dp = dH[:, self.q_dim :]
+
+            q_new = q_n + dt_eff * dH_dp
+            p_new = p_n + dt_eff * (-dH_dq - gamma * dH_dp + G_u)
+
+        return {"z": q_new, "q": q_new, "p": p_new, "theta": theta}, q_new
+
+
+# ---------------------------------------------------------------------------
+# Separable-Hamiltonian variant of LatentHamiltonianPredictor (baseline-ham branch)
+# ---------------------------------------------------------------------------
+
+
+@register_predictor("latent_hamiltonian_separable")
+class SeparableLatentHamiltonianPredictor(BasePredictor):
+    """LatentHamiltonianPredictor with a SEPARABLE Hamiltonian H = T(p, θ) + V(q, θ).
+
+    Direct ablation against LatentHamiltonianPredictor: same encoder context,
+    same GRU SID branch over (q, v, a), same theta_head, p_head, act_emb,
+    same theta-conditioned damping_net and G_net, same training objective.
+    The ONLY difference is the Hamiltonian topology — one non-separable
+    H(q, p, θ) MLP becomes two MLPs T(p, θ) and V(q, θ) summed.
+
+    Why separable: separable Hamiltonians make leapfrog naturally symplectic
+    (∂H/∂q = ∂V/∂q has no p-dependence; ∂H/∂p = ∂T/∂p has no q-dependence —
+    no chicken-and-egg coupling between q and p updates). HGN's faithful
+    leapfrog design relies on this. This predictor adopts the same H
+    topology while keeping JEPA-compatible per-frame encoder targets via
+    the GRU SID branch.
+
+    Default integrator is leapfrog. Semi-implicit Euler and implicit
+    midpoint are available as config knobs.
+
+    Leapfrog with port extensions (γ damping, G(a) action force) applied
+    symmetrically across both half-steps:
+        p_half = p_t + (dt/2)·(-∂V/∂q(q_t, θ) - γ(θ)·∂T/∂p(p_t, θ) + G(a, θ))
+        q_new  = q_t  + dt   · ∂T/∂p(p_half, θ)
+        p_new  = p_half + (dt/2)·(-∂V/∂q(q_new, θ) - γ(θ)·∂T/∂p(p_half, θ) + G(a, θ))
+    """
+
+    def __init__(
+        self,
+        latent_dim=32,
+        action_dim=3,
+        action_embedding_dim=8,
+        hidden_dim=256,
+        gru_hidden=128,
+        theta_dim=8,
+        dt=0.1,
+        integrator="leapfrog",
+        midpoint_iters=4,
+        name="latent_hamiltonian_separable",
+        **kwargs,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.q_dim = latent_dim
+        self.p_dim = latent_dim
+        self.theta_dim = theta_dim
+        self.dt = dt
+        self.integrator = integrator
+        self.midpoint_iters = midpoint_iters
+
+        self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
+
+        # SID branch — IDENTICAL to LatentHamiltonianPredictor.
+        gru_input_dim = 2 * latent_dim + action_embedding_dim
+        self.gru = nn.GRU(
+            input_size=gru_input_dim,
+            hidden_size=gru_hidden,
+            num_layers=1,
+            batch_first=True,
+        )
+        self.theta_head = nn.Linear(gru_hidden, theta_dim)
+        self.p_head = nn.Linear(gru_hidden, latent_dim)
+
+        # Separable Hamiltonian: T(p, θ) + V(q, θ).
+        self.T_net = nn.Sequential(
+            nn.Linear(latent_dim + theta_dim, hidden_dim),
+            nn.Softplus(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Softplus(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.V_net = nn.Sequential(
+            nn.Linear(latent_dim + theta_dim, hidden_dim),
+            nn.Softplus(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Softplus(),
+            nn.Linear(hidden_dim, 1),
+        )
+        # Theta-conditioned damping + action force — IDENTICAL to LH.
+        self.damping_net = nn.Linear(theta_dim, 1)
+        self.G_net = nn.Sequential(
+            nn.Linear(action_embedding_dim + theta_dim, hidden_dim // 2),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim // 2, latent_dim),
+        )
+
+    def energy(self, z, state=None):
+        """H(q, p, θ) = T(p, θ) + V(q, θ).
+
+        For monitoring: z is position-only from the encoder. If state has
+        'p', use it; otherwise approximate p=0.
+        """
+        if state is None or "theta" not in state:
+            raise ValueError(
+                "SeparableLatentHamiltonianPredictor.energy requires "
+                "state['theta'] from a prior infer() call."
+            )
+        theta = state["theta"]
+        p = state.get("p", None)
+
+        if z.ndim == 3:
+            B, T, D = z.shape
+            theta_bc = theta.unsqueeze(1).expand(-1, T, -1)
+            if p is not None and p.ndim == 2:
+                p_bc = p.unsqueeze(1).expand(-1, T, -1)
+            elif p is not None:
+                p_bc = p
+            else:
+                p_bc = torch.zeros_like(z)
+            V_inp = torch.cat([z, theta_bc], dim=-1).reshape(B * T, -1)
+            T_inp = torch.cat([p_bc, theta_bc], dim=-1).reshape(B * T, -1)
+            return (self.V_net(V_inp) + self.T_net(T_inp)).reshape(B, T, 1)
+        else:
+            if p is None:
+                p = torch.zeros_like(z)
+            return self.V_net(torch.cat([z, theta], dim=-1)) + self.T_net(
+                torch.cat([p, theta], dim=-1)
+            )
+
+    def infer(self, context, context_actions=None, dt=None, **kwargs):
+        """SID branch identical to LatentHamiltonianPredictor.infer."""
+        B, T, D = context.shape
+        dt_eff = dt if dt is not None else self.dt
+
+        velocities = (context[:, 1:] - context[:, :-1]) / dt_eff
+        q_seq = context[:, :-1]
+
+        if context_actions is None:
+            ctx_acts = torch.zeros(
+                B, T - 1, dtype=torch.long, device=context.device
+            )
+        else:
+            n_acts = context_actions.shape[1]
+            if n_acts < T - 1:
+                pad = torch.zeros(
+                    B, T - 1 - n_acts, dtype=torch.long, device=context.device
+                )
+                ctx_acts = torch.cat([context_actions, pad], dim=1)
+            else:
+                ctx_acts = context_actions[:, : T - 1]
+
+        act_emb = self.act_emb(ctx_acts)
+        gru_input = torch.cat([q_seq, velocities, act_emb], dim=-1)
+        _, h = self.gru(gru_input)
+        h_final = h[-1]
+
+        theta = self.theta_head(h_final)
+        p = self.p_head(h_final)
+        q = context[:, -1]
+
+        return {"z": q, "q": q, "p": p, "theta": theta}
+
+    @torch.enable_grad()
+    def step(self, state, action, dt=None):
+        if self.integrator == "leapfrog":
+            return self._step_leapfrog(state, action, dt)
+        if self.integrator == "implicit_midpoint":
+            return self._step_implicit_midpoint(state, action, dt)
+        if self.integrator == "euler":
+            return self._step_semi_implicit_euler(state, action, dt)
+        raise ValueError(
+            f"Unknown integrator: {self.integrator!r}. "
+            "Expected 'leapfrog', 'implicit_midpoint', or 'euler'."
+        )
+
+    def _grad_V_q(self, q, theta, create_graph):
+        q_g = _require_grad(q)
+        V = self.V_net(torch.cat([q_g, theta], dim=-1)).sum()
+        return torch.autograd.grad(V, q_g, create_graph=create_graph)[0]
+
+    def _grad_T_p(self, p, theta, create_graph):
+        p_g = _require_grad(p)
+        T = self.T_net(torch.cat([p_g, theta], dim=-1)).sum()
+        return torch.autograd.grad(T, p_g, create_graph=create_graph)[0]
+
+    def _port_terms(self, action, theta):
+        """Per-trajectory damping γ(θ) and action force G(a, θ)."""
+        gamma = F.softplus(self.damping_net(theta))           # (B, 1)
+        G_u = self.G_net(torch.cat([self.act_emb(action), theta], dim=-1))  # (B, D)
+        return gamma, G_u
+
+    def _step_leapfrog(self, state, action, dt=None):
+        """Symplectic leapfrog on separable H with port extensions.
+
+        Three autograd calls per step:
+          1. ∂V/∂q at q_t, ∂T/∂p at p_t  (paired into one half-step update)
+          2. ∂T/∂p at p_half               (full-step q update)
+          3. ∂V/∂q at q_new                (second half-step p update; reuse
+                                            ∂T/∂p(p_half) for the damping term)
+        In the conservative limit (γ=0, G=0) this is symplectic — the
+        canonical leapfrog property HGN relies on.
+        """
+        q, p, theta = state["q"], state["p"], state["theta"]
+        dt_eff = dt if dt is not None else self.dt
+        cg = self.training
+        gamma, G_u = self._port_terms(action, theta)
+
+        # Half-step 1: p_t -> p_half using gradients at (q_t, p_t).
+        dV_dq_t = self._grad_V_q(q, theta, cg)
+        dT_dp_t = self._grad_T_p(p, theta, cg)
+        p_half = p + (dt_eff / 2.0) * (-dV_dq_t - gamma * dT_dp_t + G_u)
+
+        # Full-step q: q_t -> q_new using ∂T/∂p at p_half.
+        dT_dp_half = self._grad_T_p(p_half, theta, cg)
+        q_new = q + dt_eff * dT_dp_half
+
+        # Half-step 2: p_half -> p_new using ∂V/∂q at q_new; damping reuses ∂T/∂p(p_half).
+        dV_dq_new = self._grad_V_q(q_new, theta, cg)
+        p_new = p_half + (dt_eff / 2.0) * (-dV_dq_new - gamma * dT_dp_half + G_u)
+
+        return {"z": q_new, "q": q_new, "p": p_new, "theta": theta}, q_new
+
+    def _step_semi_implicit_euler(self, state, action, dt=None):
+        """Semi-implicit Euler on separable H with port extensions."""
+        q, p, theta = state["q"], state["p"], state["theta"]
+        dt_eff = dt if dt is not None else self.dt
+        cg = self.training
+        gamma, G_u = self._port_terms(action, theta)
+
+        dV_dq = self._grad_V_q(q, theta, cg)
+        dT_dp = self._grad_T_p(p, theta, cg)
+        p_new = p + dt_eff * (-dV_dq - gamma * dT_dp + G_u)
+        dT_dp_new = self._grad_T_p(p_new, theta, cg)
+        q_new = q + dt_eff * dT_dp_new
+
+        return {"z": q_new, "q": q_new, "p": p_new, "theta": theta}, q_new
+
+    def _step_implicit_midpoint(self, state, action, dt=None):
+        """Implicit midpoint on separable H with port extensions.
+
+        Fixed-point iteration starting from (q_n, p_n). 2nd-order accurate;
+        symplectic in conservative limit. Two autograd calls per iter.
+        """
+        q, p, theta = state["q"], state["p"], state["theta"]
+        dt_eff = dt if dt is not None else self.dt
+        cg = self.training
+        gamma, G_u = self._port_terms(action, theta)
+
+        q_n = _require_grad(q)
+        p_n = _require_grad(p)
+        q_new = q_n
+        p_new = p_n
+
+        for _ in range(self.midpoint_iters):
+            q_mid = (q_n + q_new) / 2
+            p_mid = (p_n + p_new) / 2
+            dV_dq = self._grad_V_q(q_mid, theta, cg)
+            dT_dp = self._grad_T_p(p_mid, theta, cg)
+            q_new = q_n + dt_eff * dT_dp
+            p_new = p_n + dt_eff * (-dV_dq - gamma * dT_dp + G_u)
+
+        return {"z": q_new, "q": q_new, "p": p_new, "theta": theta}, q_new
+
+
+# ---------------------------------------------------------------------------
+# Rich-SID variant: 3D CNN over backbone features (baseline-ham branch)
+# ---------------------------------------------------------------------------
+
+
+@register_predictor("latent_hamiltonian_rich_sid")
+class RichSIDLatentHamiltonianPredictor(BasePredictor):
+    """Latent-Hamiltonian with a rich-feature 3D-CNN system-identification branch.
+
+    Architecturally identical to LatentHamiltonianPredictor below the SID layer
+    (same non-separable H_net(q, p, theta), damping_net(theta), G_net(act_emb,
+    theta), implicit-midpoint default integrator). The ONLY structural delta
+    is the SID branch: replaces the GRU-over-per-frame-latents with a 3D CNN
+    over rich (B, T, 64, 16, 16) backbone features supplied by
+    RichSIDVisualWorldModel.encode_features_sequence.
+
+    Class attribute requires_rich_features = True signals to the training
+    loop (train_visual.py) and rollout helpers (src/eval/rollout.py) that
+    they must additionally compute model.encode_features_sequence(images)
+    and pass it as a kwarg to infer().
+
+    q_0 = context[:, -1] (the last context-frame's per-frame latent), exactly
+    as in LatentHamiltonianPredictor. p_0 and theta come from MLP heads on
+    the pooled 3D-CNN trunk output.
+
+    3D CNN topology (input (B, 64, T_ctx, 16, 16) after channel-first permute):
+        Conv3d(64,128,(3,3,3),stride=(2,2,2),padding=1) -> LeakyReLU
+        Conv3d(128,128,(3,3,3),stride=(2,2,2),padding=1) -> LeakyReLU
+        Conv3d(128,256,(3,3,3),stride=(2,2,2),padding=1) -> LeakyReLU
+        AdaptiveAvgPool3d(1) -> flatten -> (B, 256)
+        p_head: Linear(256, latent_dim)
+        theta_head: Linear(256, theta_dim)
+    """
+
+    requires_rich_features = True
+
+    def __init__(
+        self,
+        latent_dim=64,
+        action_dim=3,
+        action_embedding_dim=8,
+        hidden_dim=256,
+        theta_dim=8,
+        dt=0.1,
+        integrator="implicit_midpoint",
+        midpoint_iters=4,
+        sid_channels_1=128,
+        sid_channels_2=128,
+        sid_channels_3=256,
+        name="latent_hamiltonian_rich_sid",
+        **kwargs,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.q_dim = latent_dim
+        self.p_dim = latent_dim
+        self.theta_dim = theta_dim
+        self.dt = dt
+        self.integrator = integrator
+        self.midpoint_iters = midpoint_iters
+
+        self.act_emb = nn.Embedding(action_dim, action_embedding_dim)
+
+        # 3D CNN SID branch — replaces the GRU over per-frame latents.
+        # Input shape: (B, 64, T_ctx, 16, 16) after channel-first permute of
+        # the (B, T_ctx, 64, 16, 16) rich-features tensor.
+        self.sid_cnn = nn.Sequential(
+            nn.Conv3d(64, sid_channels_1, kernel_size=(3, 3, 3),
+                      stride=(2, 2, 2), padding=(1, 1, 1)),
+            nn.LeakyReLU(0.2),
+            nn.Conv3d(sid_channels_1, sid_channels_2, kernel_size=(3, 3, 3),
+                      stride=(2, 2, 2), padding=(1, 1, 1)),
+            nn.LeakyReLU(0.2),
+            nn.Conv3d(sid_channels_2, sid_channels_3, kernel_size=(3, 3, 3),
+                      stride=(2, 2, 2), padding=(1, 1, 1)),
+            nn.LeakyReLU(0.2),
+            nn.AdaptiveAvgPool3d(1),  # -> (B, sid_channels_3, 1, 1, 1)
+        )
+        self.theta_head = nn.Linear(sid_channels_3, theta_dim)
+        self.p_head = nn.Linear(sid_channels_3, latent_dim)
+
+        # H(q, p, theta): scalar energy over full phase space + system ID.
+        # Byte-identical structure to LatentHamiltonianPredictor.H_net.
+        self.H_net = nn.Sequential(
+            nn.Linear(2 * latent_dim + theta_dim, hidden_dim),
+            nn.Softplus(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Softplus(),
+            nn.Linear(hidden_dim, 1),
+        )
+        # Per-trajectory scalar damping gamma(theta) >= 0. Byte-identical to LH.
+        self.damping_net = nn.Linear(theta_dim, 1)
+        # Per-trajectory action force G(a, theta) on momentum. Byte-identical to LH.
+        self.G_net = nn.Sequential(
+            nn.Linear(action_embedding_dim + theta_dim, hidden_dim // 2),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim // 2, latent_dim),
+        )
+
+    def energy(self, z, state=None):
+        """Scalar energy H(q, p, theta). Byte-identical to LatentHamiltonianPredictor.energy."""
+        if state is None or "theta" not in state:
+            raise ValueError(
+                "RichSIDLatentHamiltonianPredictor.energy requires state['theta'] "
+                "from a prior infer() call."
+            )
+        theta = state["theta"]
+        p = state.get("p", None)
+
+        if z.ndim == 3:
+            B, T, D = z.shape
+            theta_bc = theta.unsqueeze(1).expand(-1, T, -1)
+            if p is not None and p.ndim == 2:
+                p_bc = p.unsqueeze(1).expand(-1, T, -1)
+            elif p is not None:
+                p_bc = p
+            else:
+                p_bc = torch.zeros_like(z)
+            phase = torch.cat([z, p_bc], dim=-1)
+            inp = torch.cat([phase, theta_bc], dim=-1)
+            return self.H_net(inp.reshape(B * T, -1)).reshape(B, T, 1)
+        else:
+            if p is None:
+                p = torch.zeros_like(z)
+            phase = torch.cat([z, p], dim=-1)
+            inp = torch.cat([phase, theta], dim=-1)
+            return self.H_net(inp)
+
+    def infer(self, context, context_actions=None, dt=None, *, rich_features=None, **kwargs):
+        """Infer (p_0, theta) from the rich-feature 3D CNN; take q_0 = context[:, -1].
+
+        Args:
+            context:        (B, T_ctx, D) per-frame latents (from VWM.encode_sequence).
+                            Used to extract q_0 = context[:, -1], matching
+                            LatentHamiltonianPredictor's convention so the
+                            JEPA latent-target structure is preserved.
+            context_actions: ignored (3D CNN doesn't consume actions for state
+                             inference; included for uniformity with sibling
+                             predictors' infer() signatures).
+            dt: ignored (no dt-normalization here; the integrator handles dt).
+            rich_features:  (B, T_ctx, 64, 16, 16) rich features per frame from
+                            RichSIDVisualWorldModel.encode_features_sequence.
+                            REQUIRED — raises ValueError if None. Keyword-only
+                            to avoid positional misrouting with sibling
+                            predictors whose 2nd positional arg is
+                            context_actions.
+            **kwargs: ignored.
+
+        Returns:
+            state dict with keys: z, q, p, theta. q_0 = z = context[:, -1];
+            p_0 and theta come from the 3D CNN trunk.
+        """
+        if rich_features is None:
+            raise ValueError(
+                "RichSIDLatentHamiltonianPredictor.infer requires rich_features "
+                "(B, T_ctx, 64, 16, 16). Did the training loop call "
+                "model.encode_features_sequence(images) and pass the result?"
+            )
+        B, T_ctx, D = context.shape
+        # rich_features: (B, T_ctx, 64, 16, 16). Conv3d wants channel-first:
+        # (B, C=64, T, H, W). Permute and pass through the 3D CNN.
+        x = rich_features.permute(0, 2, 1, 3, 4).contiguous()
+        h = self.sid_cnn(x).reshape(B, -1)  # (B, sid_channels_3)
+        theta = self.theta_head(h)
+        p = self.p_head(h)
+        q = context[:, -1]
+        return {"z": q, "q": q, "p": p, "theta": theta}
+
+    @torch.enable_grad()
+    def step(self, state, action, dt=None):
+        if self.integrator == "implicit_midpoint":
+            return self._step_implicit_midpoint(state, action, dt)
+        return self._step_semi_implicit_euler(state, action, dt)
+
+    def _step_semi_implicit_euler(self, state, action, dt=None):
+        """Byte-identical to LatentHamiltonianPredictor._step_semi_implicit_euler."""
+        q, p, theta = state["q"], state["p"], state["theta"]
+        dt_eff = dt if dt is not None else self.dt
+
+        q = _require_grad(q)
+        p = _require_grad(p)
+
+        z_phase = torch.cat([q, p], dim=-1)
+        inp = torch.cat([z_phase, theta], dim=-1)
+        H = self.H_net(inp).sum()
+        dH_dz = torch.autograd.grad(H, z_phase, create_graph=self.training)[0]
+        dH_dq = dH_dz[:, : self.q_dim]
+        dH_dp = dH_dz[:, self.q_dim :]
+
+        gamma = F.softplus(self.damping_net(theta))
+        G_u = self.G_net(
+            torch.cat([self.act_emb(action), theta], dim=-1)
+        )
+
+        p_new = p + dt_eff * (-dH_dq - gamma * dH_dp + G_u)
+
+        z_mid = torch.cat([q, p_new], dim=-1)
+        inp_mid = torch.cat([z_mid, theta], dim=-1)
+        H_mid = self.H_net(inp_mid).sum()
+        dH_dz_mid = torch.autograd.grad(
+            H_mid, z_mid, create_graph=self.training
+        )[0]
+        dH_dp_new = dH_dz_mid[:, self.q_dim :]
+
+        q_new = q + dt_eff * dH_dp_new
+
+        return {"z": q_new, "q": q_new, "p": p_new, "theta": theta}, q_new
+
+    def _step_implicit_midpoint(self, state, action, dt=None):
+        """Byte-identical to LatentHamiltonianPredictor._step_implicit_midpoint."""
+        q, p, theta = state["q"], state["p"], state["theta"]
+        dt_eff = dt if dt is not None else self.dt
+
+        q_n = _require_grad(q)
+        p_n = _require_grad(p)
+
+        gamma = F.softplus(self.damping_net(theta))
+        G_u = self.G_net(
+            torch.cat([self.act_emb(action), theta], dim=-1)
+        )
+
         q_new = q_n
         p_new = p_n
 

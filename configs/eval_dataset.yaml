@@ -1,0 +1,25 @@
+# Config for generate_eval_dataset.py — produces a canonical eval dataset
+# used by visual_dt_generalization_test for paired cross-predictor comparison.
+#
+# Composes with the existing dataset/env config so the eval distribution
+# matches what models were trained on. Override on the CLI:
+#
+#   python generate_eval_dataset.py dataset=oscillator_visual_50k_2p5Hz \
+#       eval.dt_values=[0.05,0.1,0.15,0.2,0.3,0.4,0.5,0.6,0.8,1.0,1.5]
+
+defaults:
+  - config
+  - _self_
+
+# The dataset directory is content-addressed: it includes seed, n_seqs,
+# and ref_seq_len so different choices produce distinct datasets. By default
+# lands under datasets/<env_name>/eval/seed_<S>_n<n_seqs>_T<ref_seq_len>/.
+# Override eval_dataset.output_dir to put it elsewhere.
+eval_dataset:
+  output_dir: null      # if null, derived from dataset name + params
+  n_seqs: 16            # canonical sequences per band
+  # reference action length at training dt; eval.dt_seq_len defaults to null
+  # so we fall back to a concrete value here rather than letting int(None) crash.
+  # Override on CLI with eval_dataset.ref_seq_len=<N>.
+  ref_seq_len: 20
+  seed: ${eval.eval_dataset_seed}   # content-addressed per seed for replicates

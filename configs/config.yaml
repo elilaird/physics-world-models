@@ -10,6 +10,13 @@ seed: 42
 # Path to a pretrained checkpoint to load weights from (null = train from scratch)
 pretrained_checkpoint: null
 
+# Path to a checkpoint to RESUME training from (null = start at epoch 0). Unlike
+# pretrained_checkpoint (weights-only init), resume restores model + optimizer
+# state + the epoch counter so the LR schedule and Adam moments continue. Used
+# by train_hgn.py. Checkpoints saved before resume support lack optimizer state;
+# resume falls back to zero moments with a warning (fine for low-LR endgames).
+resume_checkpoint: null
+
 training:
   epochs: 100
   batch_size: 32
@@ -71,3 +78,5 @@ eval:
   dt_gen_every_n_epochs: 5
   save_curves: true
   curves_filename: eval_curves.pt
+  eval_dataset_dir: null
+  eval_dataset_seed: 0
